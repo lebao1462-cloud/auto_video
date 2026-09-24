@@ -57,13 +57,9 @@ except ImportError:
     import demucs.separate as demucsApi
 
 from buzz.locale import _
-from buzz.model_loader import ModelType
 from buzz.transcriber.file_transcriber import FileTranscriber
-from buzz.transcriber.openai_whisper_api_file_transcriber import (
-    OpenAIWhisperAPIFileTranscriber,
-)
+from buzz.transcriber.file_transcriber_factory import create_file_transcriber
 from buzz.transcriber.transcriber import FileTranscriptionTask, Segment
-from buzz.transcriber.whisper_file_transcriber import WhisperFileTranscriber
 
 
 class FileTranscriberQueueWorker(QObject):
@@ -171,20 +167,7 @@ class FileTranscriberQueueWorker(QObject):
         logging.debug("Starting next transcription task")
         self.task_progress.emit(self.current_task, 0)
 
-        model_type = self.current_task.transcription_options.model.model_type
-        if model_type == ModelType.OPEN_AI_WHISPER_API:
-            self.current_transcriber = OpenAIWhisperAPIFileTranscriber(
-                task=self.current_task
-            )
-        elif (
-            model_type == ModelType.WHISPER_CPP
-            or model_type == ModelType.HUGGING_FACE
-            or model_type == ModelType.WHISPER
-            or model_type == ModelType.FASTER_WHISPER
-        ):
-            self.current_transcriber = WhisperFileTranscriber(task=self.current_task)
-        else:
-            raise Exception(f"Unknown model type: {model_type}")
+        self.current_transcriber = create_file_transcriber(self.current_task)
 
         self.current_transcriber_thread = QThread(self)
 

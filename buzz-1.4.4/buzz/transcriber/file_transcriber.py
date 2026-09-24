@@ -34,6 +34,7 @@ class FileTranscriber(QObject):
     def __init__(self, task: FileTranscriptionTask, parent: Optional["QObject"] = None):
         super().__init__(parent)
         self.transcription_task = task
+        self.detected_language = task.transcription_options.language
 
     @pyqtSlot()
     def run(self):

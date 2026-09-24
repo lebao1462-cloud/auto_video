@@ -198,6 +198,10 @@ class WhisperFileTranscriber(FileTranscriber):
                         f"Invalid model type: {task.transcription_options.model.model_type}"
                     )
 
+                if task.transcription_options.language is not None:
+                    sys.stderr.write(
+                        f"language = {task.transcription_options.language}\n"
+                    )
                 segments_json = json.dumps(segments, ensure_ascii=True, default=vars)
                 sys.stderr.write(f"segments = {segments_json}\n")
                 sys.stderr.write(WhisperFileTranscriber.READ_LINE_THREAD_STOP_TOKEN + "\n")
@@ -237,6 +241,7 @@ class WhisperFileTranscriber(FileTranscriber):
             task=effective_task,
             word_timestamps=word_timestamps,
         )
+        task.transcription_options.language = language
         return [
             Segment(
                 start=int(segment.get("start") * 1000),
@@ -298,6 +303,7 @@ class WhisperFileTranscriber(FileTranscriber):
             no_speech_threshold=0.4,
             log_progress=True,
         )
+        task.transcription_options.language = info.language
         segments = []
         for segment in whisper_segments:
             # Segment will contain words if word-level timings is True
@@ -354,6 +360,10 @@ class WhisperFileTranscriber(FileTranscriber):
                 no_speech_threshold=0.4,
                 fp16=False,
             )
+            task.transcription_options.language = (
+                getattr(result, "language", None)
+                or task.transcription_options.language
+            )
             return [
                 Segment(
                     start=int(word.start * 1000),
@@ -373,6 +383,9 @@ class WhisperFileTranscriber(FileTranscriber):
             initial_prompt=task.transcription_options.initial_prompt,
             verbose=False,
             fp16=False,
+        )
+        task.transcription_options.language = (
+            result.get("language") or task.transcription_options.language
         )
         segments = result.get("segments")
         return [
@@ -444,6 +457,8 @@ class WhisperFileTranscriber(FileTranscriber):
                     for segment in segments_dict
                 ]
                 self.segments = segments
+            elif line.startswith("language = "):
+                self.detected_language = line[11:]
             elif line.startswith("error = "):
                 self.error_message = line[8:]
             else:

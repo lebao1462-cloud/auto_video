@@ -214,6 +214,10 @@ class OpenAIWhisperAPIFileTranscriber(FileTranscriber):
                 else self.openai_client.audio.translations.create(**options)
             )
 
+            detected_language = getattr(transcript, "language", None)
+            if detected_language is not None:
+                self.detected_language = detected_language
+
             segments = getattr(transcript, "segments", None)
 
             words = getattr(transcript, "words", None)
