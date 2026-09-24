@@ -1,0 +1,181 @@
+import os
+from threading import Thread, Event
+from typing import Callable, Any
+
+import numpy as np
+
+from buzz import whisper_audio
+
+mock_query_devices = [
+    {
+        "name": "Background Music",
+        "index": 0,
+        "hostapi": 0,
+        "max_input_channels": 2,
+        "max_output_channels": 2,
+        "default_low_input_latency": 0.01,
+        "default_low_output_latency": 0.008,
+        "default_high_input_latency": 0.1,
+        "default_high_output_latency": 0.064,
+        "default_samplerate": 8000.0,
+    },
+    {
+        "name": "Background Music (UI Sounds)",
+        "index": 1,
+        "hostapi": 0,
+        "max_input_channels": 2,
+        "max_output_channels": 2,
+        "default_low_input_latency": 0.01,
+        "default_low_output_latency": 0.008,
+        "default_high_input_latency": 0.1,
+        "default_high_output_latency": 0.064,
+        "default_samplerate": 8000.0,
+    },
+    {
+        "name": "BlackHole 2ch",
+        "index": 2,
+        "hostapi": 0,
+        "max_input_channels": 2,
+        "max_output_channels": 2,
+        "default_low_input_latency": 0.01,
+        "default_low_output_latency": 0.0013333333333333333,
+        "default_high_input_latency": 0.1,
+        "default_high_output_latency": 0.010666666666666666,
+        "default_samplerate": 48000.0,
+    },
+    {
+        "name": "MacBook Pro Microphone",
+        "index": 3,
+        "hostapi": 0,
+        "max_input_channels": 1,
+        "max_output_channels": 0,
+        "default_low_input_latency": 0.034520833333333334,
+        "default_low_output_latency": 0.01,
+        "default_high_input_latency": 0.043854166666666666,
+        "default_high_output_latency": 0.1,
+        "default_samplerate": 48000.0,
+    },
+    {
+        "name": "MacBook Pro Speakers",
+        "index": 4,
+        "hostapi": 0,
+        "max_input_channels": 0,
+        "max_output_channels": 2,
+        "default_low_input_latency": 0.01,
+        "default_low_output_latency": 0.0070416666666666666,
+        "default_high_input_latency": 0.1,
+        "default_high_output_latency": 0.016375,
+        "default_samplerate": 48000.0,
+    },
+    {
+        "name": "Null Audio Device",
+        "index": 5,
+        "hostapi": 0,
+        "max_input_channels": 2,
+        "max_output_channels": 2,
+        "default_low_input_latency": 0.01,
+        "default_low_output_latency": 0.0014512471655328798,
+        "default_high_input_latency": 0.1,
+        "default_high_output_latency": 0.011609977324263039,
+        "default_samplerate": 44100.0,
+    },
+    {
+        "name": "Multi-Output Device",
+        "index": 6,
+        "hostapi": 0,
+        "max_input_channels": 0,
+        "max_output_channels": 2,
+        "default_low_input_latency": 0.01,
+        "default_low_output_latency": 0.0033333333333333335,
+        "default_high_input_latency": 0.1,
+        "default_high_output_latency": 0.012666666666666666,
+        "default_samplerate": 48000.0,
+    },
+]
+
+
+class MockInputStream:
+    thread: Thread
+    samplerate = whisper_audio.SAMPLE_RATE
+
+    def __init__(
+        self,
+        callback: Callable[[np.ndarray, int, Any, Any], None],
+        *args,
+        **kwargs,
+    ):
+        self._stop_event = Event()
+        self.callback = callback
+
+        # Pre-load audio on the calling (main) thread to avoid calling
+        # subprocess.run (fork) from a background thread on macOS, which
+        # can cause a segfault when Qt is running.
+        sample_rate = whisper_audio.SAMPLE_RATE
+        file_path = os.path.join(
+            os.path.dirname(__file__), "../testdata/whisper-french.mp3"
+        )
+        self._audio = whisper_audio.load_audio(file_path, sr=sample_rate)
+
+        self.thread = Thread(target=self.target)
+
+    def start(self):
+        self.thread.start()
+
+    def target(self):
+        sample_rate = whisper_audio.SAMPLE_RATE
+        audio = self._audio
+
+        chunk_duration_secs = 1
+
+        seek = 0
+        num_samples_in_chunk = chunk_duration_secs * sample_rate
+
+        while not self._stop_event.is_set():
+            self._stop_event.wait(timeout=chunk_duration_secs)
+            if self._stop_event.is_set():
+                break
+            chunk = audio[seek : seek + num_samples_in_chunk]
+            try:
+                self.callback(chunk, 0, None, None)
+            except RuntimeError:
+                # Qt object was deleted between the stop-event check and
+                # the callback invocation; treat it as a stop signal.
+                break
+            seek += num_samples_in_chunk
+
+            # loop back around
+            if seek + num_samples_in_chunk > audio.size:
+                seek = 0
+
+    def stop(self):
+        self._stop_event.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=5)
+
+    def close(self):
+        self.stop()
+
+    def __enter__(self):
+        self.start()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+
+
+class MockSoundDevice:
+    def __init__(self):
+        self.devices = mock_query_devices
+
+    def InputStream(self, *args, **kwargs):
+        return MockInputStream(*args, **kwargs)
+
+    def query_devices(self, device=None):
+        if device is None:
+            return self.devices
+        else:
+            return next((d for d in self.devices if d['index'] == device), None)
+
+    def check_input_settings(self, device=None, samplerate=None):
+        device_info = self.query_devices(device)
+        if device_info and samplerate and samplerate != device_info['default_samplerate']:
+            raise ValueError('Invalid sample rate for device')

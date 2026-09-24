@@ -1,0 +1,402 @@
+name: CI
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "*"
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    env:
+      BUZZ_DISABLE_TELEMETRY: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+          - os: macos-latest
+          - os: windows-latest
+          - os: ubuntu-22.04
+          - os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Should be removed with next update to whisper.cpp
+      - name: Downgrade Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.0.0'
+        if: matrix.os == 'macos-latest'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Vulkan SDK
+        if: "startsWith(matrix.os, 'ubuntu-') || matrix.os == 'windows-latest'"
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Load cached venv
+        id: cached-uv-dependencies
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/uv.lock') }}
+
+      - uses: AnimMouse/setup-ffmpeg@v1
+        id: setup-ffmpeg
+        with:
+          version: ${{ matrix.os == 'macos-15-intel' && '7.1.1' || matrix.os == 'macos-latest' && '80' || '8.0' }}
+
+      - name: Test ffmpeg
+        run: ffmpeg -i ./testdata/audio-long.mp3 ./testdata/audio-long.wav
+
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@v2
+        if: runner.os == 'Windows'
+
+      - name: Install apt dependencies
+        run: |
+          sudo apt-get update
+
+          if [ "$(lsb_release -rs)" == "22.04" ]; then
+            sudo apt-get install libegl1-mesa
+
+            # Add ubuntu-toolchain-r PPA for newer libstdc++6 with GLIBCXX_3.4.32
+            sudo add-apt-repository ppa:ubuntu-toolchain-r/test -y
+            sudo apt-get update
+            sudo apt-get install -y libstdc++6
+          fi
+
+          sudo apt-get install libyaml-dev libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-xinerama0 libxcb-shape0 libxcb-cursor0 libportaudio2 gettext libpulse0 libgl1-mesa-dev libvulkan-dev ccache
+        if: "startsWith(matrix.os, 'ubuntu-')"
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Test
+        run: |
+          uv run make test
+        shell: bash
+        env:
+          PYTHONFAULTHANDLER: "1"
+
+      - name: Upload coverage reports to Codecov with GitHub Action
+        uses: codecov/codecov-action@v4
+        with:
+          flags: ${{ runner.os }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  build:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      BUZZ_DISABLE_TELEMETRY: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+          - os: macos-latest
+          - os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Should be removed with next update to whisper.cpp
+      - name: Downgrade Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.0.0'
+        if: matrix.os == 'macos-latest'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Vulkan SDK
+        if: "startsWith(matrix.os, 'ubuntu-') || matrix.os == 'windows-latest'"
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Load cached venv
+        id: cached-uv-dependencies
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/uv.lock') }}
+
+      - name: Install Inno Setup on Windows
+        uses: crazy-max/ghaction-chocolatey@v3
+        with:
+          args: install innosetup --yes
+        if: runner.os == 'Windows'
+
+      - name: Install apt dependencies
+        run: |
+          sudo apt-get update
+
+          if [ "$(lsb_release -rs)" == "22.04" ]; then
+            sudo apt-get install libegl1-mesa
+
+            # Add ubuntu-toolchain-r PPA for newer libstdc++6 with GLIBCXX_3.4.32
+            sudo add-apt-repository ppa:ubuntu-toolchain-r/test -y
+            sudo apt-get update
+            sudo apt-get install -y libstdc++6
+          fi
+
+          sudo apt-get install libyaml-dev libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-xinerama0 libxcb-shape0 libxcb-cursor0 libportaudio2 gettext libpulse0 libgl1-mesa-dev libvulkan-dev ccache
+        if: "startsWith(matrix.os, 'ubuntu-')"
+
+      - name: Install dependencies
+        run: uv sync
+
+      - uses: AnimMouse/setup-ffmpeg@v1
+        id: setup-ffmpeg
+        with:
+          version: ${{ matrix.os == 'macos-15-intel' && '7.1.1' || matrix.os == 'macos-latest' && '80' || '8.0' }}
+
+      - name: Install MSVC for Windows
+        run: |
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            uv add msvc-runtime
+            uv pip install -U torch==2.8.0+cu129 torchaudio==2.8.0+cu129 --index-url https://download.pytorch.org/whl/cu129
+            uv pip install nvidia-cublas-cu12==12.9.1.4 nvidia-cuda-cupti-cu12==12.9.79 nvidia-cuda-runtime-cu12==12.9.79 --extra-index-url https://pypi.ngc.nvidia.com
+
+            uv cache clean
+            uv run pip cache purge
+          fi
+        shell: bash
+
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@v2
+        if: runner.os == 'Windows'
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.0"
+          bundler-cache: true
+        if: "startsWith(matrix.os, 'ubuntu-')"
+
+      - name: Install FPM
+        run: gem install fpm
+        if: "startsWith(matrix.os, 'ubuntu-')"
+
+      - name: Clear space on Windows
+        if: runner.os == 'Windows'
+        run: |         
+          rm 'C:\Android\android-sdk\' -r -force
+          rm 'C:\Program Files (x86)\Google\' -r -force
+          rm 'C:\tools\kotlinc\' -r -force
+          rm 'C:\tools\php\' -r -force
+          rm 'C:\selenium\' -r -force
+        shell: pwsh
+
+      - name: Bundle
+        run: |
+          if [ "$RUNNER_OS" == "macOS" ]; then
+
+            brew install create-dmg
+
+            sudo pkill -9 XProtect >/dev/null || true;
+            while pgrep XProtect; do sleep 3; done;
+
+            CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+            KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+            echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o $CERTIFICATE_PATH
+
+            security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+            security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+            security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+            security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+            security list-keychain -d user -s $KEYCHAIN_PATH
+
+            xcrun notarytool store-credentials --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" notarytool --validate
+
+            uv run make bundle_mac
+
+          elif [ "$RUNNER_OS" == "Windows" ]; then
+
+            cp -r ./dll_backup ./buzz/
+            uv run make bundle_windows
+
+          fi
+        env:
+          BUZZ_CODESIGN_IDENTITY: ${{ secrets.BUZZ_CODESIGN_IDENTITY }}
+          BUZZ_KEYCHAIN_NOTARY_PROFILE: ${{ secrets.BUZZ_KEYCHAIN_NOTARY_PROFILE }}
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Buzz-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            dist/Buzz*-windows.exe
+            dist/Buzz*-windows-*.bin
+            dist/Buzz*-mac.dmg
+
+  build_wheels:
+    runs-on: ${{ matrix.os }}
+    env:
+      BUZZ_DISABLE_TELEMETRY: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-15-intel, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Should be removed with next update to whisper.cpp
+      - name: Downgrade Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.0.0'
+        if: matrix.os == 'macos-latest'
+
+      - name: Install Vulkan SDK
+        if: "startsWith(matrix.os, 'ubuntu-') || matrix.os == 'windows-latest'"
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Build wheels
+        run: uv build --wheel
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: buzz-wheel-${{ runner.os }}-${{ runner.arch }}
+          path: ./dist/*.whl
+
+  publish_pypi:
+    needs: [build_wheels, test]
+    runs-on: ubuntu-latest
+    env:
+      BUZZ_DISABLE_TELEMETRY: true
+    environment: pypi
+    permissions:
+      id-token: write
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: buzz-wheel-*
+          path: dist
+          merge-multiple: true
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          verbose: true
+          password: ${{ secrets.PYPI_TOKEN }}
+
+  release:
+    runs-on: ${{ matrix.os }}
+    env:
+      BUZZ_DISABLE_TELEMETRY: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+          - os: macos-latest
+          - os: windows-latest
+    needs: [build, test]
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: Buzz-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Rename .dmg files
+        if: runner.os == 'macOS'
+        run: |
+          for file in Buzz*.dmg; do
+            mv "$file" "${file%.dmg}-${{ runner.arch }}.dmg"
+          done
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Buzz*-unix.tar.gz
+            Buzz*.exe
+            Buzz*.bin
+            Buzz*.dmg
+
+#  Brew Cask deployment fails and the app is deprecated on Brew.
+#  deploy_brew_cask:
+#    runs-on: macos-latest
+#    env:
+#      BUZZ_DISABLE_TELEMETRY: true
+#    needs: [release]
+#    if: startsWith(github.ref, 'refs/tags/')
+#    steps:
+#      - uses: actions/checkout@v4
+#        with:
+#          submodules: recursive
+#
+#      # Should be removed with next update to whisper.cpp
+#      - name: Downgrade Xcode
+#        uses: maxim-lobanov/setup-xcode@v1
+#        with:
+#          xcode-version: '16.0.0'
+#        if: matrix.os == 'macos-latest'
+#
+#      - name: Install uv
+#        uses: astral-sh/setup-uv@v6
+#
+#      - name: Set up Python
+#        uses: actions/setup-python@v5
+#        with:
+#          python-version: "3.12"
+#
+#      - name: Install dependencies
+#        run: uv sync
+#
+#      - name: Upload to Brew
+#        run: uv run make upload_brew
+#        env:
+#          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}

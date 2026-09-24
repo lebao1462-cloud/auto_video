@@ -1,0 +1,106 @@
+---
+name: Snapcraft
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "*"
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      BUZZ_DISABLE_TELEMETRY: true
+    outputs:
+      snap: ${{ steps.snapcraft.outputs.snap }}
+    steps:
+      # Ideas from https://github.com/orgs/community/discussions/25678
+      - name: Remove unused build tools
+        run: |
+          sudo apt-get remove -y azure-cli google-cloud-sdk hhvm google-chrome-stable firefox powershell mono-devel || true
+          sudo apt-get autoremove -y
+          sudo apt-get clean
+          python -m pip cache purge
+          rm -rf /opt/hostedtoolcache || true
+      - name: Check available disk space
+        run: |
+          echo "=== Disk space ==="
+          df -h
+          echo "=== Memory ==="
+          free -h
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Snapcraft and dependencies
+        run: |
+          set -x
+          # Ensure snapd is ready
+          sudo systemctl start snapd.socket
+          sudo snap wait system seed.loaded
+
+          echo "=== Installing snapcraft ==="
+          sudo snap install --classic snapcraft
+
+          echo "=== Installing gnome extension dependencies ==="
+          sudo snap install gnome-46-2404 || { echo "Failed to install gnome-46-2404"; sudo journalctl -u snapd --no-pager -n 50; exit 1; }
+          sudo snap install gnome-46-2404-sdk || { echo "Failed to install gnome-46-2404-sdk"; sudo journalctl -u snapd --no-pager -n 50; exit 1; }
+
+          echo "=== Installing build-snaps ==="
+          sudo snap install --classic astral-uv || { echo "Failed to install astral-uv"; sudo journalctl -u snapd --no-pager -n 50; exit 1; }
+
+          echo "=== Installed snaps ==="
+          snap list
+      - name: Check disk space before build
+        run: df -h
+      - name: Build snap
+        id: snapcraft
+        env:
+          SNAPCRAFT_BUILD_ENVIRONMENT: host
+        run: |
+          sudo -E snapcraft pack --verbose --destructive-mode
+          echo "snap=$(ls *.snap)" >> $GITHUB_OUTPUT
+      - run: sudo snap install --devmode *.snap
+      - run: |
+          cd $HOME
+          xvfb-run buzz --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snap
+          path: ${{ steps.snapcraft.outputs.snap }}
+
+  upload-edge:
+    runs-on: ubuntu-latest
+    needs: [ build ]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: snap
+      - uses: snapcore/action-publish@v1
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_TOKEN }}
+        with:
+          snap: ${{ needs.build.outputs.snap }}
+          release: edge
+
+  upload-stable:
+    runs-on: ubuntu-latest
+    needs: [ build ]
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: snap
+      - uses: snapcore/action-publish@v1
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_TOKEN }}
+        with:
+          snap: ${{ needs.build.outputs.snap }}
+          release: stable

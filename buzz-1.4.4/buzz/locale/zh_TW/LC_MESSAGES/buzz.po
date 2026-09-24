@@ -1,0 +1,1629 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) YEAR THE PACKAGE'S COPYRIGHT HOLDER
+# This file is distributed under the same license as the PACKAGE package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, YEAR.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: \n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-03-07 20:20+0200\n"
+"PO-Revision-Date: 2023-05-01 15:45+0800\n"
+"Last-Translator: \n"
+"Language-Team: Lamb\n"
+"Language: zh_TW\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"X-Generator: Poedit 3.2.2\n"
+
+#: buzz/widgets/import_url_dialog.py buzz/settings/shortcut.py
+msgid "Import URL"
+msgstr "匯入網址"
+
+#: buzz/widgets/import_url_dialog.py
+msgid "https://example.com/audio.mp3"
+msgstr "https://example.com/audio.mp3"
+
+#: buzz/widgets/import_url_dialog.py
+#: buzz/widgets/preferences_dialog/preferences_dialog.py
+#: buzz/widgets/preferences_dialog/models_preferences_widget.py
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+#: buzz/widgets/main_window.py
+msgid "Ok"
+msgstr "確定"
+
+#: buzz/widgets/import_url_dialog.py
+#: buzz/widgets/preferences_dialog/preferences_dialog.py
+#: buzz/widgets/preferences_dialog/models_preferences_widget.py
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+#: buzz/widgets/model_download_progress_dialog.py buzz/widgets/main_window.py
+msgid "Cancel"
+msgstr "取消"
+
+#: buzz/widgets/import_url_dialog.py
+msgid "URL:"
+msgstr "網址："
+
+#: buzz/widgets/import_url_dialog.py
+msgid "Invalid URL"
+msgstr "無效的網址"
+
+#: buzz/widgets/import_url_dialog.py
+msgid "The URL you entered is invalid."
+msgstr "您輸入的網址無效。"
+
+#: buzz/widgets/presentation_window.py
+msgid "Live Transcript Presentation"
+msgstr "即時轉錄簡報"
+
+#: buzz/widgets/preferences_dialog/shortcuts_editor_preferences_widget.py
+msgid "Reset to Defaults"
+msgstr "重設為預設值"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+#: buzz/transcriber/transcriber.py
+msgid "English"
+msgstr "英語"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+#: buzz/transcriber/transcriber.py
+msgid "Catalan"
+msgstr "加泰隆尼亞語"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+#: buzz/transcriber/transcriber.py
+msgid "Danish"
+msgstr "丹麥語"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+#: buzz/transcriber/transcriber.py
+msgid "Dutch"
+msgstr "荷蘭語"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+#: buzz/transcriber/transcriber.py
+msgid "German"
+msgstr "德語"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+#: buzz/transcriber/transcriber.py
+msgid "Spanish"
+msgstr "西班牙語"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+#: buzz/transcriber/transcriber.py
+msgid "Italian"
+msgstr "義大利語"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+#: buzz/transcriber/transcriber.py
+msgid "Japanese"
+msgstr "日語"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+#: buzz/transcriber/transcriber.py
+msgid "Latvian"
+msgstr "拉脫維亞語"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+#: buzz/transcriber/transcriber.py
+msgid "Polish"
+msgstr "波蘭語"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "Portuguese (Brazil)"
+msgstr "葡萄牙語（巴西）"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+#: buzz/transcriber/transcriber.py
+msgid "Ukrainian"
+msgstr "烏克蘭語"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "Chinese (Simplified)"
+msgstr "中文（簡體）"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "Chinese (Traditional)"
+msgstr "中文（繁體）"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "Restart required!"
+msgstr "需要重新啟動！"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "Ui Language"
+msgstr "介面語言"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "Font Size"
+msgstr "字體大小"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "Test"
+msgstr "測試"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "OpenAI API key"
+msgstr "OpenAI API 金鑰"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "OpenAI base url"
+msgstr "OpenAI 基礎網址"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "OpenAI API model"
+msgstr "OpenAI API 模型"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "Default export file name"
+msgstr "預設匯出檔案名稱"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "Enable live recording transcription export"
+msgstr "啟用即時錄製轉錄匯出"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+#: buzz/widgets/preferences_dialog/folder_watch_preferences_widget.py
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "Browse"
+msgstr "瀏覽"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "Export folder"
+msgstr "匯出資料夾"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "Live recording mode"
+msgstr "即時錄製模式"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid ""
+"Note: Live recording export settings will be moved to the Advanced Settings "
+"in the Live Recording screen in a future version."
+msgstr "注意：即時錄製匯出設定將在未來版本中移至即時錄製畫面的進階設定中。"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "Use 8-bit quantization to reduce memory usage"
+msgstr "使用 8 位元量化以降低記憶體使用量"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid ""
+"Applies to Huggingface and Faster Whisper models. Reduces GPU memory usage "
+"but may slightly decrease transcription quality."
+msgstr ""
+"適用於 Huggingface 和 Faster Whisper 模型。可降低 GPU 記憶體使用量，但可能略"
+"微降低轉錄品質。"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "Reduce GPU RAM"
+msgstr "降低 GPU 記憶體"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "Use only CPU and disable GPU acceleration"
+msgstr "僅使用 CPU 並停用 GPU 加速"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "Set this if larger models do not fit your GPU memory and Buzz crashes"
+msgstr "若較大的模型無法放入 GPU 記憶體且 Buzz 當機，請啟用此選項"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "Disable GPU"
+msgstr "停用 GPU"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "OpenAI API Key Test"
+msgstr "OpenAI API 金鑰測試"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid ""
+"Your API key is valid. Buzz will use this key to perform Whisper API "
+"transcriptions and AI translations."
+msgstr "您的 API 金鑰有效。Buzz 將使用此金鑰執行 Whisper API 轉錄和 AI 翻譯。"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid "Invalid API key"
+msgstr "無效的 API 金鑰"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid ""
+"API supports only base64 characters (A-Za-z0-9+/=_-). Other characters in "
+"API key may cause errors."
+msgstr ""
+"API 僅支援 base64 字元（A-Za-z0-9+/=_-）。API 金鑰中的其他字元可能會導致錯"
+"誤。"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "Select Export Folder"
+msgstr "選擇匯出資料夾"
+
+#: buzz/widgets/preferences_dialog/general_preferences_widget.py
+msgid ""
+"OpenAI API returned invalid response. Please check the API url or your key. "
+"Transcription and translation may still work if the API does not support key "
+"validation."
+msgstr ""
+"OpenAI API 傳回無效回應。請檢查 API 網址或您的金鑰。若 API 不支援金鑰驗證，轉"
+"錄和翻譯仍可能正常運作。"
+
+#: buzz/widgets/preferences_dialog/folder_watch_preferences_widget.py
+msgid "Enable folder watch"
+msgstr "啟用資料夾監視"
+
+#: buzz/widgets/preferences_dialog/folder_watch_preferences_widget.py
+msgid "Delete processed files"
+msgstr "刪除已處理的檔案"
+
+#: buzz/widgets/preferences_dialog/folder_watch_preferences_widget.py
+msgid "Input folder"
+msgstr "輸入資料夾"
+
+#: buzz/widgets/preferences_dialog/folder_watch_preferences_widget.py
+msgid "Output folder"
+msgstr "輸出資料夾"
+
+#: buzz/widgets/preferences_dialog/folder_watch_preferences_widget.py
+msgid "Select Input Folder"
+msgstr "選擇輸入資料夾"
+
+#: buzz/widgets/preferences_dialog/folder_watch_preferences_widget.py
+msgid "Select Output Folder"
+msgstr "選擇輸出資料夾"
+
+#: buzz/widgets/preferences_dialog/preferences_dialog.py
+msgid "Preferences"
+msgstr "偏好設定"
+
+#: buzz/widgets/preferences_dialog/preferences_dialog.py
+msgid "General"
+msgstr "一般"
+
+#: buzz/widgets/preferences_dialog/preferences_dialog.py
+msgid "Models"
+msgstr "模型"
+
+#: buzz/widgets/preferences_dialog/preferences_dialog.py
+msgid "Shortcuts"
+msgstr "快捷鍵"
+
+#: buzz/widgets/preferences_dialog/preferences_dialog.py
+msgid "Folder Watch"
+msgstr "資料夾監視"
+
+#: buzz/widgets/preferences_dialog/models_preferences_widget.py
+msgid "Group"
+msgstr "群組"
+
+#: buzz/widgets/preferences_dialog/models_preferences_widget.py
+msgid "Huggingface ID of a Faster whisper model"
+msgstr "Faster Whisper 模型的 Huggingface ID"
+
+#: buzz/widgets/preferences_dialog/models_preferences_widget.py
+msgid "Download"
+msgstr "下載"
+
+#: buzz/widgets/preferences_dialog/models_preferences_widget.py
+msgid "Show file location"
+msgstr "顯示檔案位置"
+
+#: buzz/widgets/preferences_dialog/models_preferences_widget.py
+msgid "Delete"
+msgstr "刪除"
+
+#: buzz/widgets/preferences_dialog/models_preferences_widget.py
+msgid "Downloaded"
+msgstr "已下載"
+
+#: buzz/widgets/preferences_dialog/models_preferences_widget.py
+msgid "Available for Download"
+msgstr "可供下載"
+
+#: buzz/widgets/preferences_dialog/models_preferences_widget.py
+msgid "Download link to Whisper.cpp ggml model file"
+msgstr "Whisper.cpp ggml 模型檔案的下載連結"
+
+#: buzz/widgets/preferences_dialog/models_preferences_widget.py
+msgid "Delete Model"
+msgstr "刪除模型"
+
+#: buzz/widgets/preferences_dialog/models_preferences_widget.py
+msgid "Are you sure you want to delete the selected model?"
+msgstr "您確定要刪除所選模型嗎？"
+
+#: buzz/widgets/preferences_dialog/models_preferences_widget.py
+msgid "Download failed"
+msgstr "下載失敗"
+
+#: buzz/widgets/preferences_dialog/models_preferences_widget.py
+#: buzz/widgets/transcription_tasks_table_widget.py
+#: buzz/widgets/update_dialog.py buzz/widgets/main_window.py
+#: buzz/model_loader.py
+msgid "Error"
+msgstr "錯誤"
+
+#: buzz/widgets/record_button.py buzz/widgets/main_window_toolbar.py
+msgid "Record"
+msgstr "錄製"
+
+#: buzz/widgets/record_button.py
+msgid "Stop"
+msgstr "停止"
+
+#: buzz/widgets/transcriber/languages_combo_box.py
+#: buzz/transcriber/transcriber.py
+msgid "Detect Language"
+msgstr "檢測語言"
+
+#: buzz/widgets/transcriber/mms_language_line_edit.py
+msgid "e.g., eng, fra, deu"
+msgstr "例如：eng、fra、deu"
+
+#: buzz/widgets/transcriber/mms_language_line_edit.py
+msgid ""
+"Enter an ISO 639-3 language code (3 letters).\n"
+"Examples: eng (English), fra (French), deu (German),\n"
+"spa (Spanish), lav (Latvian)"
+msgstr ""
+"請輸入 ISO 639-3 語言代碼（3 個字母）。\n"
+"範例：eng（英語）、fra（法語）、deu（德語）、\n"
+"spa（西班牙語）、lav（拉脫維亞語）"
+
+#: buzz/widgets/transcriber/file_transcriber_widget.py
+msgid "Run"
+msgstr "開始執行"
+
+#: buzz/widgets/transcriber/transcription_options_group_box.py
+msgid "Model:"
+msgstr "模型:"
+
+#: buzz/widgets/transcriber/transcription_options_group_box.py
+#: buzz/transcriber/recording_transcriber.py
+msgid "First time use of a model may take up to several minutest to load."
+msgstr "首次使用模型最多可能需要數分鐘載入。"
+
+#: buzz/widgets/transcriber/transcription_options_group_box.py
+msgid "Api Key:"
+msgstr "API 金鑰："
+
+#: buzz/widgets/transcriber/transcription_options_group_box.py
+msgid "Task:"
+msgstr "任務:"
+
+#: buzz/widgets/transcriber/transcription_options_group_box.py
+msgid "Language:"
+msgstr "語言:"
+
+#: buzz/widgets/transcriber/initial_prompt_text_edit.py
+msgid "Enter prompt..."
+msgstr "輸入提示..."
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "Advanced Settings"
+msgstr "進階設定"
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "Speech recognition settings"
+msgstr "語音識別設定"
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "Initial Prompt:"
+msgstr "初始提示："
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "Translation settings"
+msgstr "翻譯設定"
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "Enable AI translation"
+msgstr "啟用 AI 翻譯"
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "AI model:"
+msgstr "AI 模型："
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid ""
+"Please translate each text sent to you from English to Spanish. Translation "
+"will be used in an automated system, please do not add any comments or "
+"notes, just the translation."
+msgstr ""
+"請將傳送給您的每段文字從英文翻譯成西班牙文。翻譯將用於自動化系統，請勿添加任"
+"何評論或備註，僅提供翻譯即可。"
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "Instructions for AI:"
+msgstr "AI 指令："
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "Recording settings"
+msgstr "錄製設定"
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "Silence threshold:"
+msgstr "靜音閾值："
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "Live recording mode:"
+msgstr "即時錄製模式："
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "Line separator:"
+msgstr "行分隔符號："
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "Transcription step:"
+msgstr "轉錄步長:"
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "Hide unconfirmed"
+msgstr "隱藏未確認內容"
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "Enable live recording export"
+msgstr "啟用即時錄製匯出"
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "Export folder:"
+msgstr "匯出資料夾："
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "Export file name:"
+msgstr "匯出檔案名稱："
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "Text file (.txt)"
+msgstr "文字檔案（.txt）"
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "CSV (.csv)"
+msgstr "CSV（.csv）"
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid "Export file type:"
+msgstr "匯出檔案類型："
+
+#: buzz/widgets/transcriber/advanced_settings_dialog.py
+msgid ""
+"Limit export entries\n"
+"(0 = export all):"
+msgstr ""
+"限制匯出筆數\n"
+"（0 = 全部匯出）："
+
+#: buzz/widgets/transcriber/file_transcription_form_widget.py
+msgid "Word-level timings"
+msgstr "單字級別的時間表達"
+
+#: buzz/widgets/transcriber/file_transcription_form_widget.py
+msgid "Extract speech"
+msgstr "提取語音"
+
+#: buzz/widgets/transcriber/file_transcription_form_widget.py
+msgid "Export:"
+msgstr "匯出："
+
+#: buzz/widgets/transcriber/hugging_face_search_line_edit.py
+msgid "Huggingface ID of a model"
+msgstr "模型的 Huggingface ID"
+
+#: buzz/widgets/transcriber/advanced_settings_button.py
+msgid "Advanced..."
+msgstr "進階..."
+
+#: buzz/widgets/main_window_toolbar.py
+msgid "New File Transcription"
+msgstr "新增檔案轉錄"
+
+#: buzz/widgets/main_window_toolbar.py
+msgid "New URL Transcription"
+msgstr "新增網址轉錄"
+
+#: buzz/widgets/main_window_toolbar.py
+msgid "Open Transcript"
+msgstr "打開轉換結果"
+
+#: buzz/widgets/main_window_toolbar.py buzz/settings/shortcut.py
+msgid "Cancel Transcription"
+msgstr "取消錄製"
+
+#: buzz/widgets/main_window_toolbar.py buzz/widgets/main_window.py
+#: buzz/settings/shortcut.py
+msgid "Clear History"
+msgstr "清除歷史紀錄"
+
+#: buzz/widgets/main_window_toolbar.py buzz/widgets/update_dialog.py
+msgid "Update Available"
+msgstr "有可用更新"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "In Progress"
+msgstr "進行中"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Completed"
+msgstr "完成"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Failed"
+msgstr "失敗"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Canceled"
+msgstr "取消"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Queued"
+msgstr "排隊中"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "File Name / URL"
+msgstr "檔案名稱 / 網址"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Model"
+msgstr "模型"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Task"
+msgstr "任務"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Status"
+msgstr "狀態"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Date Completed"
+msgstr "完成日期"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Date Added"
+msgstr "新增日期"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Notes"
+msgstr "備註"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Reset Column Order"
+msgstr "重設欄位順序"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Restart Transcription"
+msgstr "重新開始轉錄"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Rename"
+msgstr "重新命名"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Add/Edit Notes"
+msgstr "新增／編輯備註"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Rename Transcription"
+msgstr "重新命名轉錄"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Enter new name:"
+msgstr "輸入新名稱："
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Enter some relevant notes for this transcription:"
+msgstr "為此轉錄輸入相關備註："
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Cannot Restart"
+msgstr "無法重新開始"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Only failed or canceled transcriptions can be restarted."
+msgstr "只有失敗或已取消的轉錄才能重新開始。"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Failed to restart transcription: {}"
+msgstr "重新開始轉錄失敗：{}"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid ""
+"Could not restart transcription: model not available and could not be "
+"downloaded."
+msgstr "無法重新開始轉錄：模型不可用且無法下載。"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Could not restart transcription: transcriber worker not found."
+msgstr "無法重新開始轉錄：找不到轉錄工作器。"
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "Live Recording"
+msgstr "現場錄製"
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "Click Record to begin..."
+msgstr "點擊開始錄製"
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "Waiting for AI translation..."
+msgstr "等待 AI 翻譯..."
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "Microphone:"
+msgstr "麥克風:"
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "Show in new window"
+msgstr "在新視窗中顯示"
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "Text Size:"
+msgstr "文字大小："
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "Theme"
+msgstr "主題"
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "Light"
+msgstr "淺色"
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "Dark"
+msgstr "深色"
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "Custom"
+msgstr "自訂"
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "Text Color"
+msgstr "文字顏色"
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "Background Color"
+msgstr "背景顏色"
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "Fullscreen"
+msgstr "全螢幕"
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "Copy"
+msgstr "複製"
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "Copy transcription to clipboard"
+msgstr "複製轉錄內容到剪貼簿"
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "Nothing to copy!"
+msgstr "沒有可複製的內容！"
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "Copy failed"
+msgstr "複製失敗"
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "Copied!"
+msgstr "已複製！"
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "Select Text Color"
+msgstr "選擇文字顏色"
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "Select Background Color"
+msgstr "選擇背景顏色"
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid "An error occurred while starting a new recording:"
+msgstr "開始新錄製出錯"
+
+#: buzz/widgets/recording_transcriber_widget.py
+msgid ""
+"Please check your audio devices or check the application logs for more "
+"information."
+msgstr "請檢查您的音頻設備或檢查應用程序日誌以獲取更多信息。"
+
+#: buzz/widgets/update_dialog.py
+msgid "A new version of Buzz is available!"
+msgstr "Buzz 有新版本可用！"
+
+#: buzz/widgets/update_dialog.py
+msgid "Current version:"
+msgstr "目前版本："
+
+#: buzz/widgets/update_dialog.py
+msgid "New version:"
+msgstr "新版本："
+
+#: buzz/widgets/update_dialog.py
+msgid "Release Notes:"
+msgstr "版本說明："
+
+#: buzz/widgets/update_dialog.py
+msgid "Download and Install"
+msgstr "下載並安裝"
+
+#: buzz/widgets/update_dialog.py
+msgid "No download URL available for your platform."
+msgstr "您的平台沒有可用的下載連結。"
+
+#: buzz/widgets/update_dialog.py
+msgid "Downloading file {} of {}..."
+msgstr "正在下載第 {} 個檔案，共 {} 個..."
+
+#: buzz/widgets/update_dialog.py
+msgid "Downloading file {} of {} ({:.1f} MB / {:.1f} MB)..."
+msgstr "正在下載第 {} 個檔案，共 {} 個（{:.1f} MB / {:.1f} MB）..."
+
+#: buzz/widgets/update_dialog.py
+msgid "Download Failed"
+msgstr "下載失敗"
+
+#: buzz/widgets/update_dialog.py
+msgid "Failed to download the update: {}"
+msgstr "下載更新失敗：{}"
+
+#: buzz/widgets/update_dialog.py
+msgid "Failed to save the installer: {}"
+msgstr "無法儲存安裝程式：{}"
+
+#: buzz/widgets/update_dialog.py
+msgid "Download complete!"
+msgstr "下載完成！"
+
+#: buzz/widgets/update_dialog.py
+msgid "Failed to run the installer: {}"
+msgstr "無法執行安裝程式：{}"
+
+#: buzz/widgets/about_dialog.py
+msgid "Check for updates"
+msgstr "檢查更新"
+
+#: buzz/widgets/about_dialog.py
+msgid "Show logs"
+msgstr "顯示日誌"
+
+#: buzz/widgets/about_dialog.py
+msgid "You're up to date!"
+msgstr "你是最新的！"
+
+#: buzz/widgets/audio_meter_widget.py
+msgid "Average volume"
+msgstr "平均音量"
+
+#: buzz/widgets/audio_meter_widget.py
+msgid "Queue"
+msgstr "佇列"
+
+#: buzz/widgets/transcription_viewer/transcription_segments_editor_widget.py
+msgid "Start"
+msgstr "開始"
+
+#: buzz/widgets/transcription_viewer/transcription_segments_editor_widget.py
+msgid "End"
+msgstr "結束"
+
+#: buzz/widgets/transcription_viewer/transcription_segments_editor_widget.py
+#: buzz/widgets/transcription_viewer/transcription_view_mode_tool_button.py
+#: buzz/widgets/transcription_viewer/export_transcription_menu.py
+msgid "Text"
+msgstr "文字"
+
+#: buzz/widgets/transcription_viewer/transcription_segments_editor_widget.py
+#: buzz/widgets/transcription_viewer/transcription_view_mode_tool_button.py
+#: buzz/widgets/transcription_viewer/export_transcription_menu.py
+msgid "Translation"
+msgstr "翻譯"
+
+#: buzz/widgets/transcription_viewer/transcription_view_mode_tool_button.py
+msgid "View"
+msgstr "檢視"
+
+#: buzz/widgets/transcription_viewer/transcription_view_mode_tool_button.py
+msgid "Timestamps"
+msgstr "時間戳記"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "Export"
+msgstr "匯出"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "Translate"
+msgstr "翻譯"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+#: buzz/widgets/transcription_viewer/transcription_resizer_widget.py
+msgid "Resize"
+msgstr "調整大小"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "Identify Speakers"
+msgstr "識別說話者"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "Find"
+msgstr "尋找"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "Show/Hide Search Bar (Ctrl+F)"
+msgstr "顯示／隱藏搜尋列（Ctrl+F）"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "Find:"
+msgstr "尋找："
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "Enter text to find..."
+msgstr "輸入要尋找的文字..."
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "Previous match (Shift+Enter)"
+msgstr "上一個符合項目（Shift+Enter）"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "Next match (Ctrl+Enter)"
+msgstr "下一個符合項目（Ctrl+Enter）"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "Clear"
+msgstr "清除"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "Playback Controls:"
+msgstr "播放控制："
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "Loop Segment"
+msgstr "循環片段"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "Enable/disable looping when clicking on transcript segments"
+msgstr "點擊轉錄片段時啟用／停用循環播放"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "Follow Audio"
+msgstr "跟隨音訊"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid ""
+"Enable/disable following the current audio position in the transcript. When "
+"enabled, automatically scrolls to current text."
+msgstr "啟用／停用在轉錄稿中跟隨目前音訊位置。啟用後，自動捲動至目前文字。"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "Scroll to Current"
+msgstr "捲動至目前位置"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "Scroll to the currently spoken text"
+msgstr "捲動至目前正在說話的文字"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "1 of 100+ matches"
+msgstr "100 個以上符合項目中的第 1 個"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "1 of "
+msgstr "第 1 個，共 "
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid " matches"
+msgstr " 個符合項目"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "No matches found"
+msgstr "找不到符合項目"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid " of 100+ matches"
+msgstr "，共 100 個以上符合項目"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid " of "
+msgstr "，共 "
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "API Key Required"
+msgstr "需要 API 金鑰"
+
+#: buzz/widgets/transcription_viewer/transcription_viewer_widget.py
+msgid "Please enter OpenAI API Key in preferences"
+msgstr "請在偏好設定中輸入 OpenAI API 金鑰"
+
+#: buzz/widgets/transcription_viewer/transcription_resizer_widget.py
+msgid "Extend end time"
+msgstr "延長結束時間"
+
+#: buzz/widgets/transcription_viewer/transcription_resizer_widget.py
+msgid "Extend endings by up to (seconds)"
+msgstr "最多延長結束時間（秒）"
+
+#: buzz/widgets/transcription_viewer/transcription_resizer_widget.py
+msgid "Extend endings"
+msgstr "延長結尾"
+
+#: buzz/widgets/transcription_viewer/transcription_resizer_widget.py
+msgid "Resize Options"
+msgstr "調整大小選項"
+
+#: buzz/widgets/transcription_viewer/transcription_resizer_widget.py
+msgid "Desired subtitle length"
+msgstr "理想字幕長度"
+
+#: buzz/widgets/transcription_viewer/transcription_resizer_widget.py
+msgid "Available only if word level timings were disabled during transcription"
+msgstr "僅在轉錄時停用單字級別時間戳記時可用"
+
+#: buzz/widgets/transcription_viewer/transcription_resizer_widget.py
+msgid "Merge Options"
+msgstr "合併選項"
+
+#: buzz/widgets/transcription_viewer/transcription_resizer_widget.py
+msgid "Merge by gap"
+msgstr "依間隔合併"
+
+#: buzz/widgets/transcription_viewer/transcription_resizer_widget.py
+msgid "Split by punctuation"
+msgstr "依標點符號分割"
+
+#: buzz/widgets/transcription_viewer/transcription_resizer_widget.py
+msgid "Split by max length"
+msgstr "依最大長度分割"
+
+#: buzz/widgets/transcription_viewer/transcription_resizer_widget.py
+msgid "Merge"
+msgstr "合併"
+
+#: buzz/widgets/transcription_viewer/transcription_resizer_widget.py
+msgid "Available only if word level timings were enabled during transcription"
+msgstr "僅在轉錄時啟用單字級別時間戳記時可用"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid ""
+"Speaker identification is not available: failed to load required libraries."
+msgstr "說話者識別不可用：無法載入所需程式庫。"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid "1/8 Collecting transcripts"
+msgstr "1/8 收集轉錄稿"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid "2/8 Loading audio"
+msgstr "2/8 載入音訊"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid "3/8 Loading alignment model"
+msgstr "3/8 載入對齊模型"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid "3/8 Loading alignment model (retrying with cache...)"
+msgstr "3/8 載入對齊模型（正在使用快取重試...）"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid ""
+"Failed to load alignment model. Please check your internet connection and "
+"try again."
+msgstr "無法載入對齊模型。請檢查您的網路連線並重試。"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid "4/8 Processing audio"
+msgstr "4/8 處理音訊"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid "5/8 Preparing transcripts"
+msgstr "5/8 準備轉錄稿"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid "6/8 Identifying speakers"
+msgstr "6/8 識別說話者"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid "7/8 Mapping speakers to transcripts"
+msgstr "7/8 將說話者對應到轉錄稿"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid "8/8 Identification done"
+msgstr "8/8 識別完成"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid "0/0 Error identifying speakers"
+msgstr "0/0 識別說話者時發生錯誤"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid "Step 1: Identify speakers"
+msgstr "步驟 1：識別說話者"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid "Identify"
+msgstr "識別"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid "Ready to identify speakers"
+msgstr "準備識別說話者"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid "Audio file not found"
+msgstr "找不到音訊檔案"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid "Step 2: Name speakers"
+msgstr "步驟 2：為說話者命名"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid "Play sample"
+msgstr "播放範例"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid "Merge speaker sentences"
+msgstr "合併說話者句子"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid "Save"
+msgstr "儲存"
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid "Cancelling..."
+msgstr "取消中..."
+
+#: buzz/widgets/transcription_viewer/speaker_identification_widget.py
+msgid "Cancelled"
+msgstr "已取消"
+
+#: buzz/widgets/transcription_viewer/export_transcription_menu.py
+msgid "Save File"
+msgstr "儲存檔案"
+
+#: buzz/widgets/transcription_viewer/export_transcription_menu.py
+msgid "Text files"
+msgstr "文字檔案"
+
+#: buzz/widgets/model_download_progress_dialog.py
+msgid "Downloading model"
+msgstr "正在下載模型"
+
+#: buzz/widgets/model_download_progress_dialog.py
+msgid "remaining"
+msgstr "剩餘"
+
+#: buzz/widgets/menu_bar.py
+msgid "Import File..."
+msgstr "匯入檔案..."
+
+#: buzz/widgets/menu_bar.py
+msgid "Import URL..."
+msgstr "匯入網址..."
+
+#: buzz/widgets/menu_bar.py
+msgid "Import Folder..."
+msgstr "導入資料夾..."
+
+#: buzz/widgets/menu_bar.py
+msgid "About"
+msgstr "關於"
+
+#: buzz/widgets/menu_bar.py
+msgid "Preferences..."
+msgstr "偏好設定..."
+
+#: buzz/widgets/menu_bar.py
+msgid "Help"
+msgstr "幫助"
+
+#: buzz/widgets/menu_bar.py
+msgid "File"
+msgstr "檔案"
+
+#: buzz/widgets/main_window.py
+msgid ""
+"Are you sure you want to delete the selected transcription(s)? This action "
+"cannot be undone."
+msgstr "您確定要刪除所選錄製嗎？此操作無法撤消。"
+
+#: buzz/widgets/main_window.py
+msgid "Select audio file"
+msgstr "選擇聲音檔案"
+
+#: buzz/widgets/main_window.py
+msgid "Select folder"
+msgstr "選擇資料夾"
+
+#: buzz/widgets/main_window.py
+msgid "Unable to save OpenAI API key to keyring"
+msgstr "無法將 OpenAI API 金鑰儲存至鑰匙圈"
+
+#: buzz/transcriber/local_whisper_cpp_server_transcriber.py
+#: buzz/transcriber/recording_transcriber.py
+msgid "Whisper server failed to start. Check logs for details."
+msgstr "Whisper 伺服器啟動失敗。請查看日誌以了解詳情。"
+
+#: buzz/transcriber/local_whisper_cpp_server_transcriber.py
+#: buzz/transcriber/recording_transcriber.py
+msgid ""
+"Whisper server failed to start due to insufficient memory. Please try again "
+"with a smaller model. To force CPU mode use BUZZ_FORCE_CPU=TRUE environment "
+"variable."
+msgstr ""
+"Whisper 伺服器因記憶體不足而啟動失敗。請改用較小的模型重試。若要強制使用 CPU "
+"模式，請設定環境變數 BUZZ_FORCE_CPU=TRUE。"
+
+#: buzz/transcriber/transcriber.py
+msgid "Translate to English"
+msgstr "翻譯為英語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Transcribe"
+msgstr "轉錄"
+
+#: buzz/transcriber/transcriber.py
+msgid "Chinese"
+msgstr "中文"
+
+#: buzz/transcriber/transcriber.py
+msgid "Russian"
+msgstr "俄語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Korean"
+msgstr "韓語"
+
+#: buzz/transcriber/transcriber.py
+msgid "French"
+msgstr "法語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Portuguese"
+msgstr "葡萄牙語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Turkish"
+msgstr "土耳其語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Arabic"
+msgstr "阿拉伯語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Swedish"
+msgstr "瑞典語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Indonesian"
+msgstr "印尼語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Hindi"
+msgstr "印地語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Finnish"
+msgstr "芬蘭語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Vietnamese"
+msgstr "越南語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Hebrew"
+msgstr "希伯來語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Greek"
+msgstr "希臘語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Malay"
+msgstr "馬來語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Czech"
+msgstr "捷克語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Romanian"
+msgstr "羅馬尼亞語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Hungarian"
+msgstr "匈牙利語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Tamil"
+msgstr "泰米爾語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Norwegian"
+msgstr "挪威語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Thai"
+msgstr "泰語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Urdu"
+msgstr "烏爾都語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Croatian"
+msgstr "克羅埃西亞語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Bulgarian"
+msgstr "保加利亞語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Lithuanian"
+msgstr "立陶宛語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Latin"
+msgstr "拉丁語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Maori"
+msgstr "毛利語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Malayalam"
+msgstr "馬拉雅拉姆語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Welsh"
+msgstr "威爾斯語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Slovak"
+msgstr "斯洛伐克語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Telugu"
+msgstr "泰盧固語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Persian"
+msgstr "波斯語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Bengali"
+msgstr "孟加拉語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Serbian"
+msgstr "塞爾維亞語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Azerbaijani"
+msgstr "亞塞拜然語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Slovenian"
+msgstr "斯洛維尼亞語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Kannada"
+msgstr "卡納達語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Estonian"
+msgstr "愛沙尼亞語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Macedonian"
+msgstr "馬其頓語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Breton"
+msgstr "布列塔尼語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Basque"
+msgstr "巴斯克語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Icelandic"
+msgstr "冰島語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Armenian"
+msgstr "亞美尼亞語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Nepali"
+msgstr "尼泊爾語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Mongolian"
+msgstr "蒙古語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Bosnian"
+msgstr "波士尼亞語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Kazakh"
+msgstr "哈薩克語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Albanian"
+msgstr "阿爾巴尼亞語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Swahili"
+msgstr "斯瓦希里語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Galician"
+msgstr "加利西亞語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Marathi"
+msgstr "馬拉地語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Punjabi"
+msgstr "旁遮普語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Sinhala"
+msgstr "僧伽羅語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Khmer"
+msgstr "高棉語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Shona"
+msgstr "紹納語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Yoruba"
+msgstr "約魯巴語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Somali"
+msgstr "索馬利語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Afrikaans"
+msgstr "南非荷蘭語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Occitan"
+msgstr "奧克語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Georgian"
+msgstr "喬治亞語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Belarusian"
+msgstr "白俄羅斯語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Tajik"
+msgstr "塔吉克語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Sindhi"
+msgstr "信德語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Gujarati"
+msgstr "古吉拉特語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Amharic"
+msgstr "阿姆哈拉語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Yiddish"
+msgstr "意第緒語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Lao"
+msgstr "寮語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Uzbek"
+msgstr "烏茲別克語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Faroese"
+msgstr "法羅語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Haitian Creole"
+msgstr "海地克里奧爾語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Pashto"
+msgstr "普什圖語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Turkmen"
+msgstr "土庫曼語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Nynorsk"
+msgstr "新挪威語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Maltese"
+msgstr "馬爾他語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Sanskrit"
+msgstr "梵語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Luxembourgish"
+msgstr "盧森堡語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Myanmar"
+msgstr "緬甸語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Tibetan"
+msgstr "藏語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Tagalog"
+msgstr "他加祿語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Malagasy"
+msgstr "馬拉加斯語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Assamese"
+msgstr "阿薩姆語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Tatar"
+msgstr "韃靼語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Hawaiian"
+msgstr "夏威夷語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Lingala"
+msgstr "林加拉語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Hausa"
+msgstr "豪薩語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Bashkir"
+msgstr "巴什基爾語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Javanese"
+msgstr "爪哇語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Sundanese"
+msgstr "巽他語"
+
+#: buzz/transcriber/transcriber.py
+msgid "Cantonese"
+msgstr "粵語"
+
+#: buzz/transcriber/recording_transcriber.py buzz/model_loader.py
+msgid "A connection error occurred"
+msgstr "發生連線錯誤"
+
+#: buzz/transcriber/recording_transcriber.py
+msgid "Starting Whisper.cpp..."
+msgstr "正在啟動 Whisper.cpp..."
+
+#: buzz/transcriber/recording_transcriber.py
+msgid "Starting transcription..."
+msgstr "正在開始轉錄..."
+
+#: buzz/settings/shortcut.py
+msgid "Open Record Window"
+msgstr "開啟錄製視窗"
+
+#: buzz/settings/shortcut.py
+msgid "Import File"
+msgstr "匯入檔案"
+
+#: buzz/settings/shortcut.py
+msgid "Open Preferences Window"
+msgstr "開啟偏好設定視窗"
+
+#: buzz/settings/shortcut.py
+msgid "View Transcript Text"
+msgstr "檢視轉錄文字"
+
+#: buzz/settings/shortcut.py
+msgid "View Transcript Translation"
+msgstr "檢視轉錄翻譯"
+
+#: buzz/settings/shortcut.py
+msgid "View Transcript Timestamps"
+msgstr "檢視轉錄時間戳記"
+
+#: buzz/settings/shortcut.py
+msgid "Search Transcript"
+msgstr "搜尋轉錄稿"
+
+#: buzz/settings/shortcut.py
+msgid "Go to Next Transcript Search Result"
+msgstr "移至下一個轉錄搜尋結果"
+
+#: buzz/settings/shortcut.py
+msgid "Go to Previous Transcript Search Result"
+msgstr "移至上一個轉錄搜尋結果"
+
+#: buzz/settings/shortcut.py
+msgid "Scroll to Current Text"
+msgstr "捲動至目前文字"
+
+#: buzz/settings/shortcut.py
+msgid "Play/Pause Audio"
+msgstr "播放／暫停音訊"
+
+#: buzz/settings/shortcut.py
+msgid "Replay Current Segment"
+msgstr "重播目前片段"
+
+#: buzz/settings/shortcut.py
+msgid "Toggle Playback Controls"
+msgstr "切換播放控制項"
+
+#: buzz/settings/shortcut.py
+msgid "Decrease Segment Start Time"
+msgstr "縮短片段開始時間"
+
+#: buzz/settings/shortcut.py
+msgid "Increase Segment Start Time"
+msgstr "延長片段開始時間"
+
+#: buzz/settings/shortcut.py
+msgid "Decrease Segment End Time"
+msgstr "縮短片段結束時間"
+
+#: buzz/settings/shortcut.py
+msgid "Increase Segment End Time"
+msgstr "延長片段結束時間"
+
+#: buzz/settings/recording_transcriber_mode.py
+msgid "Append below"
+msgstr "附加至下方"
+
+#: buzz/settings/recording_transcriber_mode.py
+msgid "Append above"
+msgstr "附加至上方"
+
+#: buzz/settings/recording_transcriber_mode.py
+msgid "Append and correct"
+msgstr "附加並校正"
+
+#: buzz/file_transcriber_queue_worker.py
+msgid ""
+"Speech extraction failed! Check your internet connection — a model may need "
+"to be downloaded."
+msgstr "語音提取失敗！請檢查您的網路連線——可能需要下載模型。"
+
+#~ msgid "Comma-separated, e.g. \"0.0, 0.2, 0.4, 0.6, 0.8, 1.0\""
+#~ msgstr "逗號分隔，例如\"0.0, 0.2, 0.4, 0.6, 0.8, 1.0\""
+
+#~ msgid "Temperature:"
+#~ msgstr "溫度:"
+
+#~ msgid "Please translate each text sent to you from English to Spanish."
+#~ msgstr "請將傳送給您的每段文字從英語翻譯為西班牙語。"
+
+#~ msgid "Translation error, see logs!"
+#~ msgstr "翻譯錯誤，請查看日誌！"
+
+#~ msgid "ID"
+#~ msgstr "ID"
+
+#~ msgid "Downloading model (0%, unknown time remaining)"
+#~ msgstr "正在下載模型 (0%, unknown 剩餘時間)"

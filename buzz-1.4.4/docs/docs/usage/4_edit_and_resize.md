@@ -1,0 +1,13 @@
+---
+title: Edit and Resize
+---
+
+[![Resize options](https://raw.githubusercontent.com/chidiwilliams/buzz/main/share/screenshots/buzz-6-resize.png)](https://www.loom.com/share/cf263b099ac3481082bb56d19b7c87fe "Resize options")
+
+When transcript of some audio or video file is generated you can edit it and export to different subtitle formats or plain text. Double-click the transcript in the list of transcripts to see additional options for editing and exporting.
+
+Transcription view screen has option to resize the transcripts. Click on the "Resize" button so see available options. Transcripts that have been generated **with word-level timings** setting enabled can be combined into subtitles specifying different options, like maximum length of a subtitle and if subtitles should be split on punctuation. For transcripts that have been generated **without word-level timings** setting enabled can only be recombined specifying desired max length of a subtitle.  
+
+If audio file is still present on the system word-level timing merge will also analyze the audio for silences to improve subtitle accuracy. 
+
+The resize tool also has an option to extend end time of segments if you want the subtitles to be on the screen for longer. You can specify the amount of time in seconds to extend each subtitle segment. Buzz will add this amount of time to the end of each subtitle segment making sure that the end of a segment does not go over start of the next segment. This feature is available since 1.4.3.

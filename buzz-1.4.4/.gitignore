@@ -1,0 +1,36 @@
+dist/
+__pycache__/
+build/
+.pytest_cache/
+.coverage*
+!.coveragerc
+.env
+.DS_Store
+htmlcov/
+coverage.xml
+.idea/
+.venv/
+venv/
+.claude/
+
+# whisper_cpp
+whisper_cpp
+*.exe
+*.dll
+*.dylib
+*.so
+buzz/whisper_cpp/*
+
+# Internationalization - compiled binaries
+*.mo
+*.po~
+
+benchmarks.json
+
+.eggs
+*.egg-info
+/coverage/
+/wheelhouse/
+/.flatpak-builder
+/repo
+/nemo_msdd_configs
