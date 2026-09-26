@@ -45,7 +45,7 @@ Pipeline:
 | 2 | Source transcript -> Vietnamese translation | ✅ COMPLETED |
 | 3 | Vietnamese TTS | ✅ COMPLETED |
 | 4 | Speech timing synchronization | ✅ COMPLETED |
-| 5 | Audio separation / replacement / mixing | ⬜ NOT STARTED |
+| 5 | Audio separation / replacement / mixing | ✅ COMPLETED |
 | 6 | Vietnamese subtitle generation | ⬜ NOT STARTED |
 | 7 | Final MP4 rendering | ⬜ NOT STARTED |
 | 8 | GUI / end-to-end localization workflow | ⬜ NOT STARTED |
@@ -53,8 +53,8 @@ Pipeline:
 
 Current stable checkpoint:
 
-    Phase 1 + Phase 2 + Phase 3 + Phase 4 complete
-    Latest relevant regression run: 136 passed, 3 skipped, 0 failed
+    Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 complete
+    Latest relevant regression run: 158 passed, 3 skipped, 0 failed
 
 Local commits:
 
@@ -511,45 +511,82 @@ Each valid Vietnamese segment now has deterministic timing metadata suitable for
 
 ## Status
 
-⬜ NOT STARTED
+✅ COMPLETED
 
 ## Objective
 
-Create a full localized audio track while retaining appropriate background sound/music/effects.
+Create a synchronized full-length Vietnamese localized audio track while optionally preserving non-vocal background sound/music/effects.
 
-## Investigation Required
+## Architecture
 
-Compare strategies:
-1. Replace all original audio.
-2. Lower original audio and overlay Vietnamese.
-3. Separate speech/vocals from background.
-4. Preserve background and replace only speech.
+Phase 5 reuses Buzz's bundled FFmpeg path strategy and Demucs dependency.
 
-Buzz already contains Demucs-related infrastructure, so inspect/reuse it before adding another separation dependency.
+    source video/audio
+      -> extract_audio_track(...)
+      -> optional separate_background_with_demucs(...)
+      -> TimedLocalizationTranscript + Vietnamese TTS assets
+      -> mix_localized_audio(...)
+      -> localized PCM WAV
 
-## Required Work
+The final MP4 mux/render remains Phase 7.
 
-- Extract original audio.
-- Optional speech/vocal separation.
-- Place synchronized Vietnamese speech on timeline.
-- Apply gain/normalization.
-- Mix background audio.
-- Avoid clipping.
-- Preserve channels/sample rate as appropriate.
-- Produce final localized audio track.
+## Completed Work
 
-## Tests Required
+- Added FFmpeg-based audio extraction from source media.
+- Added optional Demucs background separation adapter.
+- Demucs sums all non-vocal stems and excludes the vocals stem.
+- Demucs model cache follows BUZZ_MODEL_ROOT/torch-hub when configured, keeping model downloads on drive D on this PC.
+- Reused existing Buzz/Demucs dependencies; no new dependency added.
+- Added FFmpeg-based application of Phase 4 playback-rate metadata.
+- Places each Vietnamese speech segment at its original source start time.
+- Supports multiple Vietnamese speech segments on one full timeline.
+- Supports speech-only replacement output.
+- Supports optional background audio mixing.
+- Supports configurable speech/background gain.
+- Uses a limiter on the final mix to reduce clipping risk.
+- Supports mono or stereo output and configurable sample rate.
+- Pads/trims streams to deterministic final timeline duration.
+- Produces PCM WAV suitable for Phase 7 video rendering/muxing.
+- Added LocalizedAudioResult metadata model.
+- Keeps the source input files unchanged.
 
-- Speech-only source.
-- Background/music source.
-- Silence.
-- Overlap handling.
-- Clipping prevention.
-- Final audio duration matches video timeline.
+## Key Files
+
+    buzz/localization/audio_mix.py
+    buzz/localization/__init__.py
+    tests/localization/audio_mix_test.py
+
+## Testing
+
+    Phase 5 targeted tests: 22 / 22 PASS
+    Latest combined relevant tests: 158 passed, 3 skipped, 0 failed
+
+Covered:
+- speech-only mix command. ✅
+- playback-rate/time-stretch metadata application. ✅
+- segment start-delay placement. ✅
+- multi-segment timeline. ✅
+- optional background mixing. ✅
+- configurable speech/background gain. ✅
+- sample rate/channel configuration. ✅
+- missing speech/background files. ✅
+- clipping limiter in final FFmpeg graph. ✅
+- JSON-compatible result metadata. ✅
+- audio extraction command. ✅
+- real FFmpeg audio extraction integration. ✅
+- real FFmpeg 3-second speech/background mixing integration. ✅
+- Demucs non-vocal stem combination with mocked model API. ✅
+- Phase 1/2/3/4 regression remains healthy. ✅
+- real Whisper/Hugging Face/Faster Whisper/URL regressions remain healthy. ✅
+
+The same 3 upstream Buzz tests remain skipped:
+1. Unix output-path case on Windows.
+2. Unix dated-output-path case on Windows.
+3. test_transcribe_stop, explicitly skipped upstream.
 
 ## Completion Criteria
 
-A full-length Vietnamese localized audio track is available and synchronized to the original video.
+The localization core can now create a synchronized full-length Vietnamese audio track, either speech-only or mixed with preserved background audio, ready for subtitle and final MP4 stages. ✅
 
 ---
 
@@ -807,7 +844,7 @@ Current checkpoint:
     Phase 2 ✅
     Phase 3 ✅
     Phase 4 ✅
-    Phase 5 ⬜
+    Phase 5 ✅
     Phase 6 ⬜
     Phase 7 ⬜
     Phase 8 ⬜
@@ -815,11 +852,11 @@ Current checkpoint:
 
 Next task:
 
-    Design and implement Phase 5 — Audio Separation / Replacement / Mixing.
+    Design and implement Phase 6 — Vietnamese Subtitle Generation.
 
-Do not begin Phase 6 or later until Phase 5 has:
-- an approved audio-processing/mixing design
+Do not begin Phase 7 or later until Phase 6 has:
+- an approved subtitle-generation design
 - targeted tests
-- Phase 1/2/3/4 regression confirmation
+- Phase 1/2/3/4/5 regression confirmation
 - reviewed diff
 - local commit and GitHub push checkpoint

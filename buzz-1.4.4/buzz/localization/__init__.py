@@ -18,6 +18,14 @@ from buzz.localization.tts import (
     TTSResult,
     synthesize_for_localization,
 )
+from buzz.localization.audio_mix import (
+    AudioMixingError,
+    AudioMixingOptions,
+    LocalizedAudioResult,
+    extract_audio_track,
+    mix_localized_audio,
+    separate_background_with_demucs,
+)
 from buzz.localization.timing import (
     TimedLocalizationSegment,
     TimedLocalizationTranscript,
@@ -46,4 +54,10 @@ __all__ = [
     "TimingPolicy",
     "TimingSynchronizationError",
     "synchronize_for_localization",
+    "AudioMixingError",
+    "AudioMixingOptions",
+    "LocalizedAudioResult",
+    "extract_audio_track",
+    "mix_localized_audio",
+    "separate_background_with_demucs",
 ]
