@@ -24,6 +24,7 @@ from buzz.localization.audio_mix import (
     LocalizedAudioResult,
     extract_audio_track,
     mix_localized_audio,
+    probe_media_duration,
     separate_background_with_demucs,
 )
 from buzz.localization.final_render import (
@@ -73,6 +74,7 @@ __all__ = [
     "LocalizedAudioResult",
     "extract_audio_track",
     "mix_localized_audio",
+    "probe_media_duration",
     "separate_background_with_demucs",
     "SubtitleGenerationError",
     "SubtitleOptions",
@@ -84,4 +86,29 @@ __all__ = [
     "FinalRenderOptions",
     "FinalRenderResult",
     "render_localized_mp4",
+    "EdgeTTSProvider",
+    "LocalizationProviderError",
+    "OpenAICompatibleTranslationProvider",
+    "LocalizationCancelled",
+    "LocalizationProgress",
+    "LocalizationStage",
+    "LocalizationWorkflowOptions",
+    "LocalizationWorkflowResult",
+    "cleanup_localization_workspace",
+    "localize_video",
 ]
+
+from buzz.localization.providers import (
+    EdgeTTSProvider,
+    LocalizationProviderError,
+    OpenAICompatibleTranslationProvider,
+)
+from buzz.localization.workflow import (
+    LocalizationCancelled,
+    LocalizationProgress,
+    LocalizationStage,
+    LocalizationWorkflowOptions,
+    LocalizationWorkflowResult,
+    cleanup_localization_workspace,
+    localize_video,
+)

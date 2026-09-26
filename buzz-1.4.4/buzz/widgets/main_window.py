@@ -38,6 +38,7 @@ from buzz.transcriber.transcriber import (
 from buzz.widgets.icon import BUZZ_ICON_PATH
 from buzz.widgets.import_url_dialog import ImportURLDialog
 from buzz.widgets.main_window_toolbar import MainWindowToolbar
+from buzz.widgets.localization_dialog import LocalizationDialog
 from buzz.widgets.menu_bar import MenuBar
 from buzz.widgets.preferences_dialog.models.preferences import Preferences
 from buzz.widgets.transcriber.file_transcriber_widget import FileTranscriberWidget
@@ -110,6 +111,9 @@ class MainWindow(QMainWindow):
         self.menu_bar.import_folder_action_triggered.connect(
             self.on_import_folder_action_triggered
         )
+        self.menu_bar.localize_video_action_triggered.connect(
+            self.on_localize_video_action_triggered
+        )
         self.menu_bar.shortcuts_changed.connect(self.on_shortcuts_changed)
         self.menu_bar.openai_api_key_changed.connect(
             self.on_openai_access_token_changed
@@ -161,6 +165,7 @@ class MainWindow(QMainWindow):
         self.folder_watcher.find_tasks()
 
         self.transcription_viewer_widget = None
+        self.localization_dialog = None
 
         #Initialize and run update checker
         self._init_update_checker()
@@ -267,6 +272,19 @@ class MainWindow(QMainWindow):
         url = ImportURLDialog.prompt(parent=self)
         if url is not None:
             self.open_file_transcriber_widget(url=url)
+
+    def on_localize_video_action_triggered(self):
+        if self.localization_dialog is None:
+            self.localization_dialog = LocalizationDialog(parent=self)
+            self.localization_dialog.finished.connect(
+                self.on_localization_dialog_finished
+            )
+        self.localization_dialog.show()
+        self.localization_dialog.raise_()
+        self.localization_dialog.activateWindow()
+
+    def on_localization_dialog_finished(self):
+        self.localization_dialog = None
 
     def on_import_folder_action_triggered(self):
         folder = QFileDialog.getExistingDirectory(self, _("Select folder"))

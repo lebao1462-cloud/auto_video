@@ -71,6 +71,52 @@ def _run_ffmpeg(command: list[str]) -> None:
         raise AudioMixingError(f"FFmpeg failed: {message}")
 
 
+
+def probe_media_duration(
+    media_file: str | Path,
+    *,
+    ffprobe_runner: Callable[[list[str]], subprocess.CompletedProcess] | None = None,
+) -> float:
+    """Return media duration in seconds using ffprobe."""
+    media_path = Path(media_file)
+    if not media_path.is_file():
+        raise AudioMixingError(f"Media file does not exist: {media_file}")
+
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(media_path),
+    ]
+
+    if ffprobe_runner is None:
+        def ffprobe_runner(command):
+            return subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                env=_ffmpeg_env(),
+            )
+
+    result = ffprobe_runner(command)
+    if result.returncode != 0:
+        raise AudioMixingError(
+            "FFprobe failed: " + (result.stderr or "unknown error").strip()
+        )
+
+    try:
+        duration = float(result.stdout.strip())
+    except (TypeError, ValueError) as exc:
+        raise AudioMixingError("FFprobe returned an invalid media duration") from exc
+
+    if duration <= 0:
+        raise AudioMixingError("Media duration must be positive")
+    return duration
+
 def extract_audio_track(
     source_media_file: str | Path,
     output_file: str | Path,
@@ -186,6 +232,7 @@ def mix_localized_audio(
     *,
     background_audio_file: str | Path | None = None,
     options: AudioMixingOptions | None = None,
+    target_duration: float | None = None,
     ffmpeg_runner: Callable[[list[str]], None] = _run_ffmpeg,
 ) -> LocalizedAudioResult:
     """Render a synchronized full-length localized audio track with FFmpeg."""
@@ -222,9 +269,21 @@ def mix_localized_audio(
         background_index = len(transcript.segments)
         inputs.extend(["-i", str(background_path)])
 
-    final_duration = max(float(segment.end) for segment in transcript.segments)
-    if final_duration <= 0:
-        raise AudioMixingError("Final audio duration must be positive")
+    last_segment_end = max(float(segment.end) for segment in transcript.segments)
+    if target_duration is None:
+        final_duration = last_segment_end
+    else:
+        if (
+            not isinstance(target_duration, (int, float))
+            or isinstance(target_duration, bool)
+            or target_duration <= 0
+        ):
+            raise AudioMixingError("Target audio duration must be positive")
+        if float(target_duration) + 1e-6 < last_segment_end:
+            raise AudioMixingError(
+                "Target audio duration cannot end before the last speech segment"
+            )
+        final_duration = float(target_duration)
 
     filters: list[str] = []
     speech_labels: list[str] = []

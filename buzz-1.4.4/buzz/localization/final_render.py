@@ -184,9 +184,10 @@ def render_localized_mp4(
             ]
         )
 
+    if render_options.subtitle_mode != "soft":
+        command.append("-shortest")
     command.extend(
         [
-            "-shortest",
             "-movflags",
             "+faststart",
             str(output_path),

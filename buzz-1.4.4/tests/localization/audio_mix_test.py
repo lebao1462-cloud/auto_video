@@ -470,3 +470,49 @@ def test_demucs_adapter_rejects_missing_source(tmp_path):
             tmp_path / "background.wav",
             device="cpu",
         )
+
+
+def test_target_duration_can_extend_past_last_speech(tmp_path):
+    speech = tmp_path / "speech.wav"
+    make_wav(speech)
+    runner = FakeRunner()
+
+    result = mix_localized_audio(
+        make_transcript([make_segment(speech, 0.0, 1.0)]),
+        tmp_path / "localized.wav",
+        target_duration=3.5,
+        ffmpeg_runner=runner,
+    )
+
+    command = runner.commands[0]
+    filter_complex = command[command.index("-filter_complex") + 1]
+    assert "apad=whole_dur=3.500000" in filter_complex
+    assert command[command.index("-t") + 1] == "3.500000"
+    assert result.duration == 3.5
+
+
+def test_target_duration_cannot_cut_off_last_speech(tmp_path):
+    speech = tmp_path / "speech.wav"
+    make_wav(speech)
+
+    with pytest.raises(AudioMixingError, match="before the last speech"):
+        mix_localized_audio(
+            make_transcript([make_segment(speech, 0.0, 2.0)]),
+            tmp_path / "localized.wav",
+            target_duration=1.5,
+            ffmpeg_runner=FakeRunner(),
+        )
+
+
+@pytest.mark.parametrize("duration", [0, -1, "2", True])
+def test_rejects_invalid_target_duration(duration, tmp_path):
+    speech = tmp_path / "speech.wav"
+    make_wav(speech)
+
+    with pytest.raises(AudioMixingError, match="Target audio duration"):
+        mix_localized_audio(
+            make_transcript([make_segment(speech, 0.0, 1.0)]),
+            tmp_path / "localized.wav",
+            target_duration=duration,
+            ffmpeg_runner=FakeRunner(),
+        )

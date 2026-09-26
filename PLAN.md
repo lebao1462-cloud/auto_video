@@ -48,13 +48,13 @@ Pipeline:
 | 5 | Audio separation / replacement / mixing | ✅ COMPLETED |
 | 6 | Vietnamese subtitle generation | ✅ COMPLETED |
 | 7 | Final MP4 rendering | ✅ COMPLETED |
-| 8 | GUI / end-to-end localization workflow | ⬜ NOT STARTED |
+| 8 | GUI / end-to-end localization workflow | ✅ COMPLETED |
 | 9 | Packaging / reliability / release | ⬜ NOT STARTED |
 
 Current stable checkpoint:
 
-    Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 + Phase 6 + Phase 7 complete
-    Latest relevant regression run: 205 passed, 3 skipped, 0 failed
+    Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 + Phase 6 + Phase 7 + Phase 8 complete
+    Latest relevant regression run: 230 passed, 3 skipped, 0 failed
 
 Local commits:
 
@@ -784,49 +784,67 @@ The core pipeline can now create a final Vietnamese-localized MP4 from prepared 
 
 ## Status
 
-⬜ NOT STARTED
+✅ COMPLETED
 
 ## Objective
 
-Allow a user to run localization without manually calling internal functions.
+Allow a normal user to run the complete localization pipeline without manually calling internal Phase 1-7 APIs.
 
-Desired flow:
+## Completed Work
 
-    Choose video
-      -> source language / auto
-      -> translation provider
-      -> Vietnamese TTS voice/provider
-      -> Start
-      -> progress by phase
-      -> preview/result
-      -> open output folder
+- Added localize_video(...) orchestration across Phases 1-7.
+- Added stable workflow options/result/progress models.
+- Added stage-by-stage progress reporting.
+- Added cancellation checkpoints between pipeline stages.
+- Added workspace cleanup helper that preserves final outputs.
+- Added source-media duration probing so final localized audio can match the original video duration.
+- Added optional background separation in the end-to-end workflow.
+- Added concrete OpenAI-compatible translation provider for configurable API/base URL/model.
+- Added Vietnamese Edge TTS provider with selectable female/male Vietnamese voices.
+- Added LocalizationDialog using a background QThread; the Qt UI is not blocked by the pipeline.
+- Added input video picker, output directory picker, Whisper model picker, source language selector, translation provider settings, Vietnamese voice selection, subtitle mode and optional Demucs background preservation.
+- Translation API key field is masked and can reuse the existing Buzz keyring value.
+- Added progress bar, status messages and cancel control.
+- Added File menu action: Localize Video to Vietnamese...
+- Preserved existing Buzz transcription/import workflows.
+- Added an end-to-end FFmpeg integration test that creates a real source MP4 and validates final video/audio/subtitle streams and duration.
+- Added no hard-coded paid provider requirement; translation endpoint remains OpenAI-compatible and configurable.
+- edge-tts remains runtime-optional for Phase 8 because the upstream Buzz uv lock cannot currently be regenerated while its NVIDIA registry is unavailable. Phase 9 preflight/install documentation handles this explicitly.
 
-## Required Work
+## Key Files
 
-- Orchestration service for Phases 1-7.
-- Stable job state.
-- Cancellation.
-- Progress reporting.
-- Error reporting.
-- Provider/settings UI.
-- Output folder settings.
-- Retry/resume where practical.
-- Do not block Qt UI thread.
-- Preserve normal Buzz transcription workflows.
+    buzz/localization/providers.py
+    buzz/localization/workflow.py
+    buzz/widgets/localization_dialog.py
+    buzz/widgets/main_window.py
+    buzz/widgets/menu_bar.py
+    tests/localization/providers_test.py
+    tests/localization/workflow_test.py
+    tests/widgets/localization_dialog_test.py
+    tests/widgets/menu_bar_test.py
 
-Potential future API:
+## Testing
 
-    localize_video(...)
+    Phase 8 targeted tests: 19 / 19 PASS
+    Latest combined relevant tests: 230 passed, 3 skipped, 0 failed
 
-Potential future CLI:
-
-    buzz localize input.mp4
-
-Do not finalize CLI/UI until core pipeline APIs are stable.
+Covered:
+- OpenAI-compatible English -> Vietnamese translation provider. ✅
+- Chinese -> Vietnamese provider path. ✅
+- Edge TTS validation and audio-duration probing. ✅
+- Complete Phase 1-7 orchestration with fake translation/TTS providers. ✅
+- Real FFmpeg final MP4 creation through workflow. ✅
+- Final video/audio/subtitle stream validation with ffprobe. ✅
+- Final duration matching source video. ✅
+- Cancellation before workflow start. ✅
+- Workspace cleanup preserving final outputs. ✅
+- GUI defaults/input validation. ✅
+- File menu localization action/signal. ✅
+- Existing localization and Buzz transcriber regressions remain healthy. ✅
 
 ## Completion Criteria
 
-A normal user can localize a video end-to-end from one workflow.
+A normal user can launch the Vietnamese localization dialog from Buzz, choose a video/settings, start the complete workflow, observe progress/cancel it, and receive a localized MP4/subtitle output. ✅
 
 ---
 
@@ -957,12 +975,12 @@ Current checkpoint:
     Phase 5 ✅
     Phase 6 ✅
     Phase 7 ✅
-    Phase 8 ⬜
+    Phase 8 ✅
     Phase 9 ⬜
 
 Next task:
 
-    Design and implement Phase 8 — End-to-End Workflow / GUI.
+    Complete Phase 9 — Packaging / Reliability / Release.
 
 Do not begin Phase 9 until Phase 8 has:
 - an approved orchestration/UI design

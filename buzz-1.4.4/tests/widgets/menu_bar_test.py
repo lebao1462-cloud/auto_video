@@ -20,6 +20,18 @@ class TestMenuBar:
 
         signal_mock.assert_called_once()
 
+    def test_localize_video_action_emits_signal(self, qtbot, shortcuts):
+        menu_bar = MenuBar(
+            shortcuts=shortcuts, preferences=Preferences.load(QSettings())
+        )
+        qtbot.add_widget(menu_bar)
+
+        signal_mock = Mock()
+        menu_bar.localize_video_action_triggered.connect(signal_mock)
+        menu_bar.localize_video_action.trigger()
+
+        signal_mock.assert_called_once()
+
     def test_open_preferences_dialog(self, qtbot, shortcuts):
         menu_bar = MenuBar(
             shortcuts=shortcuts, preferences=Preferences.load(QSettings())
