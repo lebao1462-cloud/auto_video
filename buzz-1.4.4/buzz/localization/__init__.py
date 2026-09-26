@@ -18,6 +18,13 @@ from buzz.localization.tts import (
     TTSResult,
     synthesize_for_localization,
 )
+from buzz.localization.timing import (
+    TimedLocalizationSegment,
+    TimedLocalizationTranscript,
+    TimingPolicy,
+    TimingSynchronizationError,
+    synchronize_for_localization,
+)
 
 __all__ = [
     "LocalizationSegment",
@@ -34,4 +41,9 @@ __all__ = [
     "TTSRequest",
     "TTSResult",
     "synthesize_for_localization",
+    "TimedLocalizationSegment",
+    "TimedLocalizationTranscript",
+    "TimingPolicy",
+    "TimingSynchronizationError",
+    "synchronize_for_localization",
 ]

@@ -44,7 +44,7 @@ Pipeline:
 | 1 | Video -> timestamped source transcript | ✅ COMPLETED |
 | 2 | Source transcript -> Vietnamese translation | ✅ COMPLETED |
 | 3 | Vietnamese TTS | ✅ COMPLETED |
-| 4 | Speech timing synchronization | ⬜ NOT STARTED |
+| 4 | Speech timing synchronization | ✅ COMPLETED |
 | 5 | Audio separation / replacement / mixing | ⬜ NOT STARTED |
 | 6 | Vietnamese subtitle generation | ⬜ NOT STARTED |
 | 7 | Final MP4 rendering | ⬜ NOT STARTED |
@@ -53,8 +53,8 @@ Pipeline:
 
 Current stable checkpoint:
 
-    Phase 1 + Phase 2 + Phase 3 complete
-    Latest relevant regression run: 110 passed, 3 skipped, 0 failed
+    Phase 1 + Phase 2 + Phase 3 + Phase 4 complete
+    Latest relevant regression run: 136 passed, 3 skipped, 0 failed
 
 Local commits:
 
@@ -409,48 +409,101 @@ The Phase 3 localization core can request and validate stable Vietnamese speech 
 
 ## Status
 
-⬜ NOT STARTED
+✅ COMPLETED
 
 ## Objective
 
-Fit generated Vietnamese speech naturally into the original segment timeline.
+Create deterministic timing metadata that fits Vietnamese speech into the original source timeline without modifying audio waveforms yet.
 
-Problem:
+Input:
 
-    generated TTS duration != source segment duration
+    SynthesizedLocalizationTranscript
 
-## Required Work
+Output:
 
-Investigate:
-- silence trimming
-- pause insertion
-- limited speed-up
-- limited slow-down
-- padding
-- overlap prevention
-- neighboring timing flexibility
+    TimedLocalizationTranscript
+        source_file
+        source_language
+        target_language
+        timing_policy
+        segments[]
 
-## Rules
+    TimedLocalizationSegment
+        original start/end
+        source/translated text
+        Phase 3 audio metadata
+        slot_duration
+        playback_rate
+        adjusted_audio_duration
+        leading_padding
+        trailing_padding
+        timing_action
 
-- Original video timeline is authoritative.
-- Do not silently remove spoken content.
-- Avoid unnatural speed changes.
-- Timing logic must remain separate from TTS provider code.
-- Preserve subtitle compatibility.
+## Architecture
 
-## Tests Required
+Phase 4 creates a timing plan only.
 
-- TTS shorter than slot.
-- TTS equal to slot.
-- TTS slightly longer.
-- TTS much longer.
-- Adjacent segments.
-- Invalid/zero duration.
-- No mutation of previous-phase data.
+    SynthesizedLocalizationTranscript
+      -> TimingPolicy
+      -> synchronize_for_localization(...)
+      -> TimedLocalizationTranscript
+
+Actual waveform time-stretching, silence insertion, and final timeline mixing remain Phase 5 responsibilities.
+
+## Completed Work
+
+- Added immutable TimingPolicy.
+- Added TimedLocalizationTranscript and TimedLocalizationSegment.
+- Added synchronize_for_localization(...).
+- Original video/source segment timeline remains authoritative.
+- Exact-duration speech uses playback rate 1.0.
+- Slightly short speech may be slowed only within the configured natural limit.
+- Much shorter speech keeps natural speed and uses trailing silence padding metadata.
+- Slightly long speech may be sped up only within the configured maximum.
+- Speech requiring excessive speed-up is rejected with TimingSynchronizationError instead of being unnaturally compressed.
+- Default playback-rate limits are 0.90x minimum and 1.25x maximum.
+- Adjacent source segments remain non-overlapping.
+- Overlapping or invalid source timings are rejected.
+- Phase 3 source text, translation, audio path, provider, voice and metadata are preserved.
+- Input Phase 3 transcript is never mutated.
+- Output remains JSON-compatible.
+- No new dependency was introduced.
+
+## Key Files
+
+    buzz/localization/timing.py
+    buzz/localization/__init__.py
+    tests/localization/timing_test.py
+
+## Testing
+
+    Phase 4 targeted tests: 24 / 24 PASS
+    Latest combined relevant tests: 136 passed, 3 skipped, 0 failed
+
+Covered:
+- exact-duration speech. ✅
+- slightly shorter speech / limited slowdown. ✅
+- much shorter speech / silence padding. ✅
+- slightly longer speech / limited speed-up. ✅
+- excessively long speech rejection. ✅
+- custom timing policy. ✅
+- adjacent segments. ✅
+- overlap prevention. ✅
+- invalid start/end/duration handling. ✅
+- JSON-compatible output. ✅
+- Phase 3 metadata preservation. ✅
+- Phase 3 input immutability. ✅
+- Phase 1/2/3 regression remains healthy. ✅
+- real Whisper/Hugging Face/Faster Whisper/URL regressions remain healthy. ✅
+
+The same 3 upstream Buzz tests remain skipped:
+1. Unix output-path case on Windows.
+2. Unix dated-output-path case on Windows.
+3. test_transcribe_stop, explicitly skipped upstream.
 
 ## Completion Criteria
 
-Each Vietnamese segment has deterministic synchronized timing metadata suitable for final audio placement.
+Each valid Vietnamese segment now has deterministic timing metadata suitable for Phase 5 audio processing and placement. ✅
 
 ---
 
@@ -753,7 +806,7 @@ Current checkpoint:
     Phase 1 ✅
     Phase 2 ✅
     Phase 3 ✅
-    Phase 4 ⬜
+    Phase 4 ✅
     Phase 5 ⬜
     Phase 6 ⬜
     Phase 7 ⬜
@@ -762,11 +815,11 @@ Current checkpoint:
 
 Next task:
 
-    Design and implement Phase 4 — Speech Timing Synchronization.
+    Design and implement Phase 5 — Audio Separation / Replacement / Mixing.
 
-Do not begin Phase 5 or later until Phase 4 has:
-- an approved timing/synchronization design
+Do not begin Phase 6 or later until Phase 5 has:
+- an approved audio-processing/mixing design
 - targeted tests
-- Phase 1/2/3 regression confirmation
+- Phase 1/2/3/4 regression confirmation
 - reviewed diff
 - local commit and GitHub push checkpoint
