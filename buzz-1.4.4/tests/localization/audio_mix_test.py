@@ -516,3 +516,19 @@ def test_rejects_invalid_target_duration(duration, tmp_path):
             target_duration=duration,
             ffmpeg_runner=FakeRunner(),
         )
+
+def test_target_duration_allows_small_asr_timestamp_drift(tmp_path):
+    speech = tmp_path / "speech-drift.wav"
+    make_wav(speech)
+    runner = FakeRunner()
+
+    result = mix_localized_audio(
+        make_transcript([make_segment(speech, 0.0, 2.12)]),
+        tmp_path / "localized-drift.wav",
+        target_duration=2.0,
+        ffmpeg_runner=runner,
+    )
+
+    command = runner.commands[0]
+    assert command[command.index("-t") + 1] == "2.120000"
+    assert result.duration == pytest.approx(2.12)

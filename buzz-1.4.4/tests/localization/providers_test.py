@@ -8,6 +8,7 @@ from buzz.localization.providers import (
     LocalizationProviderError,
     OpenAICompatibleTranslationProvider,
     _probe_audio_duration,
+    _trim_edge_tts_silence,
 )
 from buzz.localization.tts import TTSRequest
 
@@ -127,3 +128,24 @@ def test_edge_tts_rejects_empty_text(tmp_path):
                 output_file_stem=str(tmp_path / "speech"),
             )
         )
+
+def test_trim_edge_tts_silence_removes_boundary_silence(tmp_path):
+    wav_path = tmp_path / "edge.wav"
+    sample_rate = 8000
+    leading_silence = b"\x00\x00" * int(sample_rate * 0.2)
+    tone = b"\x10\x27\xf0\xd8" * int(sample_rate * 0.25)
+    trailing_silence = b"\x00\x00" * int(sample_rate * 1.0)
+
+    with wave.open(str(wav_path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(leading_silence + tone + trailing_silence)
+
+    before = _probe_audio_duration(wav_path)
+    _trim_edge_tts_silence(wav_path)
+    after = _probe_audio_duration(wav_path)
+
+    assert before == pytest.approx(1.7, abs=0.05)
+    assert after < before - 0.7
+    assert 0.4 <= after <= 0.8

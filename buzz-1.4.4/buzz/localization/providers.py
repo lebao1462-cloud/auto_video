@@ -4,7 +4,7 @@ import subprocess
 
 from openai import OpenAI
 
-from buzz.localization.audio_mix import _ffmpeg_env
+from buzz.localization.audio_mix import _ffmpeg_env, _run_ffmpeg
 from buzz.localization.tts import TTSRequest, TTSResult
 
 
@@ -117,6 +117,7 @@ class EdgeTTSProvider:
         if not output_path.is_file() or output_path.stat().st_size <= 0:
             raise LocalizationProviderError("Edge TTS did not create an audio file")
 
+        _trim_edge_tts_silence(output_path)
         duration = _probe_audio_duration(output_path)
         return TTSResult(
             audio_file=str(output_path),
@@ -130,6 +131,24 @@ class EdgeTTSProvider:
                 "pitch": pitch,
             },
         )
+
+
+def _trim_edge_tts_silence(audio_file: Path) -> None:
+    trimmed = audio_file.with_name(f"{audio_file.stem}.trimmed{audio_file.suffix}")
+    filter_expression = (
+        "silenceremove=start_periods=1:start_silence=0.05:start_threshold=-40dB,"
+        "areverse,"
+        "silenceremove=start_periods=1:start_silence=0.05:start_threshold=-40dB,"
+        "areverse"
+    )
+    _run_ffmpeg([
+        "ffmpeg", "-y", "-nostdin", "-i", str(audio_file),
+        "-af", filter_expression, str(trimmed),
+    ])
+    if not trimmed.is_file() or trimmed.stat().st_size <= 0:
+        trimmed.unlink(missing_ok=True)
+        raise LocalizationProviderError("FFmpeg did not create trimmed Edge TTS audio")
+    trimmed.replace(audio_file)
 
 
 def _probe_audio_duration(audio_file: Path) -> float:

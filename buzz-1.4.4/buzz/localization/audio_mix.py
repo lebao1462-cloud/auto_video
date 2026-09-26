@@ -279,11 +279,13 @@ def mix_localized_audio(
             or target_duration <= 0
         ):
             raise AudioMixingError("Target audio duration must be positive")
-        if float(target_duration) + 1e-6 < last_segment_end:
+        target_duration = float(target_duration)
+        drift = last_segment_end - target_duration
+        if drift > 0.25:
             raise AudioMixingError(
                 "Target audio duration cannot end before the last speech segment"
             )
-        final_duration = float(target_duration)
+        final_duration = max(target_duration, last_segment_end)
 
     filters: list[str] = []
     speech_labels: list[str] = []
