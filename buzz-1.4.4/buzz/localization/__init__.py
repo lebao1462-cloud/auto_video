@@ -26,6 +26,14 @@ from buzz.localization.audio_mix import (
     mix_localized_audio,
     separate_background_with_demucs,
 )
+from buzz.localization.subtitles import (
+    SubtitleGenerationError,
+    SubtitleOptions,
+    SubtitleResult,
+    render_srt,
+    render_vtt,
+    write_subtitles,
+)
 from buzz.localization.timing import (
     TimedLocalizationSegment,
     TimedLocalizationTranscript,
@@ -60,4 +68,10 @@ __all__ = [
     "extract_audio_track",
     "mix_localized_audio",
     "separate_background_with_demucs",
+    "SubtitleGenerationError",
+    "SubtitleOptions",
+    "SubtitleResult",
+    "render_srt",
+    "render_vtt",
+    "write_subtitles",
 ]

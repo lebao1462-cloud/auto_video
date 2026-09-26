@@ -46,15 +46,15 @@ Pipeline:
 | 3 | Vietnamese TTS | ✅ COMPLETED |
 | 4 | Speech timing synchronization | ✅ COMPLETED |
 | 5 | Audio separation / replacement / mixing | ✅ COMPLETED |
-| 6 | Vietnamese subtitle generation | ⬜ NOT STARTED |
+| 6 | Vietnamese subtitle generation | ✅ COMPLETED |
 | 7 | Final MP4 rendering | ⬜ NOT STARTED |
 | 8 | GUI / end-to-end localization workflow | ⬜ NOT STARTED |
 | 9 | Packaging / reliability / release | ⬜ NOT STARTED |
 
 Current stable checkpoint:
 
-    Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 complete
-    Latest relevant regression run: 158 passed, 3 skipped, 0 failed
+    Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 + Phase 6 complete
+    Latest relevant regression run: 183 passed, 3 skipped, 0 failed
 
 Local commits:
 
@@ -594,38 +594,102 @@ The localization core can now create a synchronized full-length Vietnamese audio
 
 ## Status
 
-⬜ NOT STARTED
+✅ COMPLETED
 
 ## Objective
 
-Generate Vietnamese subtitles from translated/timed segments.
+Generate valid UTF-8 Vietnamese subtitle files directly from Phase 4 timed localization data.
+
+Input:
+
+    TimedLocalizationTranscript
 
 Output:
-- SRT required
-- VTT optional
-- ASS optional for richer styling
 
-## Required Work
+    SubtitleResult
+        subtitle_file
+        format
+        cue_count
 
-- Map Vietnamese translation to segment timestamps.
-- Preserve Unicode.
-- Format timestamps correctly.
-- Handle punctuation/line wrapping.
-- Prevent invalid intervals.
-- Prepare optional style metadata for final burn-in.
+Supported formats:
+- SRT ✅
+- VTT ✅
+- ASS deferred until richer styling is required
 
-## Tests Required
+## Architecture
 
-- Vietnamese Unicode.
-- Timestamp formatting.
-- Segment order.
-- Multiline subtitles.
-- Empty-text rejection.
-- Subtitle count matches translated segments.
+Phase 6 reuses Buzz's existing subtitle timestamp formatter to stay consistent with native Buzz exports.
+
+    TimedLocalizationTranscript
+      -> subtitle validation
+      -> text normalization / optional line wrapping
+      -> render_srt(...) or render_vtt(...)
+      -> write_subtitles(...)
+      -> UTF-8 subtitle file
+
+## Completed Work
+
+- Added SubtitleOptions for configurable line wrapping.
+- Added SubtitleResult metadata model.
+- Added render_srt(...).
+- Added render_vtt(...).
+- Added write_subtitles(...).
+- Reused Buzz to_timestamp(...) formatting behavior.
+- Converts Phase 4 second-based timestamps to subtitle milliseconds.
+- Preserves Vietnamese Unicode.
+- Preserves cue order and source timeline timestamps.
+- Uses comma millisecond separator for SRT.
+- Uses decimal-point millisecond separator for WebVTT.
+- Adds required WEBVTT header.
+- Supports configurable maximum line length and maximum line count.
+- Can disable automatic line wrapping.
+- Normalizes excessive internal whitespace/newlines.
+- Rejects empty Vietnamese text.
+- Rejects invalid or overlapping subtitle intervals.
+- Rejects unsupported target language and output format.
+- Ensures output extension matches requested format.
+- Writes subtitle files as UTF-8 with deterministic LF newlines.
+- Does not mutate Phase 4 input data.
+- Added no new dependency.
+
+## Key Files
+
+    buzz/localization/subtitles.py
+    buzz/localization/__init__.py
+    tests/localization/subtitles_test.py
+
+## Testing
+
+    Phase 6 targeted tests: 25 / 25 PASS
+    Latest combined relevant tests: 183 passed, 3 skipped, 0 failed
+
+Covered:
+- Vietnamese Unicode. ✅
+- SRT formatting. ✅
+- WebVTT formatting/header. ✅
+- hour/minute/second/millisecond timestamps. ✅
+- millisecond rounding. ✅
+- segment order/count. ✅
+- configurable multiline wrapping. ✅
+- whitespace normalization. ✅
+- empty-text rejection. ✅
+- invalid interval rejection. ✅
+- overlap prevention. ✅
+- unsupported language/format rejection. ✅
+- UTF-8 file writing. ✅
+- JSON-compatible result metadata. ✅
+- Phase 4 input immutability. ✅
+- Phase 1/2/3/4/5 regression remains healthy. ✅
+- real Whisper/Hugging Face/Faster Whisper/URL regressions remain healthy. ✅
+
+The same 3 upstream Buzz tests remain skipped:
+1. Unix output-path case on Windows.
+2. Unix dated-output-path case on Windows.
+3. test_transcribe_stop, explicitly skipped upstream.
 
 ## Completion Criteria
 
-Valid Vietnamese subtitle files can be generated independently of final rendering.
+Valid Vietnamese SRT/VTT subtitle files can now be generated independently and are ready for Phase 7 final MP4 rendering or burn-in. ✅
 
 ---
 
@@ -845,18 +909,18 @@ Current checkpoint:
     Phase 3 ✅
     Phase 4 ✅
     Phase 5 ✅
-    Phase 6 ⬜
+    Phase 6 ✅
     Phase 7 ⬜
     Phase 8 ⬜
     Phase 9 ⬜
 
 Next task:
 
-    Design and implement Phase 6 — Vietnamese Subtitle Generation.
+    Design and implement Phase 7 — Final MP4 Rendering.
 
-Do not begin Phase 7 or later until Phase 6 has:
-- an approved subtitle-generation design
+Do not begin Phase 8 or later until Phase 7 has:
+- an approved FFmpeg rendering/muxing design
 - targeted tests
-- Phase 1/2/3/4/5 regression confirmation
+- Phase 1/2/3/4/5/6 regression confirmation
 - reviewed diff
 - local commit and GitHub push checkpoint
