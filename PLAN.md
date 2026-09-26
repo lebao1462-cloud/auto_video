@@ -43,7 +43,7 @@ Pipeline:
 | 0 | Project foundation / Buzz reuse | ✅ COMPLETED |
 | 1 | Video -> timestamped source transcript | ✅ COMPLETED |
 | 2 | Source transcript -> Vietnamese translation | ✅ COMPLETED |
-| 3 | Vietnamese TTS | ⬜ NOT STARTED |
+| 3 | Vietnamese TTS | ✅ COMPLETED |
 | 4 | Speech timing synchronization | ⬜ NOT STARTED |
 | 5 | Audio separation / replacement / mixing | ⬜ NOT STARTED |
 | 6 | Vietnamese subtitle generation | ⬜ NOT STARTED |
@@ -53,15 +53,15 @@ Pipeline:
 
 Current stable checkpoint:
 
-    Phase 1 + Phase 2 complete
-    Latest relevant regression run: 88 passed, 3 skipped, 0 failed
+    Phase 1 + Phase 2 + Phase 3 complete
+    Latest relevant regression run: 110 passed, 3 skipped, 0 failed
 
 Local commits:
 
     87f3c69  feat: add localization transcription pipeline
     4fd47db  feat: add Vietnamese localization translation stage
 
-No automatic GitHub push.
+Completed phases are pushed to GitHub after review, tests, and local commit.
 
 ---
 
@@ -79,6 +79,7 @@ No automatic GitHub push.
 10. Targeted tests must pass before moving to the next phase.
 11. Re-run previous localization tests after later pipeline changes.
 12. On this development PC, models/caches/temp files should use drive D.
+13. After each completed phase passes review/tests, commit locally and push to GitHub.
 
 Development paths:
 
@@ -108,7 +109,7 @@ Prepare the Buzz fork for controlled incremental development.
 - Test/URL temporary files redirected to drive D during testing.
 - AGENTS.md created.
 - Planner -> Codex -> Reviewer workflow established.
-- Git workflow established: inspect -> implement -> test -> review -> local commit -> no automatic push.
+- Git workflow established: inspect -> implement -> test -> review -> local commit -> push completed phase to GitHub.
 
 ## Completion Criteria
 
@@ -302,17 +303,17 @@ No Phase 1 or Phase 2 localization test is intentionally skipped.
 
 ## Status
 
-⬜ NOT STARTED
+✅ COMPLETED
 
 ## Objective
 
-Generate Vietnamese speech audio for every translated segment.
+Generate Vietnamese speech audio assets for translated segments through a provider-neutral TTS interface.
 
 Input:
 
     TranslatedLocalizationTranscript
 
-Output concept:
+Output:
 
     SynthesizedLocalizationTranscript
         source_file
@@ -327,49 +328,80 @@ Output concept:
         translated_text
         audio_file
         audio_duration
-        voice/provider metadata
+        provider
+        voice
+        provider_metadata
 
-## Required Architecture
+## Architecture
 
 Provider-neutral TTS layer:
 
-    TTSProvider
-        synthesize(text, voice/options) -> audio result
+    TTSRequest
+      ->
+    TTSProvider.synthesize(...)
+      ->
+    TTSResult
+      ->
+    SynthesizedLocalizationTranscript
 
-Possible providers later:
+Concrete providers can later be added without changing the localization pipeline.
+
+Possible providers:
 - free cloud TTS
 - paid cloud TTS
 - Edge TTS where suitable
 - local Vietnamese TTS
 - other interchangeable engines
 
-## Required Work
+## Completed Work
 
-- Inspect Buzz audio helpers first.
-- Define TTS result models.
-- Define TTSProvider.
-- Generate one audio asset per translated segment.
-- Preserve segment identity/order.
-- Store generated duration.
-- Handle Vietnamese Unicode.
-- Handle provider errors.
-- Store assets/cache on drive D.
-- Add fake-provider tests.
+- Inspected existing Buzz audio helpers before implementation.
+- Added provider-neutral TTSProvider protocol.
+- Added TTSRequest and TTSResult models.
+- Added SynthesizedLocalizationTranscript and SynthesizedLocalizationSegment.
+- Added synthesize_for_localization(...).
+- Creates one deterministic synthesis request per translated segment.
+- Preserves source text, Vietnamese translation, timestamps and segment order.
+- Stores generated audio file path and duration.
+- Stores provider, voice and provider-specific metadata.
+- Validates provider response type, provider metadata, duration and audio-file existence.
+- Supports provider options without mutating caller input.
+- Output directory is caller-controlled, allowing assets to remain on drive D on this PC.
+- Added no new runtime dependency and did not lock the pipeline to one TTS vendor.
+- Added network-free fake-provider tests.
+- Phase 4 timing adjustment was intentionally not implemented here.
 
-## Tests Required
+## Key Files
 
-- Vietnamese text passed unchanged.
-- Segment order preserved.
-- Audio mapping preserved.
-- Duration retained.
-- Empty translated text rejected.
-- Provider failure propagated.
-- Input data not mutated.
-- Previous Phase 1/2 tests remain green.
+    buzz/localization/tts.py
+    buzz/localization/__init__.py
+    tests/localization/tts_test.py
+
+## Testing
+
+    Phase 3 targeted tests: 22 / 22 PASS
+    Latest combined relevant tests: 110 passed, 3 skipped, 0 failed
+
+Covered:
+- Vietnamese Unicode/text passthrough. ✅
+- Segment order and deterministic audio mapping. ✅
+- Audio duration/provider/voice metadata. ✅
+- Provider options. ✅
+- Empty translated text rejection. ✅
+- Invalid/missing provider output rejection. ✅
+- Provider failure propagation. ✅
+- Input transcript immutability. ✅
+- Phase 1/2 regression remains healthy. ✅
+- Real Whisper/Hugging Face/Faster Whisper/URL regressions remain healthy. ✅
+
+The same 3 upstream Buzz tests remain skipped:
+1. Unix output-path case on Windows.
+2. Unix dated-output-path case on Windows.
+3. test_transcribe_stop, explicitly skipped upstream.
 
 ## Completion Criteria
 
-Every valid translated segment can produce a stable Vietnamese speech asset through a swappable provider.
+The Phase 3 localization core can request and validate stable Vietnamese speech assets through a swappable TTS provider. ✅
 
 ---
 
@@ -689,8 +721,8 @@ For every new phase:
 13. Inspect git status.
 14. Review the diff.
 15. Do not silently modify lock files.
-16. Do not push automatically.
-17. Commit locally only after review/tests pass.
+16. Commit locally only after review/tests pass.
+17. Push the completed phase to GitHub after the commit succeeds.
 18. Produce the AGENTS.md structured report.
 
 ---
@@ -720,7 +752,7 @@ Current checkpoint:
     Phase 0 ✅
     Phase 1 ✅
     Phase 2 ✅
-    Phase 3 ⬜
+    Phase 3 ✅
     Phase 4 ⬜
     Phase 5 ⬜
     Phase 6 ⬜
@@ -730,11 +762,11 @@ Current checkpoint:
 
 Next task:
 
-    Design and implement Phase 3 — Vietnamese TTS.
+    Design and implement Phase 4 — Speech Timing Synchronization.
 
-Do not begin Phase 4 or later until Phase 3 has:
-- an approved provider-neutral design
+Do not begin Phase 5 or later until Phase 4 has:
+- an approved timing/synchronization design
 - targeted tests
-- Phase 1/2 regression confirmation
+- Phase 1/2/3 regression confirmation
 - reviewed diff
-- local commit checkpoint
+- local commit and GitHub push checkpoint

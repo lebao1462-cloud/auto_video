@@ -10,6 +10,14 @@ from buzz.localization.translation import (
     TranslationProvider,
     translate_for_localization,
 )
+from buzz.localization.tts import (
+    SynthesizedLocalizationSegment,
+    SynthesizedLocalizationTranscript,
+    TTSProvider,
+    TTSRequest,
+    TTSResult,
+    synthesize_for_localization,
+)
 
 __all__ = [
     "LocalizationSegment",
@@ -20,4 +28,10 @@ __all__ = [
     "TranslatedLocalizationTranscript",
     "TranslationProvider",
     "translate_for_localization",
+    "SynthesizedLocalizationSegment",
+    "SynthesizedLocalizationTranscript",
+    "TTSProvider",
+    "TTSRequest",
+    "TTSResult",
+    "synthesize_for_localization",
 ]
