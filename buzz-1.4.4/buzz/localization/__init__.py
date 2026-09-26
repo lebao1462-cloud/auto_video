@@ -26,6 +26,12 @@ from buzz.localization.audio_mix import (
     mix_localized_audio,
     separate_background_with_demucs,
 )
+from buzz.localization.final_render import (
+    FinalRenderError,
+    FinalRenderOptions,
+    FinalRenderResult,
+    render_localized_mp4,
+)
 from buzz.localization.subtitles import (
     SubtitleGenerationError,
     SubtitleOptions,
@@ -74,4 +80,8 @@ __all__ = [
     "render_srt",
     "render_vtt",
     "write_subtitles",
+    "FinalRenderError",
+    "FinalRenderOptions",
+    "FinalRenderResult",
+    "render_localized_mp4",
 ]

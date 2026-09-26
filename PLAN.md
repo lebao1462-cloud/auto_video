@@ -47,14 +47,14 @@ Pipeline:
 | 4 | Speech timing synchronization | ✅ COMPLETED |
 | 5 | Audio separation / replacement / mixing | ✅ COMPLETED |
 | 6 | Vietnamese subtitle generation | ✅ COMPLETED |
-| 7 | Final MP4 rendering | ⬜ NOT STARTED |
+| 7 | Final MP4 rendering | ✅ COMPLETED |
 | 8 | GUI / end-to-end localization workflow | ⬜ NOT STARTED |
 | 9 | Packaging / reliability / release | ⬜ NOT STARTED |
 
 Current stable checkpoint:
 
-    Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 + Phase 6 complete
-    Latest relevant regression run: 183 passed, 3 skipped, 0 failed
+    Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 + Phase 6 + Phase 7 complete
+    Latest relevant regression run: 205 passed, 3 skipped, 0 failed
 
 Local commits:
 
@@ -697,40 +697,86 @@ Valid Vietnamese SRT/VTT subtitle files can now be generated independently and a
 
 ## Status
 
-⬜ NOT STARTED
+✅ COMPLETED
 
 ## Objective
 
-Combine original video, localized Vietnamese audio, and Vietnamese subtitles into the final MP4.
+Combine the original video, localized Vietnamese audio, and Vietnamese subtitles into a final playable MP4.
 
-## Required Work
+## Architecture
 
-Use FFmpeg or existing media stack after investigation.
+Phase 7 reuses the FFmpeg runner introduced in Phase 5.
 
-Support:
-- final localized audio
-- original video stream when possible
-- subtitle burn-in option
-- optional soft subtitle track
-- safe H.264/AAC output where required
-- preserve resolution/frame rate where possible
-- deterministic output path
-- cleanup after failures
-- never overwrite original input by accident
+    source video
+    + localized audio from Phase 5
+    + optional subtitle file from Phase 6
+      -> render_localized_mp4(...)
+      -> final localized MP4
 
-## Tests Required
+Supported subtitle modes:
+- soft subtitle track (mov_text) ✅
+- burned-in subtitle ✅
+- no subtitle ✅
 
-- Output exists.
-- Video stream playable.
-- Audio stream playable.
-- Duration matches source approximately.
-- Vietnamese subtitle present.
-- Source file remains unchanged.
-- Failure cleanup works.
+## Completed Work
+
+- Added FinalRenderOptions.
+- Added FinalRenderResult.
+- Added FinalRenderError.
+- Added render_localized_mp4(...).
+- Replaces original audio with localized Vietnamese audio.
+- Soft-subtitle mode copies the original video stream when possible.
+- Soft subtitles are muxed as MP4 mov_text.
+- Vietnamese subtitle stream is tagged with language vie.
+- Burn-in mode re-encodes video using configurable H.264-compatible codec/settings.
+- Burn-in uses the FFmpeg subtitles filter and safely escapes Windows subtitle paths.
+- Audio is encoded as configurable AAC/bitrate by default.
+- Uses -shortest to avoid trailing media beyond the shortest required stream.
+- Uses +faststart for better MP4 playback/startup behavior.
+- Preserves source file by explicitly rejecting source/output path collisions.
+- Rejects missing source video, localized audio, subtitle file, unsupported subtitle extension and non-MP4 output.
+- Removes partial output after renderer failures.
+- Validates output creation and non-zero output size.
+- Added no new dependency.
+
+## Key Files
+
+    buzz/localization/final_render.py
+    buzz/localization/__init__.py
+    tests/localization/final_render_test.py
+
+## Testing
+
+    Phase 7 targeted tests: 22 / 22 PASS
+    Latest combined relevant tests: 205 passed, 3 skipped, 0 failed
+
+Covered:
+- soft subtitle FFmpeg command. ✅
+- burn-in subtitle FFmpeg command. ✅
+- no-subtitle mode. ✅
+- localized audio replacement. ✅
+- video stream copy for soft subtitle mode. ✅
+- configurable H.264 CRF/preset for burn-in mode. ✅
+- AAC audio encoding. ✅
+- Vietnamese subtitle language metadata. ✅
+- missing/invalid input handling. ✅
+- source overwrite prevention. ✅
+- partial-output cleanup after failure. ✅
+- JSON-compatible result metadata. ✅
+- real FFmpeg MP4 render with video + audio + soft subtitle. ✅
+- real FFmpeg MP4 render with burned-in Vietnamese subtitle. ✅
+- ffprobe validation of video/audio/subtitle streams. ✅
+- Phase 1/2/3/4/5/6 regression remains healthy. ✅
+- real Whisper/Hugging Face/Faster Whisper/URL regressions remain healthy. ✅
+
+The same 3 upstream Buzz tests remain skipped:
+1. Unix output-path case on Windows.
+2. Unix dated-output-path case on Windows.
+3. test_transcribe_stop, explicitly skipped upstream.
 
 ## Completion Criteria
 
-One final Vietnamese-localized MP4 is produced from outputs of Phases 1-6.
+The core pipeline can now create a final Vietnamese-localized MP4 from prepared Phase 5 audio and Phase 6 subtitles while keeping the original source video unchanged. ✅
 
 ---
 
@@ -910,17 +956,17 @@ Current checkpoint:
     Phase 4 ✅
     Phase 5 ✅
     Phase 6 ✅
-    Phase 7 ⬜
+    Phase 7 ✅
     Phase 8 ⬜
     Phase 9 ⬜
 
 Next task:
 
-    Design and implement Phase 7 — Final MP4 Rendering.
+    Design and implement Phase 8 — End-to-End Workflow / GUI.
 
-Do not begin Phase 8 or later until Phase 7 has:
-- an approved FFmpeg rendering/muxing design
+Do not begin Phase 9 until Phase 8 has:
+- an approved orchestration/UI design
 - targeted tests
-- Phase 1/2/3/4/5/6 regression confirmation
+- Phase 1/2/3/4/5/6/7 regression confirmation
 - reviewed diff
 - local commit and GitHub push checkpoint
