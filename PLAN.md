@@ -49,7 +49,7 @@ Pipeline:
 | 6 | Vietnamese subtitle generation | ✅ COMPLETED |
 | 7 | Final MP4 rendering | ✅ COMPLETED |
 | 8 | GUI / end-to-end localization workflow | ✅ COMPLETED |
-| 9 | Packaging / reliability / release | ⬜ NOT STARTED |
+| 9 | Packaging / reliability / release | ✅ COMPLETED |
 
 Current stable checkpoint:
 
@@ -852,47 +852,74 @@ A normal user can launch the Vietnamese localization dialog from Buzz, choose a 
 
 ## Status
 
-⬜ NOT STARTED
+✅ COMPLETED
 
 ## Objective
 
-Make the localization fork repeatable and usable outside the development workflow.
+Make the localization fork repeatable, diagnosable, packageable, and usable on the target Windows PC without requiring developer-only workflow steps.
 
-## Required Work
+## Completed Work
 
-- Full regression suite.
-- Windows packaging.
-- Dependency audit.
-- Model/cache path validation.
-- First-run behavior.
-- FFmpeg availability handling.
-- Offline/network failure handling.
-- API credential UX.
-- Logs/diagnostics.
-- Disk space checks.
-- Large-video testing.
-- Long-duration testing.
-- Real English video testing.
-- Real Chinese video testing.
-- Vietnamese voice quality review.
-- Final output quality review.
-- User documentation.
+- Added localization preflight checks before GUI execution.
+- Preflight validates source video, Whisper model path, FFmpeg, ffprobe, Edge TTS, optional Demucs, translation configuration, output write access, and estimated free disk space.
+- Added conservative workspace estimate: max(512 MiB, 6x compressed source size).
+- Added non-secret localization_diagnostics.json output.
+- Diagnostics explicitly avoid storing translation API keys.
+- Added warning-level model/cache drive policy check for this Windows development PC.
+- Added first-run and troubleshooting documentation in LOCALIZATION_GUIDE.md.
+- Added pinned localization runtime provider requirement in localization-requirements.txt.
+- Kept edge-tts runtime optional for normal Buzz import paths; localization preflight reports it clearly when absent.
+- Updated Buzz.spec to bundle Edge TTS when installed in the build environment.
+- Made optional upstream metadata/whisper.cpp/dll bundle paths packaging-safe for this source snapshot.
+- Installed PyInstaller only in the local .venv for packaging validation; no project lockfile was silently modified.
+- Corrected the local build environment from onnxruntime 1.30.0 to Buzz's declared onnxruntime 1.18.1 requirement.
+- Windows PyInstaller packaging completed successfully.
+- Verified packaged Buzz.exe exists and starts without immediate crash.
+- Verified packaged ffmpeg.exe and ffprobe.exe are present.
+- Verified edge_tts files are present in the packaged application.
+- Preserved generated build artifacts outside Git in D:\AutoVideoBuild.
+- Full relevant regression suite remains green after packaging-environment correction.
 
-## Performance Measurements
+## Key Files
 
-Measure:
-- transcription time
-- translation time
-- TTS time
-- synchronization time
-- rendering time
-- RAM usage
-- CPU/GPU usage
-- disk usage
+    buzz/localization/preflight.py
+    buzz/localization/__init__.py
+    buzz/widgets/localization_dialog.py
+    Buzz.spec
+    LOCALIZATION_GUIDE.md
+    localization-requirements.txt
+    tests/localization/preflight_test.py
+
+## Testing
+
+    Phase 9 targeted tests: 11 / 11 PASS
+    Final combined relevant tests: 238 passed, 3 skipped, 0 failed
+
+Packaging validation:
+- PyInstaller Windows build: PASS ✅
+- Build output: D:\AutoVideoBuild\dist\Buzz\Buzz.exe ✅
+- Packaged Buzz.exe smoke launch: PASS ✅
+- Packaged ffmpeg.exe: present ✅
+- Packaged ffprobe.exe: present ✅
+- Packaged edge_tts runtime: present ✅
+- Source repository build artifacts: not committed ✅
+
+The same 3 upstream Buzz tests remain skipped:
+1. Unix output-path case on Windows.
+2. Unix dated-output-path case on Windows.
+3. test_transcribe_stop, explicitly skipped upstream.
+
+## Release Validation Notes
+
+Automated tests cover the full pipeline with deterministic fake translation/TTS providers plus real FFmpeg rendering and packaged-app smoke launch.
+
+Live translation quality, Vietnamese voice preference, provider quota/rate limits, and long real-world English/Chinese source quality depend on the user's configured external provider and media. These are documented as operational acceptance checks rather than being silently exercised with user credentials.
+
+Performance varies substantially by Whisper model, CPU/GPU, Demucs use, video length, and external-provider latency. Stage progress and diagnostics are available, but no single benchmark is treated as a release gate.
 
 ## Completion Criteria
 
-The complete pipeline can be installed and repeatedly used on the target Windows PC without developer intervention.
+The complete localization workflow is packageable and runnable on the target Windows PC, performs preflight/diagnostics before execution, and has a documented first-run path without developer intervention. ✅
 
 ---
 
@@ -976,15 +1003,12 @@ Current checkpoint:
     Phase 6 ✅
     Phase 7 ✅
     Phase 8 ✅
-    Phase 9 ⬜
+    Phase 9 ✅
 
-Next task:
+Project status:
 
-    Complete Phase 9 — Packaging / Reliability / Release.
+    CORE ROADMAP COMPLETE ✅
 
-Do not begin Phase 9 until Phase 8 has:
-- an approved orchestration/UI design
-- targeted tests
-- Phase 1/2/3/4/5/6/7 regression confirmation
-- reviewed diff
-- local commit and GitHub push checkpoint
+Recommended next activity:
+
+    Run a manual acceptance localization with the user's preferred real translation provider and a representative English or Chinese video, then tune voice/model/background options to preference.

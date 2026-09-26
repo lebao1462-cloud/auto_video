@@ -20,6 +20,10 @@ from PyQt6.QtWidgets import (
 )
 
 from buzz.localization.final_render import FinalRenderOptions
+from buzz.localization.preflight import (
+    run_localization_preflight,
+    write_localization_diagnostics,
+)
 from buzz.localization.providers import (
     EdgeTTSProvider,
     OpenAICompatibleTranslationProvider,
@@ -264,7 +268,31 @@ class LocalizationDialog(QDialog):
             QMessageBox.warning(self, "Localization", error)
             return
 
-        Path(self.output_edit.text()).mkdir(parents=True, exist_ok=True)
+        output_directory = Path(self.output_edit.text())
+        output_directory.mkdir(parents=True, exist_ok=True)
+        preflight = run_localization_preflight(
+            self.source_edit.text(),
+            self.model_path_edit.text(),
+            output_directory,
+            translation_api_key=self.api_key_edit.text().strip(),
+            translation_model=self.translation_model_edit.text().strip(),
+            require_edge_tts=True,
+            use_background_separation=self.background_checkbox.isChecked(),
+        )
+        write_localization_diagnostics(
+            preflight,
+            output_directory / "localization_diagnostics.json",
+        )
+        if not preflight.ok:
+            QMessageBox.critical(
+                self,
+                "Localization preflight failed",
+                "\n".join(preflight.errors),
+            )
+            return
+        if preflight.warnings:
+            self.status_label.setText("Preflight warning: " + "; ".join(preflight.warnings))
+
         self.progress_bar.setValue(0)
         self.status_label.setText("Starting...")
         self.start_button.setEnabled(False)

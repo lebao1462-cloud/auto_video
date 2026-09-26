@@ -96,8 +96,20 @@ __all__ = [
     "LocalizationWorkflowResult",
     "cleanup_localization_workspace",
     "localize_video",
+    "LocalizationPreflightReport",
+    "PreflightCheck",
+    "estimate_required_workspace_bytes",
+    "run_localization_preflight",
+    "write_localization_diagnostics",
 ]
 
+from buzz.localization.preflight import (
+    LocalizationPreflightReport,
+    PreflightCheck,
+    estimate_required_workspace_bytes,
+    run_localization_preflight,
+    write_localization_diagnostics,
+)
 from buzz.localization.providers import (
     EdgeTTSProvider,
     LocalizationProviderError,

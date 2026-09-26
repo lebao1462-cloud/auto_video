@@ -4,37 +4,52 @@ import os.path
 import platform
 import shutil
 
-from PyInstaller.utils.hooks import collect_data_files, copy_metadata
+from PyInstaller.utils.hooks import collect_all, collect_data_files, copy_metadata
 
 from buzz.__version__ import VERSION
 
+def safe_copy_metadata(package_name):
+    try:
+        return copy_metadata(package_name)
+    except Exception:
+        print(f"Optional package metadata not found, skipping: {package_name}")
+        return []
+
 datas = []
+edge_tts_binaries = []
+edge_tts_hiddenimports = []
+try:
+    edge_tts_datas, edge_tts_binaries, edge_tts_hiddenimports = collect_all("edge_tts")
+    datas += edge_tts_datas
+except Exception:
+    # Localization preflight will report a missing Edge TTS runtime.
+    pass
 datas += collect_data_files("torch")
 datas += collect_data_files("demucs")
-datas += copy_metadata("tqdm")
-datas += copy_metadata("torch")
-datas += copy_metadata("regex")
-datas += copy_metadata("requests")
-datas += copy_metadata("packaging")
-datas += copy_metadata("filelock")
-datas += copy_metadata("numpy")
-datas += copy_metadata("tokenizers")
-datas += copy_metadata("huggingface-hub")
-datas += copy_metadata("safetensors")
-datas += copy_metadata("pyyaml")
-datas += copy_metadata("julius")
-datas += copy_metadata("openunmix")
-datas += copy_metadata("lameenc")
-datas += copy_metadata("diffq")
-datas += copy_metadata("einops")
-datas += copy_metadata("hydra-core")
-datas += copy_metadata("hydra-colorlog")
-datas += copy_metadata("museval")
-datas += copy_metadata("submitit")
-datas += copy_metadata("treetable")
-datas += copy_metadata("soundfile")
-datas += copy_metadata("dora-search")
-datas += copy_metadata("lhotse")
+datas += safe_copy_metadata("tqdm")
+datas += safe_copy_metadata("torch")
+datas += safe_copy_metadata("regex")
+datas += safe_copy_metadata("requests")
+datas += safe_copy_metadata("packaging")
+datas += safe_copy_metadata("filelock")
+datas += safe_copy_metadata("numpy")
+datas += safe_copy_metadata("tokenizers")
+datas += safe_copy_metadata("huggingface-hub")
+datas += safe_copy_metadata("safetensors")
+datas += safe_copy_metadata("pyyaml")
+datas += safe_copy_metadata("julius")
+datas += safe_copy_metadata("openunmix")
+datas += safe_copy_metadata("lameenc")
+datas += safe_copy_metadata("diffq")
+datas += safe_copy_metadata("einops")
+datas += safe_copy_metadata("hydra-core")
+datas += safe_copy_metadata("hydra-colorlog")
+datas += safe_copy_metadata("museval")
+datas += safe_copy_metadata("submitit")
+datas += safe_copy_metadata("treetable")
+datas += safe_copy_metadata("soundfile")
+datas += safe_copy_metadata("dora-search")
+datas += safe_copy_metadata("lhotse")
 
 # Allow transformers package to load __init__.py file dynamically:
 # https://github.com/chidiwilliams/buzz/issues/272
@@ -92,18 +107,27 @@ else:
         (shutil.which("ffprobe"), "."),
     ]
 
-binaries.append(("buzz/whisper_cpp/*", "buzz/whisper_cpp"))
+whisper_cpp_dir = os.path.join("buzz", "whisper_cpp")
+if os.path.isdir(whisper_cpp_dir):
+    binaries.append((os.path.join(whisper_cpp_dir, "*"), "buzz/whisper_cpp"))
+else:
+    print("Optional whisper.cpp bundle directory not found, skipping.")
 
 if platform.system() == "Windows":
-    datas += [("dll_backup", "dll_backup")]
-    datas += collect_data_files("msvc-runtime")
-
-    binaries.append(("dll_backup/SDL2.dll", "dll_backup"))
+    if os.path.isdir("dll_backup"):
+        datas += [("dll_backup", "dll_backup")]
+        sdl2_path = os.path.join("dll_backup", "SDL2.dll")
+        if os.path.isfile(sdl2_path):
+            binaries.append((sdl2_path, "dll_backup"))
+    try:
+        datas += collect_data_files("msvc-runtime")
+    except Exception:
+        print("Optional msvc-runtime data not found, skipping.")
 
 a = Analysis(
     ["main.py"],
     pathex=[],
-    binaries=binaries,
+    binaries=binaries + edge_tts_binaries,
     datas=datas,
     hiddenimports=[
         "dora", "dora.log",
@@ -120,6 +144,7 @@ a = Analysis(
         "soundfile",
         "_soundfile_data",
         "lhotse",
+        *edge_tts_hiddenimports,
     ],
     hookspath=[],
     hooksconfig={},
