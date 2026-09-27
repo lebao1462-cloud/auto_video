@@ -221,3 +221,114 @@ def test_workflow_rejects_missing_input(tmp_path):
             LocalizationWorkflowOptions(output_directory=str(tmp_path / "output")),
             transcribe_func=fake_transcribe,
         )
+
+
+@pytest.mark.parametrize(
+    "source_language,source_text,translated_text,route",
+    [
+        ("en", "Hello everyone", "Xin chào mọi người", ["en", "vi"]),
+        ("zh", "大家好", "Xin chào mọi người", ["zh", "en", "vi"]),
+    ],
+)
+def test_end_to_end_workflow_accepts_argos_provider(
+    monkeypatch,
+    tmp_path,
+    source_language,
+    source_text,
+    translated_text,
+    route,
+):
+    from buzz.localization.providers import ArgosTranslationProvider
+
+    source = tmp_path / f"source-{source_language}.mp4"
+    output_dir = tmp_path / f"output-{source_language}"
+    create_test_video(source)
+
+    def fake_worker(command, src, target="vi", text=None):
+        assert src == source_language
+        if command == "route":
+            return {"ok": True, "route": route}
+        assert text == source_text
+        return {
+            "ok": True,
+            "route": route,
+            "text": translated_text,
+        }
+
+    monkeypatch.setattr(
+        "buzz.localization.providers._run_argos_worker",
+        fake_worker,
+    )
+
+    def transcribe(video_path, transcription_options, model_path):
+        return LocalizationTranscript(
+            source_file=video_path,
+            source_language=source_language,
+            segments=(
+                LocalizationSegment(
+                    start=0.25,
+                    end=1.50,
+                    text=source_text,
+                ),
+            ),
+        )
+
+    result = localize_video(
+        str(source),
+        TranscriptionOptions(language=source_language, task=Task.TRANSCRIBE),
+        "unused-model-path",
+        ArgosTranslationProvider(),
+        FakeTTSProvider(),
+        LocalizationWorkflowOptions(
+            output_directory=str(output_dir),
+            render_options=FinalRenderOptions(subtitle_mode="soft"),
+        ),
+        transcribe_func=transcribe,
+    )
+
+    assert Path(result.final_video.video_file).is_file()
+    subtitle_text = Path(result.subtitle.subtitle_file).read_text(encoding="utf-8")
+    assert translated_text in subtitle_text
+
+
+def test_end_to_end_workflow_accepts_gemini_provider(monkeypatch, tmp_path):
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    class Response:
+        text = "Xin chào mọi người"
+
+    class Models:
+        def generate_content(self, **kwargs):
+            assert kwargs["model"] == "gemini-test"
+            return Response()
+
+    class Client:
+        models = Models()
+
+    source = tmp_path / "source-gemini.mp4"
+    output_dir = tmp_path / "output-gemini"
+    create_test_video(source)
+
+    provider = GeminiTranslationProvider(
+        api_key="test-key",
+        model="gemini-test",
+    )
+    provider._client = Client()
+
+    result = localize_video(
+        str(source),
+        TranscriptionOptions(language="en", task=Task.TRANSCRIBE),
+        "unused-model-path",
+        provider,
+        FakeTTSProvider(),
+        LocalizationWorkflowOptions(
+            output_directory=str(output_dir),
+            render_options=FinalRenderOptions(subtitle_mode="soft"),
+        ),
+        transcribe_func=fake_transcribe,
+    )
+
+    assert Path(result.final_video.video_file).is_file()
+    assert "Xin chào mọi người" in Path(
+        result.subtitle.subtitle_file
+    ).read_text(encoding="utf-8")

@@ -87,14 +87,19 @@ def run_localization_preflight(
     model_path: str | Path,
     output_directory: str | Path,
     *,
-    translation_api_key: str,
-    translation_model: str,
+    translation_api_key: str = "",
+    translation_model: str = "",
+    translation_provider: str = "openai-compatible",
+    source_language: str | None = None,
     require_edge_tts: bool = True,
     use_background_separation: bool = False,
 ) -> LocalizationPreflightReport:
     source = Path(source_video_file)
     model = Path(model_path)
     output = Path(output_directory)
+
+    if translation_provider not in {"argos", "gemini", "openai-compatible"}:
+        raise ValueError("Unsupported translation provider")
 
     checks: list[PreflightCheck] = []
 
@@ -160,24 +165,97 @@ def run_localization_preflight(
             )
         )
 
-    checks.append(
-        PreflightCheck(
-            "translation_api_key",
-            bool(translation_api_key.strip()),
-            "Translation API credential is configured."
-            if translation_api_key.strip()
-            else "Translation API key is required.",
+    if translation_provider == "argos":
+        argos_runtime = importlib.util.find_spec("argostranslate") is not None
+        checks.append(
+            PreflightCheck(
+                "argos_runtime",
+                argos_runtime,
+                "Argos Translate runtime is available."
+                if argos_runtime
+                else (
+                    "Argos Translate runtime is missing. Install "
+                    "argostranslate in the Buzz Python environment."
+                ),
+            )
         )
-    )
-    checks.append(
-        PreflightCheck(
-            "translation_model",
-            bool(translation_model.strip()),
-            "Translation model is configured."
-            if translation_model.strip()
-            else "Translation model is required.",
+        if argos_runtime:
+            try:
+                from buzz.localization.providers import argos_route_available
+
+                if source_language in {"en", "zh"}:
+                    ok, message = argos_route_available(source_language)
+                    checks.append(
+                        PreflightCheck(
+                            f"argos_route_{source_language}",
+                            ok,
+                            message,
+                        )
+                    )
+                else:
+                    checks.append(
+                        PreflightCheck(
+                            "argos_route_auto",
+                            True,
+                            "Argos route will be validated after source-language auto-detection.",
+                        )
+                    )
+            except Exception as exc:
+                checks.append(
+                    PreflightCheck(
+                        "argos_routes",
+                        False,
+                        f"Unable to inspect installed Argos routes: {exc}",
+                    )
+                )
+    elif translation_provider == "gemini":
+        gemini_runtime = importlib.util.find_spec("google.genai") is not None
+        checks.append(
+            PreflightCheck(
+                "gemini_runtime",
+                gemini_runtime,
+                "Gemini runtime is available."
+                if gemini_runtime
+                else "google-genai is required for Gemini translation.",
+            )
         )
-    )
+        checks.append(
+            PreflightCheck(
+                "translation_api_key",
+                bool(translation_api_key.strip()),
+                "Gemini API credential is configured."
+                if translation_api_key.strip()
+                else "Gemini API key is required.",
+            )
+        )
+        checks.append(
+            PreflightCheck(
+                "translation_model",
+                bool(translation_model.strip()),
+                "Gemini model is configured."
+                if translation_model.strip()
+                else "Gemini model is required.",
+            )
+        )
+    else:
+        checks.append(
+            PreflightCheck(
+                "translation_api_key",
+                bool(translation_api_key.strip()),
+                "Translation API credential is configured."
+                if translation_api_key.strip()
+                else "Translation API key is required.",
+            )
+        )
+        checks.append(
+            PreflightCheck(
+                "translation_model",
+                bool(translation_model.strip()),
+                "Translation model is configured."
+                if translation_model.strip()
+                else "Translation model is required.",
+            )
+        )
 
     output_ok = False
     output_message = ""

@@ -195,3 +195,146 @@ def test_report_properties_only_require_required_checks():
     assert report.ok is True
     assert report.errors == ()
     assert report.warnings == ("warn",)
+
+
+def test_argos_preflight_does_not_require_api_key_or_model(monkeypatch, tmp_path):
+    source, model, output = _make_inputs(tmp_path)
+    monkeypatch.setattr(
+        "buzz.localization.preflight._find_bundled_or_path_executable",
+        lambda name: f"C:/{name}.exe",
+    )
+    monkeypatch.setattr(
+        "buzz.localization.preflight.importlib.util.find_spec",
+        lambda name: object(),
+    )
+    monkeypatch.setattr(
+        "buzz.localization.providers.argos_route_available",
+        lambda language: (True, f"Argos route available: {language} -> vi"),
+    )
+    monkeypatch.setattr(
+        "buzz.localization.preflight.shutil.disk_usage",
+        lambda path: type("Usage", (), {"free": 10 * 1024**3})(),
+    )
+
+    report = run_localization_preflight(
+        source,
+        model,
+        output,
+        translation_provider="argos",
+        source_language="en",
+        translation_api_key="",
+        translation_model="",
+    )
+
+    assert report.ok is True
+    assert not any(check.name == "translation_api_key" for check in report.checks)
+    assert not any(check.name == "translation_model" for check in report.checks)
+
+
+def test_argos_preflight_blocks_missing_route(monkeypatch, tmp_path):
+    source, model, output = _make_inputs(tmp_path)
+    monkeypatch.setattr(
+        "buzz.localization.preflight._find_bundled_or_path_executable",
+        lambda name: f"C:/{name}.exe",
+    )
+    monkeypatch.setattr(
+        "buzz.localization.preflight.importlib.util.find_spec",
+        lambda name: object(),
+    )
+    monkeypatch.setattr(
+        "buzz.localization.providers.argos_route_available",
+        lambda language: (False, f"missing {language}->vi route"),
+    )
+    monkeypatch.setattr(
+        "buzz.localization.preflight.shutil.disk_usage",
+        lambda path: type("Usage", (), {"free": 10 * 1024**3})(),
+    )
+
+    report = run_localization_preflight(
+        source,
+        model,
+        output,
+        translation_provider="argos",
+        source_language="zh",
+    )
+
+    assert report.ok is False
+    assert any("missing zh->vi route" in error for error in report.errors)
+
+
+def test_argos_auto_language_defers_route_check_until_detection(monkeypatch, tmp_path):
+    source, model, output = _make_inputs(tmp_path)
+    monkeypatch.setattr(
+        "buzz.localization.preflight._find_bundled_or_path_executable",
+        lambda name: f"C:/{name}.exe",
+    )
+    monkeypatch.setattr(
+        "buzz.localization.preflight.importlib.util.find_spec",
+        lambda name: object(),
+    )
+    monkeypatch.setattr(
+        "buzz.localization.preflight.shutil.disk_usage",
+        lambda path: type("Usage", (), {"free": 10 * 1024**3})(),
+    )
+
+    report = run_localization_preflight(
+        source,
+        model,
+        output,
+        translation_provider="argos",
+        source_language=None,
+    )
+
+    assert report.ok is True
+    auto_check = next(c for c in report.checks if c.name == "argos_route_auto")
+    assert "after source-language auto-detection" in auto_check.message
+
+
+def test_gemini_preflight_requires_only_gemini_configuration(monkeypatch, tmp_path):
+    source, model, output = _make_inputs(tmp_path)
+    monkeypatch.setattr(
+        "buzz.localization.preflight._find_bundled_or_path_executable",
+        lambda name: f"C:/{name}.exe",
+    )
+    monkeypatch.setattr(
+        "buzz.localization.preflight.importlib.util.find_spec",
+        lambda name: object(),
+    )
+    monkeypatch.setattr(
+        "buzz.localization.preflight.shutil.disk_usage",
+        lambda path: type("Usage", (), {"free": 10 * 1024**3})(),
+    )
+
+    missing = run_localization_preflight(
+        source,
+        model,
+        output,
+        translation_provider="gemini",
+        translation_api_key="",
+        translation_model="",
+    )
+    assert missing.ok is False
+    assert "Gemini API key is required." in missing.errors
+    assert "Gemini model is required." in missing.errors
+
+    ok = run_localization_preflight(
+        source,
+        model,
+        output,
+        translation_provider="gemini",
+        translation_api_key="key",
+        translation_model="gemini-2.5-flash",
+    )
+    assert ok.ok is True
+
+
+def test_preflight_rejects_unknown_translation_provider(tmp_path):
+    source, model, output = _make_inputs(tmp_path)
+
+    with pytest.raises(ValueError, match="Unsupported translation provider"):
+        run_localization_preflight(
+            source,
+            model,
+            output,
+            translation_provider="unknown",
+        )

@@ -7,7 +7,7 @@ This fork extends Buzz 1.4.4 with an English/Chinese video -> Vietnamese localiz
 For one source video, the application can:
 
 1. Transcribe English or Chinese speech with Buzz/Whisper.
-2. Translate each segment into Vietnamese with an OpenAI-compatible API.
+2. Translate each segment into Vietnamese with Argos offline by default, or Gemini/OpenAI-compatible providers when selected.
 3. Generate Vietnamese speech with Edge TTS.
 4. Synchronize Vietnamese speech to the source timeline.
 5. Optionally separate original vocals with Demucs and preserve background/music.
@@ -47,25 +47,66 @@ Install the pinned localization runtime requirement into the same Python environ
 
 The provider is intentionally lazy-loaded. Normal Buzz transcription still works when Edge TTS is absent; localization preflight will report that the localization runtime is missing.
 
-## Translation provider
+## Translation providers
 
-The translation layer accepts OpenAI-compatible endpoints.
+The default translation provider is Argos Translate:
 
-In the localization dialog configure:
+- offline after language packages are installed;
+- free;
+- no API key;
+- English uses en -> vi;
+- Chinese uses zh -> en -> vi on the current Argos package index because a direct zh -> vi package is not available.
+
+The Argos runtime is isolated in a worker process. This avoids the native-library conflict observed when Argos and the Buzz/Whisper localization stack are loaded in the same Windows process.
+
+### Install Argos language packages
+
+On this development PC, packages are stored on drive D:
+
+    setx ARGOS_PACKAGES_DIR D:\ArgosTranslate\packages
+
+For the current PowerShell session:
+
+    $env:ARGOS_PACKAGES_DIR='D:\ArgosTranslate\packages'
+
+Install/refresh the required language packages explicitly:
+
+    .venv\Scripts\python.exe install_argos_packages.py
+
+This download is never triggered automatically by a localization run.
+
+### Gemini API - optional online provider
+
+Gemini is optional and is never used as an automatic fallback from Argos.
+
+Configure the GUI with:
+
+- Gemini API key
+- Gemini model (default: gemini-2.5-flash)
+
+Gemini requires network access and may be subject to provider quota/rate limits.
+
+### OpenAI-compatible - advanced compatibility provider
+
+The existing OpenAI-compatible provider remains available for custom endpoints.
+
+Configure:
 
 - Translation API base URL
 - Translation API key
 - Translation model
 
-The base URL can be left empty for the default OpenAI client endpoint, or set to another OpenAI-compatible service.
-
-Secrets are not written into localization diagnostics.
-
-Environment variables can also provide defaults:
+Environment variables can provide defaults:
 
     BUZZ_TRANSLATION_API_BASE_URL
     BUZZ_TRANSLATION_API_KEY
     BUZZ_TRANSLATION_MODEL
+
+No translation API key is required when Argos is selected. Provider secrets are never written into localization diagnostics.
+
+### Offline translation quality note
+
+Argos prioritizes zero-cost/offline operation. English-to-Vietnamese output is generally more usable than the current Chinese pivot route. The Chinese zh -> en -> vi pivot can produce noticeably weaker wording on short or ambiguous phrases. Select Gemini explicitly when higher translation quality is more important than fully offline operation.
 
 ## Using the GUI
 
@@ -79,7 +120,7 @@ Then:
 2. Select the output folder.
 3. Choose English, Chinese, or auto-detect.
 4. Select a valid Whisper model.
-5. Configure the translation endpoint/key/model.
+5. Choose a translation provider. Argos requires no API key; Gemini/OpenAI show provider-specific fields.
 6. Choose a Vietnamese voice.
 7. Choose Soft subtitle, Burn subtitle into video, or No subtitle.
 8. Optionally enable Demucs background preservation.
@@ -124,8 +165,9 @@ Buzz already contains Windows PyInstaller/Inno Setup packaging infrastructure.
 The modified Buzz.spec:
 
 - continues to bundle FFmpeg/ffprobe through the existing Buzz mechanism;
-- bundles Edge TTS data/hidden imports when edge-tts is installed in the build environment;
-- keeps Edge TTS optional so normal Buzz builds do not crash solely because the provider is absent.
+- bundles Edge TTS, Argos Translate, and Google GenAI provider modules when installed in the build environment;
+- keeps localization providers optional so normal Buzz startup does not fail solely because a provider runtime is absent;
+- includes the Argos worker entrypoint used to isolate native translation runtime from the main Buzz process.
 
 Before packaging, install the localization runtime requirement:
 
@@ -147,9 +189,21 @@ Install:
 
 The packaged Buzz application should include them. For development, put the existing Buzz internal directory containing ffmpeg.exe and ffprobe.exe on PATH.
 
-### Translation request fails
+### Argos route missing
 
-Check the base URL, API key, model name, internet connection, provider quota/rate limits, and provider compatibility with the OpenAI chat-completions interface.
+Set ARGOS_PACKAGES_DIR to the intended package location and run:
+
+    .venv\Scripts\python.exe install_argos_packages.py
+
+Preflight reports the exact missing English or Chinese route. Localization itself never downloads packages.
+
+### Gemini translation fails
+
+Check the Gemini API key, model name, internet connection, quota and rate limits.
+
+### OpenAI-compatible translation fails
+
+Check the base URL, API key, model name, internet connection, provider quota/rate limits, and compatibility with the OpenAI chat-completions interface.
 
 ### Demucs is slow
 

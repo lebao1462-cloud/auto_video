@@ -25,7 +25,9 @@ from buzz.localization.preflight import (
     write_localization_diagnostics,
 )
 from buzz.localization.providers import (
+    ArgosTranslationProvider,
     EdgeTTSProvider,
+    GeminiTranslationProvider,
     OpenAICompatibleTranslationProvider,
 )
 from buzz.localization.workflow import (
@@ -34,6 +36,7 @@ from buzz.localization.workflow import (
     LocalizationWorkflowOptions,
     localize_video,
 )
+from buzz.settings.settings import Settings
 from buzz.store.keyring_store import Key, get_password
 from buzz.transcriber.transcriber import Task, TranscriptionOptions
 
@@ -52,6 +55,7 @@ class LocalizationWorker(QObject):
         output_directory: str,
         source_language: str | None,
         model_path: str,
+        translation_provider_name: str,
         translation_base_url: str | None,
         translation_api_key: str,
         translation_model: str,
@@ -64,6 +68,7 @@ class LocalizationWorker(QObject):
         self.output_directory = output_directory
         self.source_language = source_language
         self.model_path = model_path
+        self.translation_provider_name = translation_provider_name
         self.translation_base_url = translation_base_url
         self.translation_api_key = translation_api_key
         self.translation_model = translation_model
@@ -80,11 +85,19 @@ class LocalizationWorker(QObject):
 
     def run(self):
         try:
-            translation_provider = OpenAICompatibleTranslationProvider(
-                api_key=self.translation_api_key,
-                model=self.translation_model,
-                base_url=self.translation_base_url,
-            )
+            if self.translation_provider_name == "argos":
+                translation_provider = ArgosTranslationProvider()
+            elif self.translation_provider_name == "gemini":
+                translation_provider = GeminiTranslationProvider(
+                    api_key=self.translation_api_key,
+                    model=self.translation_model,
+                )
+            else:
+                translation_provider = OpenAICompatibleTranslationProvider(
+                    api_key=self.translation_api_key,
+                    model=self.translation_model,
+                    base_url=self.translation_base_url,
+                )
             tts_provider = EdgeTTSProvider(default_voice=self.tts_voice)
             result = localize_video(
                 self.source_video,
@@ -123,9 +136,31 @@ class LocalizationDialog(QDialog):
         self.worker_thread: QThread | None = None
         self.worker: LocalizationWorker | None = None
 
+        self.settings = Settings()
         self.source_edit = QLineEdit()
         self.output_edit = QLineEdit(self._default_output_directory())
         self.model_path_edit = QLineEdit(self._default_model_path())
+
+        self.translation_provider_combo = QComboBox()
+        self.translation_provider_combo.addItem(
+            "Argos Translate - Offline / Free / No API key", "argos"
+        )
+        self.translation_provider_combo.addItem(
+            "Gemini API - Online / Optional", "gemini"
+        )
+        self.translation_provider_combo.addItem(
+            "OpenAI-compatible - Advanced", "openai-compatible"
+        )
+        saved_provider = self.settings.value(
+            Settings.Key.LOCALIZATION_TRANSLATION_PROVIDER,
+            "argos",
+        )
+        saved_index = self.translation_provider_combo.findData(saved_provider)
+        self.translation_provider_combo.setCurrentIndex(
+            saved_index if saved_index >= 0 else 0
+        )
+        self.translation_provider_status = QLabel()
+
         self.base_url_edit = QLineEdit(
             os.getenv("BUZZ_TRANSLATION_API_BASE_URL", "")
         )
@@ -134,7 +169,7 @@ class LocalizationDialog(QDialog):
         )
         self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.translation_model_edit = QLineEdit(
-            os.getenv("BUZZ_TRANSLATION_MODEL", "gpt-4o-mini")
+            os.getenv("BUZZ_TRANSLATION_MODEL", "gemini-2.5-flash")
         )
 
         self.language_combo = QComboBox()
@@ -172,9 +207,14 @@ class LocalizationDialog(QDialog):
         form.addRow("Output folder:", output_row)
         form.addRow("Source language:", self.language_combo)
         form.addRow("Whisper model path:", model_row)
-        form.addRow("Translation API base URL:", self.base_url_edit)
-        form.addRow("Translation API key:", self.api_key_edit)
-        form.addRow("Translation model:", self.translation_model_edit)
+        form.addRow("Translation provider:", self.translation_provider_combo)
+        form.addRow("", self.translation_provider_status)
+        self.base_url_label = QLabel("Translation API base URL:")
+        self.api_key_label = QLabel("Translation API key:")
+        self.translation_model_label = QLabel("Translation model:")
+        form.addRow(self.base_url_label, self.base_url_edit)
+        form.addRow(self.api_key_label, self.api_key_edit)
+        form.addRow(self.translation_model_label, self.translation_model_edit)
         form.addRow("Vietnamese voice:", self.voice_combo)
         form.addRow("Subtitle mode:", self.subtitle_mode_combo)
         form.addRow("", self.background_checkbox)
@@ -192,6 +232,10 @@ class LocalizationDialog(QDialog):
 
         self.start_button.clicked.connect(self.start_localization)
         self.cancel_button.clicked.connect(self.cancel_localization)
+        self.translation_provider_combo.currentIndexChanged.connect(
+            self._on_translation_provider_changed
+        )
+        self._on_translation_provider_changed()
 
     @staticmethod
     def _path_row(edit: QLineEdit, callback) -> QWidget:
@@ -249,6 +293,41 @@ class LocalizationDialog(QDialog):
         if path:
             self.model_path_edit.setText(path)
 
+    def _on_translation_provider_changed(self):
+        provider = self.translation_provider_combo.currentData()
+        is_argos = provider == "argos"
+        is_gemini = provider == "gemini"
+        is_openai = provider == "openai-compatible"
+
+        self.base_url_label.setVisible(is_openai)
+        self.base_url_edit.setVisible(is_openai)
+        self.api_key_label.setVisible(not is_argos)
+        self.api_key_edit.setVisible(not is_argos)
+        self.translation_model_label.setVisible(not is_argos)
+        self.translation_model_edit.setVisible(not is_argos)
+
+        if is_argos:
+            self.translation_provider_status.setText(
+                "Offline / free. Uses installed Argos language packages; no API key."
+            )
+        elif is_gemini:
+            self.translation_provider_status.setText(
+                "Online Gemini translation. API quota/network access may apply."
+            )
+            if self.translation_model_edit.text().strip() in {"", "gpt-4o-mini"}:
+                self.translation_model_edit.setText(
+                    os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+                )
+        else:
+            self.translation_provider_status.setText(
+                "Advanced OpenAI-compatible endpoint."
+            )
+
+        self.settings.set_value(
+            Settings.Key.LOCALIZATION_TRANSLATION_PROVIDER,
+            provider,
+        )
+
     def _validate_inputs(self) -> str | None:
         if not Path(self.source_edit.text()).is_file():
             return "Please select a valid input video."
@@ -256,10 +335,17 @@ class LocalizationDialog(QDialog):
             return "Please select an output folder."
         if not Path(self.model_path_edit.text()).exists():
             return "Please select a valid Whisper model path."
-        if not self.api_key_edit.text().strip():
-            return "Translation API key is required."
-        if not self.translation_model_edit.text().strip():
-            return "Translation model is required."
+        provider = self.translation_provider_combo.currentData()
+        if provider == "gemini":
+            if not self.api_key_edit.text().strip():
+                return "Gemini API key is required."
+            if not self.translation_model_edit.text().strip():
+                return "Gemini model is required."
+        elif provider == "openai-compatible":
+            if not self.api_key_edit.text().strip():
+                return "Translation API key is required."
+            if not self.translation_model_edit.text().strip():
+                return "Translation model is required."
         return None
 
     def start_localization(self):
@@ -276,6 +362,8 @@ class LocalizationDialog(QDialog):
             output_directory,
             translation_api_key=self.api_key_edit.text().strip(),
             translation_model=self.translation_model_edit.text().strip(),
+            translation_provider=self.translation_provider_combo.currentData(),
+            source_language=self.language_combo.currentData(),
             require_edge_tts=True,
             use_background_separation=self.background_checkbox.isChecked(),
         )
@@ -304,6 +392,7 @@ class LocalizationDialog(QDialog):
             output_directory=self.output_edit.text(),
             source_language=self.language_combo.currentData(),
             model_path=self.model_path_edit.text(),
+            translation_provider_name=self.translation_provider_combo.currentData(),
             translation_base_url=self.base_url_edit.text().strip() or None,
             translation_api_key=self.api_key_edit.text().strip(),
             translation_model=self.translation_model_edit.text().strip(),

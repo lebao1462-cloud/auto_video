@@ -28,6 +28,7 @@ Pipeline:
       -> Phase 7: Final MP4 rendering
       -> Phase 8: End-to-end GUI / workflow
       -> Phase 9: Packaging / reliability / release
+      -> Phase 10: Free-first translation providers (Argos + Gemini option)
 
 ## Status Legend
 
@@ -50,11 +51,14 @@ Pipeline:
 | 7 | Final MP4 rendering | ✅ COMPLETED |
 | 8 | GUI / end-to-end localization workflow | ✅ COMPLETED |
 | 9 | Packaging / reliability / release | ✅ COMPLETED |
+| 10 | Free-first translation providers: Argos offline + Gemini optional | COMPLETED |
 
 Current stable checkpoint:
 
-    Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 + Phase 6 + Phase 7 + Phase 8 complete
-    Latest relevant regression run: 230 passed, 3 skipped, 0 failed
+    Phase 0 + Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 + Phase 6 + Phase 7 + Phase 8 + Phase 9 + Phase 10 complete
+    Phase 10 targeted tests: 56 passed, 0 failed
+    Latest relevant regression run: 271 passed, 3 skipped, 0 failed
+    Frozen Windows build smoke: Argos en -> vi PASS, zh -> en -> vi PASS, real translation PASS, GUI launch PASS
 
 Local commits:
 
@@ -80,6 +84,9 @@ Completed phases are pushed to GitHub after review, tests, and local commit.
 11. Re-run previous localization tests after later pipeline changes.
 12. On this development PC, models/caches/temp files should use drive D.
 13. After each completed phase passes review/tests, commit locally and push to GitHub.
+14. Translation must be free-first: Argos Translate is the default path and must not require an API key.
+15. Gemini translation is optional and must never be required for the offline/local path.
+16. The GUI must make provider cost/connectivity requirements explicit before execution.
 
 Development paths:
 
@@ -923,6 +930,265 @@ The complete localization workflow is packageable and runnable on the target Win
 
 ---
 
+# Phase 10 — Free-First Translation Providers (Argos + Gemini)
+
+## Status
+
+COMPLETED
+
+## Objective
+
+Remove the requirement for an OpenAI-compatible API key from the normal localization workflow while preserving an optional higher-quality online translation path.
+
+The preferred default workflow must be usable with no translation API key:
+
+    English / Chinese video
+      -> Whisper local transcription
+      -> Argos Translate local/offline
+      -> Edge TTS Vietnamese
+      -> timing synchronization
+      -> FFmpeg audio/subtitles/final MP4
+
+An optional online workflow may use Gemini:
+
+    English / Chinese video
+      -> Whisper local transcription
+      -> Gemini translation
+      -> Edge TTS Vietnamese
+      -> timing synchronization
+      -> FFmpeg audio/subtitles/final MP4
+
+## Provider Policy
+
+GUI provider choices:
+
+    Translation Provider
+
+    1. Argos Translate — Offline / Free / No API key   [DEFAULT]
+    2. Gemini API — Online / Optional
+    3. OpenAI-compatible — Advanced / Existing compatibility
+
+Rules:
+- Argos is the default provider.
+- Argos must not require an API key.
+- Gemini must remain optional.
+- OpenAI-compatible provider remains available for compatibility but is not the default.
+- Switching providers must not change downstream TTS/timing/audio/subtitle/render APIs.
+- No provider secret may be written to logs, diagnostics, source files, Git, or generated subtitle/video metadata.
+
+## Argos Translate Design
+
+### Goal
+
+Provide a fully local/offline translation path after language packages are installed.
+
+Required source paths:
+- English -> Vietnamese
+- Chinese -> Vietnamese when a direct Argos package exists
+- Chinese -> English -> Vietnamese pivot when direct Chinese -> Vietnamese is unavailable
+
+Required behavior:
+- Detect installed Argos language packages.
+- Prefer a direct translation package when available.
+- Fall back to a deterministic pivot route only when required packages are installed.
+- Never silently download language packages during a localization run.
+- Provide a clear install/preflight message for missing language packages.
+- Keep Argos packages/cache on drive D on this development PC where configurable.
+- Preserve segment order, timestamps, source text, and immutable Phase 2 output contracts.
+
+Recommended provider API:
+
+    ArgosTranslationProvider
+        translate(text, source_language, target_language) -> str
+
+Optional helper/service:
+
+    ArgosLanguagePackageManager
+        list_installed()
+        route_available(source_language, target_language)
+        install_from_local_package(...)
+        refresh_package_index(...)  # explicit user action only
+
+### Argos Preflight
+
+For English source:
+- en -> vi route must exist.
+
+For Chinese source:
+- prefer zh -> vi direct route;
+- otherwise require both zh -> en and en -> vi.
+
+Preflight must report the exact missing route/package instead of requesting an API key.
+
+## Gemini Translation Design
+
+### Goal
+
+Provide an optional online translation provider for users who prefer better translation quality and accept API usage/quota requirements.
+
+Required behavior:
+- Dedicated GeminiTranslationProvider.
+- API key required only when Gemini is selected.
+- Configurable Gemini model.
+- Clear timeout/network/rate-limit/quota errors.
+- No automatic fallback from Argos to Gemini without explicit user selection.
+- No automatic paid-provider fallback.
+- Preserve the existing TranslationProvider protocol.
+- Keep prompts deterministic and focused on translation only.
+- Preserve meaning and concise phrasing suitable for speech timing.
+
+Recommended configuration:
+
+    GEMINI_API_KEY
+    GEMINI_MODEL
+
+GUI should allow:
+- API key entry
+- model selection/text field
+- optional secure reuse from keyring when supported
+
+## Translation Quality / Timing Rules
+
+Translation output is consumed by Vietnamese TTS, so providers should prefer concise natural Vietnamese rather than unnecessarily verbose wording.
+
+Rules:
+- Do not summarize away source meaning.
+- Do not add commentary or explanations.
+- Preserve numbers, units, product names, and important entities.
+- Prefer concise Vietnamese where multiple accurate phrasings exist.
+- Return plain translated text only.
+- Empty or non-string provider responses are invalid.
+- Provider failures must not produce partial final videos silently.
+
+## GUI Changes
+
+Update LocalizationDialog translation section:
+
+    Translation Provider:
+        Argos Translate — Offline / Free
+        Gemini API — Online
+        OpenAI-compatible — Advanced
+
+When Argos is selected:
+- hide/disable API-key fields;
+- show installed route/package status;
+- show Offline / No API key;
+- block Start only if required Argos route is missing.
+
+When Gemini is selected:
+- show Gemini API key/model controls;
+- preflight key/model/network-facing configuration.
+
+When OpenAI-compatible is selected:
+- retain current base URL/API key/model controls.
+
+Provider choice should be persisted in normal user settings where appropriate.
+
+## Workflow Changes
+
+Workflow orchestration must receive a TranslationProvider instance without branching on provider internals.
+
+Expected structure:
+
+    UI/provider factory
+       -> TranslationProvider
+       -> translate_for_localization(...)
+       -> existing Phase 3-7 pipeline unchanged
+
+This phase should not rewrite:
+- transcription
+- TTS
+- timing
+- audio mixing
+- subtitles
+- final render
+
+## Packaging / Dependency Strategy
+
+Argos and Gemini dependencies must be investigated before changing the main Buzz dependency lock.
+
+Rules:
+- Do not silently modify uv.lock.
+- Prefer a dedicated localization requirements file if upstream Buzz lock regeneration remains blocked.
+- Package/import optional providers safely.
+- Normal Buzz transcription should still launch if Argos/Gemini optional dependencies are missing.
+- Localization preflight must explain missing provider runtime dependencies.
+
+Argos package/model files should not be committed to Git.
+
+## Tests Required
+
+### Argos
+- English -> Vietnamese direct route.
+- Chinese -> Vietnamese direct route when available.
+- Chinese -> English -> Vietnamese pivot route.
+- Direct route preferred over pivot.
+- Missing route reports clear error.
+- No API key required.
+- Empty input/output validation.
+- Provider exception propagation.
+- Unicode Vietnamese output.
+- No mutation of source transcript.
+
+### Gemini
+- English -> Vietnamese request/response.
+- Chinese -> Vietnamese request/response.
+- Missing API key rejection.
+- Missing model rejection.
+- Invalid/empty response rejection.
+- Network/provider error propagation.
+- API key never appears in diagnostics/log fixtures.
+
+### GUI / Preflight
+- Argos is default selection.
+- Argos hides API key controls.
+- Missing Argos package blocks Start with actionable message.
+- Gemini shows API key/model controls.
+- OpenAI-compatible remains selectable.
+- Provider-specific preflight logic works.
+- Existing GUI behavior remains healthy.
+
+### End-to-End
+- Real/fake English video workflow using Argos path.
+- Chinese workflow using Argos direct or pivot route.
+- Gemini path with mocked network response.
+- Existing Edge TTS / timing / FFmpeg pipeline remains unchanged.
+- Real mayhutbui.mp4 is re-tested with Argos if Chinese route packages are available.
+
+## Completed / Validation
+
+- Argos Translate is the default translation provider and requires no translation API key.
+- English uses the installed `en -> vi` Argos route.
+- Chinese uses direct `zh -> vi` when available; on this development PC the validated route is `zh -> en -> vi`.
+- Gemini API is available as an optional online provider.
+- OpenAI-compatible translation remains available as the Advanced compatibility option.
+- Argos package discovery/install is explicit; localization runs never silently download packages.
+- Argos runtime work is isolated through the `--argos-worker` subprocess path to avoid native-library conflicts with the main Buzz process.
+- Windows frozen build was hardened by excluding the older PyQt-bundled `PyQt6/Qt6/bin/MSVCP140.dll` and keeping the newer runtime at `_internal/MSVCP140.dll`; this fixed the frozen Argos `0xC0000005` crash without breaking the GUI.
+- Final Windows build: `D:\AutoVideoBuildPhase10Final\dist\Buzz\Buzz.exe` (~73.3 MB executable, ~2.26 GB full onedir distribution).
+- Frozen build smoke tests: `en -> vi` route PASS, `zh -> en -> vi` route PASS, real English -> Vietnamese translation PASS.
+- Frozen GUI smoke: process remained healthy after 10 seconds; no new Application Error event.
+- `python -m compileall -q buzz`: PASS.
+- Phase 10 targeted tests: **56 passed, 0 failed**.
+- Relevant full regression: **271 passed, 3 skipped, 0 failed**.
+- The three skips are unchanged upstream/platform-specific tests.
+- Build/test/cache/temp paths were kept on drive D for final validation.
+
+## Completion Criteria
+
+Phase 10 is complete when:
+
+- [x] A user can localize English video to Vietnamese with Argos without any translation API key.
+- [x] A Chinese video can use a documented Argos direct or pivot route when corresponding packages are installed.
+- [x] Gemini is available as an optional online provider.
+- [x] OpenAI-compatible provider remains available as an advanced compatibility option.
+- [x] GUI clearly distinguishes offline/free vs online/API providers.
+- [x] Preflight validates only the requirements of the selected provider.
+- [x] Existing Phase 1-9 behavior remains regression-safe.
+- [x] Targeted tests, full regression, review, commit, and GitHub push complete.
+
+---
+
 # Deferred / Optional Features
 
 ## Status
@@ -988,27 +1254,32 @@ and automatically receive:
 
 without manually performing transcription, translation, TTS, timing, audio mixing, subtitle creation, or rendering.
 
+The default translation path should work without a translation API key by using Argos Translate after the required offline language packages are installed. Gemini and OpenAI-compatible providers remain optional alternatives.
+
 ---
 
 # Current Next Action
 
 Current checkpoint:
 
-    Phase 0 ✅
-    Phase 1 ✅
-    Phase 2 ✅
-    Phase 3 ✅
-    Phase 4 ✅
-    Phase 5 ✅
-    Phase 6 ✅
-    Phase 7 ✅
-    Phase 8 ✅
-    Phase 9 ✅
+    Phase 0 DONE
+    Phase 1 DONE
+    Phase 2 DONE
+    Phase 3 DONE
+    Phase 4 DONE
+    Phase 5 DONE
+    Phase 6 DONE
+    Phase 7 DONE
+    Phase 8 DONE
+    Phase 9 DONE
+    Phase 10 DONE
 
 Project status:
 
-    CORE ROADMAP COMPLETE ✅
+    CORE LOCALIZATION PIPELINE COMPLETE
+    FREE-FIRST TRANSLATION PROVIDERS COMPLETE
 
-Recommended next activity:
+Next task:
 
-    Run a manual acceptance localization with the user's preferred real translation provider and a representative English or Chinese video, then tune voice/model/background options to preference.
+    Phase 10 is closed after tests, frozen-build smoke validation, review, commit, and GitHub push.
+    Define the next roadmap phase only when a new requirement is approved.

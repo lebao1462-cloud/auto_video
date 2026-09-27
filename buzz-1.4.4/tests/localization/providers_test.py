@@ -149,3 +149,156 @@ def test_trim_edge_tts_silence_removes_boundary_silence(tmp_path):
     assert before == pytest.approx(1.7, abs=0.05)
     assert after < before - 0.7
     assert 0.4 <= after <= 0.8
+
+
+def test_argos_provider_uses_worker(monkeypatch):
+    from buzz.localization.providers import ArgosTranslationProvider
+
+    calls = []
+
+    def fake_worker(command, source_language, target_language="vi", text=None):
+        calls.append((command, source_language, target_language, text))
+        return {"ok": True, "route": ["en", "vi"], "text": "Xin chào"}
+
+    monkeypatch.setattr(
+        "buzz.localization.providers._run_argos_worker",
+        fake_worker,
+    )
+
+    provider = ArgosTranslationProvider()
+    assert provider.translate("Hello", "en", "vi") == "Xin chào"
+    assert calls == [("translate", "en", "vi", "Hello")]
+
+
+def test_argos_provider_supports_chinese_worker_route(monkeypatch):
+    from buzz.localization.providers import ArgosTranslationProvider
+
+    monkeypatch.setattr(
+        "buzz.localization.providers._run_argos_worker",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "route": ["zh", "en", "vi"],
+            "text": "Chào buổi sáng",
+        },
+    )
+
+    assert (
+        ArgosTranslationProvider().translate("早上好", "zh", "vi")
+        == "Chào buổi sáng"
+    )
+
+
+def test_argos_provider_rejects_empty_text():
+    from buzz.localization.providers import ArgosTranslationProvider
+
+    with pytest.raises(ValueError, match="cannot be empty"):
+        ArgosTranslationProvider().translate(" ", "en", "vi")
+
+
+def test_argos_provider_rejects_unsupported_source():
+    from buzz.localization.providers import ArgosTranslationProvider
+
+    with pytest.raises(ValueError, match="Source language"):
+        ArgosTranslationProvider().translate("Bonjour", "fr", "vi")
+
+
+def test_argos_route_available_reports_worker_route(monkeypatch):
+    from buzz.localization.providers import argos_route_available
+
+    monkeypatch.setattr(
+        "buzz.localization.providers._run_argos_worker",
+        lambda *args, **kwargs: {"ok": True, "route": ["zh", "en", "vi"]},
+    )
+
+    assert argos_route_available("zh") == (
+        True,
+        "Argos route available: zh -> en -> vi",
+    )
+
+
+def test_argos_route_available_reports_worker_error(monkeypatch):
+    from buzz.localization.providers import argos_route_available
+
+    def fail(*args, **kwargs):
+        raise LocalizationProviderError("missing zh->en route")
+
+    monkeypatch.setattr(
+        "buzz.localization.providers._run_argos_worker",
+        fail,
+    )
+
+    assert argos_route_available("zh") == (False, "missing zh->en route")
+
+
+class FakeGeminiResponse:
+    def __init__(self, text):
+        self.text = text
+
+
+class FakeGeminiModels:
+    def __init__(self, text):
+        self.text = text
+        self.calls = []
+
+    def generate_content(self, **kwargs):
+        self.calls.append(kwargs)
+        return FakeGeminiResponse(self.text)
+
+
+class FakeGeminiClient:
+    def __init__(self, text):
+        self.models = FakeGeminiModels(text)
+
+
+def test_gemini_provider_returns_vietnamese_text():
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    provider = GeminiTranslationProvider(api_key="test-key", model="gemini-test")
+    provider._client = FakeGeminiClient(" Xin chào thế giới ")
+
+    assert provider.translate("Hello world", "en", "vi") == "Xin chào thế giới"
+    call = provider._client.models.calls[0]
+    assert call["model"] == "gemini-test"
+    assert "Hello world" in call["contents"]
+
+
+def test_gemini_provider_supports_chinese_source():
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    provider = GeminiTranslationProvider(api_key="test-key", model="gemini-test")
+    provider._client = FakeGeminiClient("Chào buổi sáng")
+    assert provider.translate("早上好", "zh", "vi") == "Chào buổi sáng"
+
+
+def test_gemini_provider_requires_key_and_model():
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    with pytest.raises(ValueError, match="API key"):
+        GeminiTranslationProvider(api_key="", model="gemini-test")
+    with pytest.raises(ValueError, match="model"):
+        GeminiTranslationProvider(api_key="key", model="")
+
+
+def test_gemini_provider_rejects_empty_response():
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    provider = GeminiTranslationProvider(api_key="key", model="gemini-test")
+    provider._client = FakeGeminiClient("   ")
+    with pytest.raises(LocalizationProviderError, match="empty"):
+        provider.translate("Hello", "en", "vi")
+
+
+def test_gemini_provider_wraps_network_error():
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    class FailingModels:
+        def generate_content(self, **kwargs):
+            raise RuntimeError("network down")
+
+    class FailingClient:
+        models = FailingModels()
+
+    provider = GeminiTranslationProvider(api_key="SECRET", model="gemini-test")
+    provider._client = FailingClient()
+    with pytest.raises(LocalizationProviderError, match="Gemini translation request failed"):
+        provider.translate("Hello", "en", "vi")

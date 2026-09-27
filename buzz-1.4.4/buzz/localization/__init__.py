@@ -86,9 +86,12 @@ __all__ = [
     "FinalRenderOptions",
     "FinalRenderResult",
     "render_localized_mp4",
+    "ArgosTranslationProvider",
+    "GeminiTranslationProvider",
     "EdgeTTSProvider",
     "LocalizationProviderError",
     "OpenAICompatibleTranslationProvider",
+    "argos_route_available",
     "LocalizationCancelled",
     "LocalizationProgress",
     "LocalizationStage",
@@ -111,9 +114,12 @@ from buzz.localization.preflight import (
     write_localization_diagnostics,
 )
 from buzz.localization.providers import (
+    ArgosTranslationProvider,
+    GeminiTranslationProvider,
     EdgeTTSProvider,
     LocalizationProviderError,
     OpenAICompatibleTranslationProvider,
+    argos_route_available,
 )
 from buzz.localization.workflow import (
     LocalizationCancelled,

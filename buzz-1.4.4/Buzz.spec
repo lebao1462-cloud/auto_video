@@ -3,6 +3,7 @@ import os
 import os.path
 import platform
 import shutil
+import importlib.util
 
 from PyInstaller.utils.hooks import collect_all, collect_data_files, copy_metadata
 
@@ -16,14 +17,65 @@ def safe_copy_metadata(package_name):
         return []
 
 datas = []
-edge_tts_binaries = []
-edge_tts_hiddenimports = []
+localization_binaries = []
+localization_hiddenimports = []
+for optional_package in ("edge_tts", "argostranslate"):
+    try:
+        package_datas, package_binaries, package_hiddenimports = collect_all(
+            optional_package
+        )
+        datas += package_datas
+        localization_binaries += package_binaries
+        localization_hiddenimports += package_hiddenimports
+    except Exception:
+        # Localization preflight reports missing optional provider runtimes.
+        print(f"Optional localization package not bundled: {optional_package}")
+
+# google-genai ships a large tests/local-tokenizer tree. collect_all() would pull
+# that entire tree into Buzz and can force sentencepiece into PyInstaller's
+# isolated dependency scanner even though text generation does not need it.
+# The runtime provider only needs these modules; their regular imports pull
+# required dependencies transitively.
 try:
-    edge_tts_datas, edge_tts_binaries, edge_tts_hiddenimports = collect_all("edge_tts")
-    datas += edge_tts_datas
+    import google.genai  # noqa: F401
+    localization_hiddenimports += [
+        "google.genai",
+        "google.genai.types",
+    ]
+    datas += safe_copy_metadata("google-genai")
 except Exception:
-    # Localization preflight will report a missing Edge TTS runtime.
-    pass
+    print("Optional localization package not bundled: google-genai")
+
+# Argos depends on sentencepiece. On this Windows development machine,
+# PyInstaller's isolated dependency scanner crashes while importing
+# sentencepiece (0xC0000005), although sentencepiece works at runtime.
+# Exclude it from graph scanning and copy its pure-Python package files plus
+# native extension manually so the frozen Argos worker can import it normally.
+sentencepiece_spec = importlib.util.find_spec("sentencepiece")
+if sentencepiece_spec and sentencepiece_spec.submodule_search_locations:
+    sentencepiece_dir = os.path.abspath(
+        next(iter(sentencepiece_spec.submodule_search_locations))
+    )
+    for filename in (
+        "__init__.py",
+        "__init__.pyi",
+        "_version.py",
+        "sentencepiece_model_pb2.py",
+        "sentencepiece_pb2.py",
+        "py.typed",
+    ):
+        source = os.path.join(sentencepiece_dir, filename)
+        if os.path.isfile(source):
+            datas.append((source, "sentencepiece"))
+    for filename in os.listdir(sentencepiece_dir):
+        if filename.startswith("_sentencepiece") and filename.endswith(".pyd"):
+            localization_binaries.append(
+                (os.path.join(sentencepiece_dir, filename), "sentencepiece")
+            )
+    datas += safe_copy_metadata("sentencepiece")
+else:
+    print("Optional sentencepiece runtime not found; Argos may be unavailable.")
+
 datas += collect_data_files("torch")
 datas += collect_data_files("demucs")
 datas += safe_copy_metadata("tqdm")
@@ -127,7 +179,7 @@ if platform.system() == "Windows":
 a = Analysis(
     ["main.py"],
     pathex=[],
-    binaries=binaries + edge_tts_binaries,
+    binaries=binaries + localization_binaries,
     datas=datas,
     hiddenimports=[
         "dora", "dora.log",
@@ -144,17 +196,31 @@ a = Analysis(
         "soundfile",
         "_soundfile_data",
         "lhotse",
-        *edge_tts_hiddenimports,
+        *localization_hiddenimports,
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=["sentencepiece"],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
     noarchive=False,
 )
+
+# PyQt6 bundles an older MSVCP140.dll under Qt6/bin. On Windows that copy can
+# be selected by the frozen Argos subprocess and crash sentencepiece/Argos
+# with 0xC0000005. Keep the newer runtime already collected at _internal root.
+if platform.system() == "Windows":
+    from PyInstaller.building.datastruct import TOC
+
+    a.binaries = TOC(
+        entry
+        for entry in a.binaries
+        if entry[0].replace("\\", "/").lower()
+        != "pyqt6/qt6/bin/msvcp140.dll"
+    )
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(
