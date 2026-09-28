@@ -5,7 +5,8 @@ import uuid
 
 from PyQt6.QtCore import QSettings
 
-APP_NAME = "Buzz"
+APP_NAME = "Buzz"  # Existing settings and keyring namespace.
+APP_DISPLAY_NAME = "Auto Video"
 
 
 class Settings:
@@ -51,6 +52,9 @@ class Settings:
         CUSTOM_OPENAI_BASE_URL = "transcriber/custom-openai-base-url"
         OPENAI_API_MODEL = "transcriber/openai-api-model"
         LOCALIZATION_TRANSLATION_PROVIDER = "localization/translation-provider"
+        LOCALIZATION_COVER_ORIGINAL_SUBTITLES = (
+            "localization/cover-original-subtitles"
+        )
         CUSTOM_FASTER_WHISPER_ID = "transcriber/custom-faster-whisper-id"
         HUGGINGFACE_MODEL_ID = "transcriber/huggingface-model-id"
 

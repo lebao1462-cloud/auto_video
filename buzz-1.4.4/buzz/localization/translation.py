@@ -72,6 +72,29 @@ def translate_for_localization(
             raise ValueError("Phase 2 cannot translate an empty source segment")
 
     translated_segments = []
+    if callable(getattr(provider, "translate_segments", None)):
+        batch_size = 30
+        for start in range(0, len(transcript.segments), batch_size):
+            batch = transcript.segments[start:start + batch_size]
+            context = transcript.segments[max(0, start - 5):start]
+            items = provider.translate_segments(
+                batch, transcript.source_language, target_language, context=context
+            )
+            if len(items) != len(batch):
+                raise ValueError("Translation provider returned a different segment count")
+            for segment, item in zip(batch, items):
+                corrected, translated = item
+                if not isinstance(corrected, str) or not corrected.strip() or not isinstance(translated, str) or not translated.strip():
+                    raise ValueError("Translation provider returned an invalid response")
+                translated_segments.append(TranslatedLocalizationSegment(
+                    start=segment.start, end=segment.end,
+                    source_text=corrected.strip(), translated_text=translated.strip(),
+                ))
+        return TranslatedLocalizationTranscript(
+            source_file=transcript.source_file, source_language=transcript.source_language,
+            target_language=target_language, segments=tuple(translated_segments),
+        )
+
     for segment in transcript.segments:
         translated_text = provider.translate(
             segment.text,

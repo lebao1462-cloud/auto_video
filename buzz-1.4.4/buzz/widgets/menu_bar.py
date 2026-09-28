@@ -1,13 +1,14 @@
 import platform
 import webbrowser
+from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtGui import QAction, QKeySequence
-from PyQt6.QtWidgets import QMenuBar, QWidget
+from PyQt6.QtWidgets import QMenuBar, QMessageBox, QWidget
 
 from buzz.locale import _
-from buzz.settings.settings import APP_NAME
+from buzz.settings.settings import APP_DISPLAY_NAME
 from buzz.settings.shortcut import Shortcut
 from buzz.settings.shortcuts import Shortcuts
 from buzz.widgets.about_dialog import AboutDialog
@@ -51,7 +52,7 @@ class MenuBar(QMenuBar):
         self.localize_video_action.triggered.connect(self.localize_video_action_triggered)
 
         about_label = _("About")
-        about_action = QAction(f'{about_label} {APP_NAME}', self)
+        about_action = QAction(f'{about_label} {APP_DISPLAY_NAME}', self)
         about_action.triggered.connect(self.on_about_action_triggered)
         about_action.setMenuRole(QAction.MenuRole.AboutRole)
 
@@ -64,13 +65,6 @@ class MenuBar(QMenuBar):
         help_action.triggered.connect(self.on_help_action_triggered)
 
         self.reset_shortcuts()
-
-        file_menu = self.addMenu(_("File"))
-        file_menu.addAction(self.import_action)
-        file_menu.addAction(self.import_url_action)
-        file_menu.addAction(self.import_folder_action)
-        file_menu.addSeparator()
-        file_menu.addAction(self.localize_video_action)
 
         help_menu_title = _("Help") + ("\u200B" if platform.system() == "Darwin" else "")
         help_menu = self.addMenu(help_menu_title)
@@ -102,7 +96,11 @@ class MenuBar(QMenuBar):
             self.preferences_changed.emit(updated_preferences)
 
     def on_help_action_triggered(self):
-        webbrowser.open("https://chidiwilliams.github.io/buzz/docs")
+        help_file = Path(__file__).resolve().parents[2] / "HELP.html"
+        if help_file.is_file():
+            webbrowser.open(help_file.as_uri())
+        else:
+            QMessageBox.warning(self, APP_DISPLAY_NAME, "Help file is missing.")
 
     def reset_shortcuts(self):
         self.import_action.setShortcut(

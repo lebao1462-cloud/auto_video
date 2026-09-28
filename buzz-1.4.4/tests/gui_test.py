@@ -89,25 +89,24 @@ class TestAudioDevicesComboBox:
 @pytest.fixture(scope="module", autouse=True)
 def clear_settings():
     settings = Settings()
+    saved = {key: settings.settings.value(key) for key in settings.settings.allKeys()}
     settings.clear()
+    yield
+    settings.clear()
+    for key, value in saved.items():
+        settings.settings.setValue(key, value)
+    settings.settings.sync()
 
 
 class TestAboutDialog:
-    def test_should_check_for_updates(self, qtbot: QtBot):
-        reply = MockNetworkReply(data={"name": "v" + VERSION})
-        manager = MockNetworkAccessManager(reply=reply)
-        dialog = AboutDialog(network_access_manager=manager)
+    def test_about_has_no_project_link(self, qtbot: QtBot):
+        dialog = AboutDialog()
         qtbot.add_widget(dialog)
+        assert dialog.windowTitle() == "About Auto Video"
+        assert not dialog.windowIcon().isNull()
 
-        mock_message_box_information = Mock()
-        QMessageBox.information = mock_message_box_information
-
-        with qtbot.wait_signal(dialog.network_access_manager.finished):
-            dialog.check_updates_button.click()
-
-        mock_message_box_information.assert_called_with(
-            dialog, "", _("You're up to date!")
-        )
+        assert not hasattr(dialog, "project_button")
+        assert dialog.show_logs_button.text() == _("Show logs")
 
 
 class TestAdvancedSettingsDialog:

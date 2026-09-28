@@ -1,51 +1,52 @@
 # Auto Video Localization - Windows Guide
 
-This fork extends Buzz 1.4.4 with an English/Chinese video -> Vietnamese localized MP4 workflow.
+Auto Video converts Chinese speech into Vietnamese dubbing and subtitles.
 
 ## What the workflow produces
 
 For one source video, the application can:
 
-1. Transcribe English or Chinese speech with Buzz/Whisper.
-2. Translate each segment into Vietnamese with Argos offline by default, or Gemini/OpenAI-compatible providers when selected.
+1. Transcribe Chinese speech with Paraformer-zh.
+2. Translate with Argos offline by default, or use Gemini to correct Chinese recognition in context and translate batches of up to 30 timestamped segments.
 3. Generate Vietnamese speech with Edge TTS.
 4. Synchronize Vietnamese speech to the source timeline.
 5. Optionally separate original vocals with Demucs and preserve background/music.
 6. Mix a full-length Vietnamese audio track.
 7. Generate Vietnamese SRT/VTT subtitles.
 8. Render the final MP4 with soft subtitles, burned-in subtitles, or no subtitle track.
+9. For videos longer than 15 minutes, split into sequential parts and join one final MP4 automatically.
 
 ## Windows first run
 
 Recommended paths on this development PC:
 
-    Project:          D:\code\auto_video\buzz-1.4.4
-    Model root:       D:\Buzz\Models
-    UV cache:         D:\uv-cache
-    Temporary files: D:\BuzzTestCache\Temp
-    Default output:  D:\AutoVideoOutput
+    Project:          D:\codex\auto_video\buzz-1.4.4
+    Model root:       D:\Dev\buzz-models
+    UV cache:         D:\Dev\uv-cache
+    Temporary files: D:\Dev\Temp
+    Default output:  D:\codex\auto_video_output
 
 Set the persistent model root if needed:
 
-    setx BUZZ_MODEL_ROOT D:\Buzz\Models
+    setx BUZZ_MODEL_ROOT D:\Dev\buzz-models
 
 For a PowerShell development session:
 
-    $env:BUZZ_MODEL_ROOT='D:\Buzz\Models'
-    $env:UV_CACHE_DIR='D:\uv-cache'
-    $env:TEMP='D:\BuzzTestCache\Temp'
-    $env:TMP='D:\BuzzTestCache\Temp'
-    $env:PATH='D:\App\Buzz\Buzz\_internal;' + $env:PATH
+    $env:BUZZ_MODEL_ROOT='D:\Dev\buzz-models'
+    $env:UV_CACHE_DIR='D:\Dev\uv-cache'
+    $env:TEMP='D:\Dev\Temp'
+    $env:TMP='D:\Dev\Temp'
+    $env:PATH='D:\Dev\FFmpeg\ffmpeg-9.0.2-full_build\bin;' + $env:PATH
 
-## Optional localization runtime provider
+## Localization runtime dependencies
 
-The localization GUI currently uses Edge TTS for Vietnamese speech.
+The localization workflow uses Paraformer-zh/FunASR for Chinese ASR and Edge TTS for Vietnamese speech.
 
-Install the pinned localization runtime requirement into the same Python environment used by Buzz:
+Install the pinned localization runtime requirements into the project's Python environment:
 
     .venv\Scripts\python.exe -m pip install -r localization-requirements.txt
 
-The provider is intentionally lazy-loaded. Normal Buzz transcription still works when Edge TTS is absent; localization preflight will report that the localization runtime is missing.
+Large ASR models are not stored in Git. Paraformer models are downloaded to the configured ModelScope cache on first use and can run offline afterward. Provider modules are lazy-loaded where practical; localization preflight reports missing runtime components.
 
 ## Translation providers
 
@@ -57,7 +58,7 @@ The default translation provider is Argos Translate:
 - English uses en -> vi;
 - Chinese uses zh -> en -> vi on the current Argos package index because a direct zh -> vi package is not available.
 
-The Argos runtime is isolated in a worker process. This avoids the native-library conflict observed when Argos and the Buzz/Whisper localization stack are loaded in the same Windows process.
+The Argos runtime is isolated in a worker process. This avoids native-library conflicts with the localization runtime in the main Windows process.
 
 ### Install Argos language packages
 
@@ -84,7 +85,7 @@ Configure the GUI with:
 - Gemini API key
 - Gemini model (default: gemini-2.5-flash)
 
-Gemini requires network access and may be subject to provider quota/rate limits.
+Gemini requires network access and may be subject to provider quota/rate limits. Each request includes segment IDs, timestamps, and five previous segments for context. The response must preserve every ID; invalid batches fail instead of silently misaligning dubbing. Chinese transcript text is corrected before Vietnamese translation. English transcript text is preserved.
 
 ### OpenAI-compatible - advanced compatibility provider
 
@@ -110,7 +111,7 @@ Argos prioritizes zero-cost/offline operation. English-to-Vietnamese output is g
 
 ## Using the GUI
 
-Open Buzz and choose:
+Open Auto Video and choose:
 
     File -> Localize Video to Vietnamese...
 
@@ -118,13 +119,13 @@ Then:
 
 1. Select the input video.
 2. Select the output folder.
-3. Choose English, Chinese, or auto-detect.
-4. Select a valid Whisper model.
+3. Choose Chinese or auto-detect (which resolves to Chinese).
+4. Paraformer-zh is used automatically for Chinese transcription. Its models are cached under `D:\Dev\modelscope-cache` when D: is available.
 5. Choose a translation provider. Argos requires no API key; Gemini/OpenAI show provider-specific fields.
 6. Choose a Vietnamese voice.
 7. Choose Soft subtitle, Burn subtitle into video, or No subtitle.
 8. Optionally enable Demucs background preservation.
-9. Click Start Localization.
+9. Click Start Localization. Long videos are divided and joined automatically; no manual part selection is required.
 
 Before work begins, preflight verifies the source/model, FFmpeg/ffprobe, Edge TTS, Demucs when requested, translation configuration, output write access, and estimated free disk space.
 
@@ -160,22 +161,22 @@ Long videos, high-resolution material, Demucs stems, and PCM audio may require m
 
 ## Packaging
 
-Buzz already contains Windows PyInstaller/Inno Setup packaging infrastructure.
+The project contains Windows PyInstaller/Inno Setup packaging infrastructure.
 
-The modified Buzz.spec:
+The modified build specification (AutoVideo.spec):
 
-- continues to bundle FFmpeg/ffprobe through the existing Buzz mechanism;
+- continues to bundle FFmpeg/ffprobe through the existing build mechanism;
 - bundles Edge TTS, Argos Translate, and Google GenAI provider modules when installed in the build environment;
-- keeps localization providers optional so normal Buzz startup does not fail solely because a provider runtime is absent;
-- includes the Argos worker entrypoint used to isolate native translation runtime from the main Buzz process.
+- keeps localization providers optional so normal application startup does not fail solely because a provider runtime is absent;
+- includes the Argos worker entrypoint used to isolate native translation runtime from the main application process.
 
 Before packaging, install the localization runtime requirement:
 
     .venv\Scripts\python.exe -m pip install -r localization-requirements.txt
 
-Then use the existing Buzz Windows build/package process.
+Then use the current Windows build/package process.
 
-Note: on September 26, 2026, regenerating the upstream Buzz uv.lock on this machine was blocked by DNS access to pypi.ngc.nvidia.com and the offline cache did not contain all cross-platform bitsandbytes packages. For that reason this fork does not silently modify uv.lock; the small localization provider requirement is kept in localization-requirements.txt.
+Note: on September 26, 2026, regenerating the original uv.lock on this machine was blocked by DNS access to pypi.ngc.nvidia.com and the offline cache did not contain all cross-platform bitsandbytes packages. For that reason this fork does not silently modify uv.lock; the small localization provider requirement is kept in localization-requirements.txt.
 
 ## Troubleshooting
 
@@ -187,7 +188,7 @@ Install:
 
 ### FFmpeg or ffprobe missing
 
-The packaged Buzz application should include them. For development, put the existing Buzz internal directory containing ffmpeg.exe and ffprobe.exe on PATH.
+The packaged application should include them. For development, put the existing application internal directory containing ffmpeg.exe and ffprobe.exe on PATH.
 
 ### Argos route missing
 
@@ -219,7 +220,7 @@ At Phase 8 completion:
 
     230 passed, 3 skipped, 0 failed
 
-The three skipped tests are unchanged upstream Buzz tests:
+The three skipped tests are unchanged tests from the original codebase:
 - two Unix-path cases skipped on Windows;
 - test_transcribe_stop, explicitly skipped upstream.
 
@@ -237,7 +238,7 @@ Final Windows release validation on September 26, 2026:
 
 Validated bundle:
 
-    D:\AutoVideoBuild\dist\Buzz\Buzz.exe
+    D:\AutoVideoBuild\dist\AutoVideo\AutoVideo.exe
 
 The bundle contains:
 

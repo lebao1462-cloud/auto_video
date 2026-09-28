@@ -197,3 +197,25 @@ def test_partial_provider_failure_raises_without_returning_partial_data():
         LocalizationSegment(0, 1, "First"),
         LocalizationSegment(1, 2, "Second"),
     )
+
+
+def test_batch_translation_keeps_timestamps_and_corrected_chinese():
+    class BatchProvider:
+        def __init__(self):
+            self.calls = []
+
+        def translate_segments(self, segments, source_language, target_language, *, context):
+            self.calls.append((len(segments), len(context)))
+            return [(f"修正{i}", f"Dịch {i}") for i, _ in enumerate(segments)]
+
+    provider = BatchProvider()
+    transcript = make_transcript(
+        source_language="zh",
+        segments=[LocalizationSegment(float(i), float(i + 1), f"文本{i}") for i in range(31)],
+    )
+    result = translate_for_localization(transcript, provider)
+    assert provider.calls == [(30, 0), (1, 5)]
+    assert result.segments[30].start == 30
+    assert result.segments[30].end == 31
+    assert result.segments[30].source_text == "修正0"
+    assert result.segments[30].translated_text == "Dịch 0"

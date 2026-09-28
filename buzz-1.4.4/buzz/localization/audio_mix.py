@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 import os
+import shutil
 import subprocess
 import sys
 from typing import Callable
@@ -192,6 +193,35 @@ def separate_background_with_demucs(
         if device is None:
             device = "cpu"
 
+    if not hasattr(demucs_api, "Separator"):
+        # The published Demucs package exposes a CLI, but no Separator API.
+        output_path = Path(output_file)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        demucs_dir = output_path.parent / "demucs_stems"
+        command = [
+            sys.executable, "-m", "demucs", "--two-stems", "vocals",
+            "-n", "htdemucs", "-d", device, "-o", str(demucs_dir),
+            str(source_path),
+        ]
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        )
+        if result.returncode != 0:
+            raise AudioMixingError(
+                "Demucs background separation failed: "
+                + (result.stderr or result.stdout).strip()
+            )
+        stem = demucs_dir / "htdemucs" / source_path.stem / "no_vocals.wav"
+        if not stem.is_file():
+            raise AudioMixingError("Demucs did not create the background stem")
+        shutil.copyfile(stem, output_path)
+        return str(output_path)
+
     try:
         separator = demucs_api.Separator(device=device, progress=False)
         _, separated = separator.separate_audio_file(source_path)
@@ -302,6 +332,7 @@ def mix_localized_audio(
             [
                 f"adelay={delay_ms}:all=1",
                 f"apad=whole_dur={final_duration:.6f}",
+                "asetpts=N/SR/TB",
                 f"atrim=0:{final_duration:.6f}",
             ]
         )

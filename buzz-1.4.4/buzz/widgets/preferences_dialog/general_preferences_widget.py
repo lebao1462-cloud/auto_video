@@ -217,7 +217,7 @@ class GeneralPreferencesWidget(QWidget):
         self.force_cpu_checkbox = QCheckBox(_("Use only CPU and disable GPU acceleration"))
         self.force_cpu_checkbox.setChecked(self.force_cpu_enabled)
         self.force_cpu_checkbox.setObjectName("ForceCPUCheckbox")
-        self.force_cpu_checkbox.setToolTip(_("Set this if larger models do not fit your GPU memory and Buzz crashes"))
+        self.force_cpu_checkbox.setToolTip(_("Set this if larger models do not fit your GPU memory and Auto Video crashes"))
         self.force_cpu_checkbox.stateChanged.connect(self.on_force_cpu_changed)
         layout.addRow(_("Disable GPU"), self.force_cpu_checkbox)
 
@@ -245,7 +245,7 @@ class GeneralPreferencesWidget(QWidget):
         QMessageBox.information(
             self,
             _("OpenAI API Key Test"),
-            _("Your API key is valid. Buzz will use this key to perform Whisper API transcriptions and AI translations."),
+            _("Your API key is valid. Auto Video will use this key to perform Whisper API transcriptions and AI translations."),
         )
 
     def on_test_openai_api_key_failure(self, error: str):

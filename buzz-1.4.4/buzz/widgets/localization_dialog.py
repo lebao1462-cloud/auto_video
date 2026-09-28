@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
 )
 
 from buzz.localization.final_render import FinalRenderOptions
+from buzz.localization.timing import TimingPolicy
 from buzz.localization.preflight import (
     run_localization_preflight,
     write_localization_diagnostics,
@@ -28,7 +29,9 @@ from buzz.localization.providers import (
     ArgosTranslationProvider,
     EdgeTTSProvider,
     GeminiTranslationProvider,
+    NLLBTranslationProvider,
     OpenAICompatibleTranslationProvider,
+    normalize_gemini_model_name,
 )
 from buzz.localization.workflow import (
     LocalizationCancelled,
@@ -37,7 +40,7 @@ from buzz.localization.workflow import (
     localize_video,
 )
 from buzz.settings.settings import Settings
-from buzz.store.keyring_store import Key, get_password
+from buzz.store.keyring_store import Key, get_password, set_password
 from buzz.transcriber.transcriber import Task, TranscriptionOptions
 
 
@@ -54,26 +57,26 @@ class LocalizationWorker(QObject):
         source_video: str,
         output_directory: str,
         source_language: str | None,
-        model_path: str,
         translation_provider_name: str,
         translation_base_url: str | None,
         translation_api_key: str,
         translation_model: str,
         tts_voice: str,
         subtitle_mode: str,
+        cover_original_subtitles: bool,
         use_background_separation: bool,
     ):
         super().__init__()
         self.source_video = source_video
         self.output_directory = output_directory
         self.source_language = source_language
-        self.model_path = model_path
         self.translation_provider_name = translation_provider_name
         self.translation_base_url = translation_base_url
         self.translation_api_key = translation_api_key
         self.translation_model = translation_model
         self.tts_voice = tts_voice
         self.subtitle_mode = subtitle_mode
+        self.cover_original_subtitles = cover_original_subtitles
         self.use_background_separation = use_background_separation
         self.cancel_event = threading.Event()
 
@@ -87,6 +90,8 @@ class LocalizationWorker(QObject):
         try:
             if self.translation_provider_name == "argos":
                 translation_provider = ArgosTranslationProvider()
+            elif self.translation_provider_name == "nllb":
+                translation_provider = NLLBTranslationProvider()
             elif self.translation_provider_name == "gemini":
                 translation_provider = GeminiTranslationProvider(
                     api_key=self.translation_api_key,
@@ -105,19 +110,22 @@ class LocalizationWorker(QObject):
                     language=self.source_language,
                     task=Task.TRANSCRIBE,
                 ),
-                self.model_path,
+                "",
                 translation_provider,
                 tts_provider,
                 LocalizationWorkflowOptions(
                     output_directory=self.output_directory,
                     use_background_separation=self.use_background_separation,
                     tts_voice=self.tts_voice,
+                    timing_policy=TimingPolicy(max_playback_rate=2.0),
                     render_options=FinalRenderOptions(
                         subtitle_mode=self.subtitle_mode,
+                        cover_original_subtitles=self.cover_original_subtitles,
                     ),
                 ),
                 progress_callback=self._on_progress,
                 cancel_event=self.cancel_event,
+                asr_provider="paraformer-zh",
             )
             self.completed.emit(result)
         except LocalizationCancelled:
@@ -139,9 +147,18 @@ class LocalizationDialog(QDialog):
         self.settings = Settings()
         self.source_edit = QLineEdit()
         self.output_edit = QLineEdit(self._default_output_directory())
-        self.model_path_edit = QLineEdit(self._default_model_path())
+        self.asr_provider_label = QLabel(
+            "Paraformer-zh - Chinese / Offline / Recommended"
+        )
+        self.asr_provider_status = QLabel(
+            "Chinese only; offline after the first model download. Models are stored "
+            "in D:\\Dev\\modelscope-cache when D: is available; no API key."
+        )
 
         self.translation_provider_combo = QComboBox()
+        self.translation_provider_combo.addItem(
+            "NLLB-200 - Offline / Free / No API key", "nllb"
+        )
         self.translation_provider_combo.addItem(
             "Argos Translate - Offline / Free / No API key", "argos"
         )
@@ -153,7 +170,7 @@ class LocalizationDialog(QDialog):
         )
         saved_provider = self.settings.value(
             Settings.Key.LOCALIZATION_TRANSLATION_PROVIDER,
-            "argos",
+            "nllb",
         )
         saved_index = self.translation_provider_combo.findData(saved_provider)
         self.translation_provider_combo.setCurrentIndex(
@@ -164,17 +181,40 @@ class LocalizationDialog(QDialog):
         self.base_url_edit = QLineEdit(
             os.getenv("BUZZ_TRANSLATION_API_BASE_URL", "")
         )
+        self._translation_api_keys = {
+            "gemini": (
+                os.getenv("GEMINI_API_KEY")
+                or os.getenv("BUZZ_TRANSLATION_API_KEY")
+                or get_password(Key.GEMINI_API_KEY)
+                or ""
+            ),
+            "openai-compatible": (
+                os.getenv("BUZZ_TRANSLATION_API_KEY")
+                or get_password(Key.OPENAI_API_KEY)
+                or ""
+            ),
+        }
+        self._active_translation_provider = (
+            self.translation_provider_combo.currentData()
+        )
         self.api_key_edit = QLineEdit(
-            os.getenv("BUZZ_TRANSLATION_API_KEY", get_password(Key.OPENAI_API_KEY) or "")
+            self._translation_api_keys.get(
+                self._active_translation_provider, ""
+            )
         )
         self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key_edit.editingFinished.connect(
+            self._save_current_api_key
+        )
         self.translation_model_edit = QLineEdit(
-            os.getenv("BUZZ_TRANSLATION_MODEL", "gemini-2.5-flash")
+            os.getenv("BUZZ_TRANSLATION_MODEL", "gemini-3.8-flash")
+        )
+        self.translation_model_edit.editingFinished.connect(
+            self._normalize_translation_model
         )
 
         self.language_combo = QComboBox()
-        self.language_combo.addItem("Auto detect (English/Chinese)", None)
-        self.language_combo.addItem("English", "en")
+        self.language_combo.addItem("Auto detect (Chinese)", None)
         self.language_combo.addItem("Chinese", "zh")
 
         self.voice_combo = QComboBox()
@@ -185,6 +225,19 @@ class LocalizationDialog(QDialog):
         self.subtitle_mode_combo.addItem("Soft subtitle", "soft")
         self.subtitle_mode_combo.addItem("Burn subtitle into video", "burn")
         self.subtitle_mode_combo.addItem("No subtitle in MP4", "none")
+
+        self.cover_original_subtitles_checkbox = QCheckBox(
+            "Blur original subtitles area (bottom 18%)"
+        )
+        self.cover_original_subtitles_checkbox.setChecked(
+            self.settings.value(
+                Settings.Key.LOCALIZATION_COVER_ORIGINAL_SUBTITLES,
+                True,
+            )
+        )
+        self.cover_original_subtitles_checkbox.setToolTip(
+            "Blurs the lower 18% of the video, adds a light dark overlay, then burns Vietnamese subtitles on top."
+        )
 
         self.background_checkbox = QCheckBox(
             "Separate original vocals and preserve background/music (Demucs)"
@@ -200,13 +253,13 @@ class LocalizationDialog(QDialog):
 
         source_row = self._path_row(self.source_edit, self._browse_source)
         output_row = self._path_row(self.output_edit, self._browse_output)
-        model_row = self._path_row(self.model_path_edit, self._browse_model)
 
         form = QFormLayout()
         form.addRow("Input video:", source_row)
         form.addRow("Output folder:", output_row)
+        form.addRow("ASR engine:", self.asr_provider_label)
+        form.addRow("", self.asr_provider_status)
         form.addRow("Source language:", self.language_combo)
-        form.addRow("Whisper model path:", model_row)
         form.addRow("Translation provider:", self.translation_provider_combo)
         form.addRow("", self.translation_provider_status)
         self.base_url_label = QLabel("Translation API base URL:")
@@ -217,6 +270,7 @@ class LocalizationDialog(QDialog):
         form.addRow(self.translation_model_label, self.translation_model_edit)
         form.addRow("Vietnamese voice:", self.voice_combo)
         form.addRow("Subtitle mode:", self.subtitle_mode_combo)
+        form.addRow("", self.cover_original_subtitles_checkbox)
         form.addRow("", self.background_checkbox)
 
         buttons = QHBoxLayout()
@@ -235,7 +289,11 @@ class LocalizationDialog(QDialog):
         self.translation_provider_combo.currentIndexChanged.connect(
             self._on_translation_provider_changed
         )
+        self.subtitle_mode_combo.currentIndexChanged.connect(
+            self._on_subtitle_mode_changed
+        )
         self._on_translation_provider_changed()
+        self._on_subtitle_mode_changed()
 
     @staticmethod
     def _path_row(edit: QLineEdit, callback) -> QWidget:
@@ -254,15 +312,6 @@ class LocalizationDialog(QDialog):
         if Path("D:/").exists():
             return str(d_drive)
         return str(Path.home() / "AutoVideoOutput")
-
-    @staticmethod
-    def _default_model_path() -> str:
-        root = os.getenv("BUZZ_MODEL_ROOT")
-        if root:
-            candidate = Path(root) / "whisper" / "tiny.pt"
-            if candidate.is_file():
-                return str(candidate)
-        return ""
 
     def _browse_source(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -283,40 +332,76 @@ class LocalizationDialog(QDialog):
         if path:
             self.output_edit.setText(path)
 
-    def _browse_model(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select Whisper model",
-            self.model_path_edit.text(),
-            "Model Files (*.pt *.bin);;All Files (*)",
+    def _on_subtitle_mode_changed(self):
+        is_burn = self.subtitle_mode_combo.currentData() == "burn"
+        self.cover_original_subtitles_checkbox.setEnabled(is_burn)
+
+    def _normalize_translation_model(self):
+        if self.translation_provider_combo.currentData() == "gemini":
+            normalized = normalize_gemini_model_name(
+                self.translation_model_edit.text()
+            )
+            if normalized:
+                self.translation_model_edit.setText(normalized)
+
+    def _save_current_api_key(self):
+        provider = self.translation_provider_combo.currentData()
+        api_key = self.api_key_edit.text().strip()
+        if provider not in {"gemini", "openai-compatible"} or not api_key:
+            return
+        self._translation_api_keys[provider] = api_key
+        key = (
+            Key.GEMINI_API_KEY
+            if provider == "gemini"
+            else Key.OPENAI_API_KEY
         )
-        if path:
-            self.model_path_edit.setText(path)
+        try:
+            set_password(key, api_key)
+        except Exception:
+            # A keyring failure must not prevent localization from running.
+            return
 
     def _on_translation_provider_changed(self):
         provider = self.translation_provider_combo.currentData()
+        previous = getattr(self, "_active_translation_provider", None)
+        if hasattr(self, "api_key_edit") and previous != provider:
+            if previous in {"gemini", "openai-compatible"}:
+                self._translation_api_keys[previous] = (
+                    self.api_key_edit.text().strip()
+                )
+            self.api_key_edit.setText(
+                self._translation_api_keys.get(provider, "")
+            )
+            self._active_translation_provider = provider
+
+        is_offline = provider in {"argos", "nllb"}
         is_argos = provider == "argos"
+        is_nllb = provider == "nllb"
         is_gemini = provider == "gemini"
         is_openai = provider == "openai-compatible"
 
         self.base_url_label.setVisible(is_openai)
         self.base_url_edit.setVisible(is_openai)
-        self.api_key_label.setVisible(not is_argos)
-        self.api_key_edit.setVisible(not is_argos)
-        self.translation_model_label.setVisible(not is_argos)
-        self.translation_model_edit.setVisible(not is_argos)
+        self.api_key_label.setVisible(not is_offline)
+        self.api_key_edit.setVisible(not is_offline)
+        self.translation_model_label.setVisible(not is_offline)
+        self.translation_model_edit.setVisible(not is_offline)
 
         if is_argos:
             self.translation_provider_status.setText(
                 "Offline / free. Uses installed Argos language packages; no API key."
             )
+        elif is_nllb:
+            self.translation_provider_status.setText(
+                "Direct English/Chinese -> Vietnamese. First use downloads NLLB-200 once; then it works offline with no API key."
+            )
         elif is_gemini:
             self.translation_provider_status.setText(
-                "Online Gemini translation. API quota/network access may apply."
+                "Gemini corrects Chinese transcript and translates 30 segments per request. API quota/network access may apply."
             )
             if self.translation_model_edit.text().strip() in {"", "gpt-4o-mini"}:
                 self.translation_model_edit.setText(
-                    os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+                    os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
                 )
         else:
             self.translation_provider_status.setText(
@@ -333,8 +418,6 @@ class LocalizationDialog(QDialog):
             return "Please select a valid input video."
         if not self.output_edit.text().strip():
             return "Please select an output folder."
-        if not Path(self.model_path_edit.text()).exists():
-            return "Please select a valid Whisper model path."
         provider = self.translation_provider_combo.currentData()
         if provider == "gemini":
             if not self.api_key_edit.text().strip():
@@ -349,16 +432,23 @@ class LocalizationDialog(QDialog):
         return None
 
     def start_localization(self):
+        self._normalize_translation_model()
         error = self._validate_inputs()
         if error:
             QMessageBox.warning(self, "Localization", error)
             return
 
+        self._save_current_api_key()
+        self.settings.set_value(
+            Settings.Key.LOCALIZATION_COVER_ORIGINAL_SUBTITLES,
+            self.cover_original_subtitles_checkbox.isChecked(),
+        )
+
         output_directory = Path(self.output_edit.text())
         output_directory.mkdir(parents=True, exist_ok=True)
         preflight = run_localization_preflight(
             self.source_edit.text(),
-            self.model_path_edit.text(),
+            "",
             output_directory,
             translation_api_key=self.api_key_edit.text().strip(),
             translation_model=self.translation_model_edit.text().strip(),
@@ -366,6 +456,7 @@ class LocalizationDialog(QDialog):
             source_language=self.language_combo.currentData(),
             require_edge_tts=True,
             use_background_separation=self.background_checkbox.isChecked(),
+            asr_provider="paraformer-zh",
         )
         write_localization_diagnostics(
             preflight,
@@ -391,13 +482,16 @@ class LocalizationDialog(QDialog):
             source_video=self.source_edit.text(),
             output_directory=self.output_edit.text(),
             source_language=self.language_combo.currentData(),
-            model_path=self.model_path_edit.text(),
             translation_provider_name=self.translation_provider_combo.currentData(),
             translation_base_url=self.base_url_edit.text().strip() or None,
             translation_api_key=self.api_key_edit.text().strip(),
             translation_model=self.translation_model_edit.text().strip(),
             tts_voice=self.voice_combo.currentData(),
             subtitle_mode=self.subtitle_mode_combo.currentData(),
+            cover_original_subtitles=(
+                self.cover_original_subtitles_checkbox.isChecked()
+                and self.subtitle_mode_combo.currentData() == "burn"
+            ),
             use_background_separation=self.background_checkbox.isChecked(),
         )
         self.worker.moveToThread(self.worker_thread)

@@ -23,8 +23,9 @@ from PyQt6.QtWidgets import (
 
 from buzz.__version__ import VERSION
 from buzz.locale import _
+from buzz.settings.settings import APP_DISPLAY_NAME
 from buzz.update_checker import UpdateInfo
-from buzz.widgets.icon import BUZZ_ICON_PATH
+from buzz.widgets.icon import APP_ICON_PATH
 
 class UpdateDialog(QDialog):
     """Dialog shows when an update is available"""
@@ -51,7 +52,7 @@ class UpdateDialog(QDialog):
 
     def _setup_ui(self):
         self.setWindowTitle(_("Update Available"))
-        self.setWindowIcon(QIcon(BUZZ_ICON_PATH))
+        self.setWindowIcon(QIcon(APP_ICON_PATH))
         self.setMinimumWidth(450)
 
         layout = QVBoxLayout(self)
@@ -59,7 +60,7 @@ class UpdateDialog(QDialog):
 
         #header
         header_label = QLabel(
-            _("A new version of Buzz is available!")
+            f"A new version of {APP_DISPLAY_NAME} is available!"
         )
 
         header_label.setStyleSheet("font-size: 16px; font-weight: bold;")

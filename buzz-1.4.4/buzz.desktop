@@ -4,14 +4,14 @@ Type=Application
 
 Encoding=UTF-8
 
-Name=Buzz
+Name=Auto Video
 
-Comment=Buzz transcribes and translates audio offline on your personal computer.
+Comment=Create Vietnamese dubbing and subtitles for videos.
 
-Path=/opt/buzz
+Path=/opt/auto-video
 
-Exec=/opt/buzz/Buzz
+Exec=/opt/auto-video/AutoVideo
 
-Icon=buzz
+Icon=auto-video
 
 Terminal=false

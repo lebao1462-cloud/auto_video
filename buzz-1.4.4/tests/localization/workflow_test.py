@@ -45,7 +45,7 @@ class FakeTTSProvider:
         )
 
 
-def create_test_video(path: Path):
+def create_test_video(path: Path, duration: int = 2):
     subprocess.run(
         [
             "ffmpeg",
@@ -53,11 +53,11 @@ def create_test_video(path: Path):
             "-f",
             "lavfi",
             "-i",
-            "color=c=black:s=320x240:d=2",
+            f"color=c=black:s=320x240:d={duration}",
             "-f",
             "lavfi",
             "-i",
-            "sine=frequency=440:duration=2",
+            f"sine=frequency=440:duration={duration}",
             "-shortest",
             "-c:v",
             "libx264",
@@ -295,7 +295,7 @@ def test_end_to_end_workflow_accepts_gemini_provider(monkeypatch, tmp_path):
     from buzz.localization.providers import GeminiTranslationProvider
 
     class Response:
-        text = "Xin chào mọi người"
+        text = '{"segments":[{"id":0,"corrected_text":"Hello everyone","translated_text":"Xin chào mọi người"}]}'
 
     class Models:
         def generate_content(self, **kwargs):
@@ -332,3 +332,125 @@ def test_end_to_end_workflow_accepts_gemini_provider(monkeypatch, tmp_path):
     assert "Xin chào mọi người" in Path(
         result.subtitle.subtitle_file
     ).read_text(encoding="utf-8")
+
+def test_chunked_video_joins_parts_and_offsets_subtitles(tmp_path):
+    source = tmp_path / "long_source.mp4"
+    create_test_video(source, duration=4)
+    output = tmp_path / "output"
+    progress = []
+    result = localize_video(
+        str(source),
+        TranscriptionOptions(language="en", task=Task.TRANSCRIBE),
+        "unused-model-path", FakeTranslationProvider(), FakeTTSProvider(),
+        LocalizationWorkflowOptions(
+            output_directory=str(output), chunk_duration_seconds=2,
+            render_options=FinalRenderOptions(subtitle_mode="soft"),
+        ),
+        progress_callback=progress.append,
+        transcribe_func=fake_transcribe,
+    )
+    assert result.subtitle.cue_count == 2
+    text = Path(result.subtitle.subtitle_file).read_text(encoding="utf-8")
+    assert "00:00:00,250 --> 00:00:01,500" in text
+    times = [line for line in text.splitlines() if "-->" in line]
+    assert len(times) == 2
+    start, end = times[1].split(" --> ")
+    assert start.startswith("00:00:02,")
+    assert end.startswith("00:00:03,")
+    assert 250 <= int(start.rsplit(",", 1)[1]) < 350
+    assert int(end.rsplit(",", 1)[1]) - int(start.rsplit(",", 1)[1]) == 250
+    assert Path(result.localized_audio_file).is_file()
+    assert progress[-1].fraction == 1.0
+    assert any("Part 2/2" in item.message for item in progress)
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "format=duration:stream=codec_type", "-of", "json",
+         result.final_video.video_file],
+        check=True, capture_output=True, text=True,
+    )
+    import json
+    streams = json.loads(probe.stdout)
+    assert float(streams["format"]["duration"]) == pytest.approx(4.0, abs=0.2)
+    assert {item["codec_type"] for item in streams["streams"]} == {
+        "video", "audio", "subtitle",
+    }
+    packets = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "s:0",
+         "-show_entries", "packet=pts_time", "-of", "csv=p=0",
+         result.final_video.video_file],
+        check=True, capture_output=True, text=True,
+    )
+    second_start = 2 + int(start.rsplit(",", 1)[1]) / 1000
+    assert any(
+        abs(float(pts) - second_start) < 0.01
+        for pts in packets.stdout.splitlines() if pts.strip()
+    )
+
+
+def test_chunked_video_cancellation_between_parts(tmp_path):
+    source = tmp_path / "long_source.mp4"
+    create_test_video(source, duration=4)
+    cancel = threading.Event()
+
+    def stop_after_first_part(progress):
+        if "Part 1/2" in progress.message and progress.stage == LocalizationStage.RENDER:
+            cancel.set()
+
+    with pytest.raises(LocalizationCancelled):
+        localize_video(
+            str(source),
+            TranscriptionOptions(language="en", task=Task.TRANSCRIBE),
+            "unused-model-path", FakeTranslationProvider(), FakeTTSProvider(),
+            LocalizationWorkflowOptions(
+                output_directory=str(tmp_path / "out"), chunk_duration_seconds=2,
+            ),
+            progress_callback=stop_after_first_part, cancel_event=cancel,
+            transcribe_func=fake_transcribe,
+        )
+
+@pytest.mark.parametrize("mode", ["soft", "burn", "none"])
+def test_chunked_video_preserves_silent_part(tmp_path, mode):
+    source = tmp_path / "long_source.mp4"
+    create_test_video(source, duration=4)
+    calls = 0
+
+    def transcribe_first_part_only(video_path, transcription_options, model_path):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return fake_transcribe(video_path, transcription_options, model_path)
+        return LocalizationTranscript(
+            source_file=video_path, source_language="en", segments=(),
+        )
+
+    result = localize_video(
+        str(source),
+        TranscriptionOptions(language="en", task=Task.TRANSCRIBE),
+        "unused-model-path", FakeTranslationProvider(), FakeTTSProvider(),
+        LocalizationWorkflowOptions(
+            output_directory=str(tmp_path / "output"), chunk_duration_seconds=2,
+            render_options=FinalRenderOptions(subtitle_mode=mode),
+        ),
+        transcribe_func=transcribe_first_part_only,
+    )
+    assert calls == 2
+    assert result.subtitle.cue_count == 1
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1",
+         result.final_video.video_file],
+        check=True, capture_output=True, text=True,
+    )
+    assert float(probe.stdout.strip()) == pytest.approx(4.0, abs=0.2)
+
+
+def test_chunked_vtt_merges_with_absolute_offsets(tmp_path):
+    from buzz.localization.chunked import _merge_subtitles
+    first = tmp_path / "part1.vtt"
+    second = tmp_path / "part2.vtt"
+    first.write_text("WEBVTT\n\n00:00:00.500 --> 00:00:01.500\nMột\n", encoding="utf-8")
+    second.write_text("WEBVTT\n\n00:00:00.200 --> 00:00:01.200\nHai\n", encoding="utf-8")
+    final = tmp_path / "final.vtt"
+    assert _merge_subtitles([(first, 0), (second, 900)], final, "vtt") == 2
+    text = final.read_text(encoding="utf-8")
+    assert "00:15:00.200 --> 00:15:01.200" in text

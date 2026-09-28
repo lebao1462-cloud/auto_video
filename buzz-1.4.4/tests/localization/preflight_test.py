@@ -21,6 +21,16 @@ def _make_inputs(tmp_path):
     return source, model, output
 
 
+@pytest.fixture(autouse=True)
+def available_paraformer(monkeypatch):
+    monkeypatch.setattr(
+        "buzz.localization.paraformer.paraformer_runtime_available", lambda: True,
+    )
+    monkeypatch.setattr(
+        "buzz.localization.paraformer.paraformer_model_is_cached", lambda cache: True,
+    )
+
+
 def test_workspace_estimate_has_conservative_floor():
     assert estimate_required_workspace_bytes(1) == 512 * 1024 * 1024
     assert estimate_required_workspace_bytes(200 * 1024 * 1024) == 1200 * 1024 * 1024
@@ -108,6 +118,10 @@ def test_missing_edge_tts_can_be_warning_when_not_required(monkeypatch, tmp_path
         lambda name: None,
     )
     monkeypatch.setattr(
+        "buzz.localization.paraformer.paraformer_runtime_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
         "buzz.localization.preflight.shutil.disk_usage",
         lambda path: type("Usage", (), {"free": 10 * 1024**3})(),
     )
@@ -125,7 +139,7 @@ def test_missing_edge_tts_can_be_warning_when_not_required(monkeypatch, tmp_path
     assert any("Edge TTS" in warning for warning in report.warnings)
 
 
-def test_preflight_rejects_missing_source_and_model(monkeypatch, tmp_path):
+def test_preflight_rejects_missing_source_without_requiring_a_model(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "buzz.localization.preflight._find_bundled_or_path_executable",
         lambda name: f"C:/{name}.exe",
@@ -145,7 +159,7 @@ def test_preflight_rejects_missing_source_and_model(monkeypatch, tmp_path):
 
     assert report.ok is False
     assert "Input video does not exist." in report.errors
-    assert "Whisper model path does not exist." in report.errors
+    assert not any("model path" in error.lower() for error in report.errors)
 
 
 def test_diagnostics_do_not_contain_api_key(monkeypatch, tmp_path):
@@ -221,7 +235,7 @@ def test_argos_preflight_does_not_require_api_key_or_model(monkeypatch, tmp_path
         model,
         output,
         translation_provider="argos",
-        source_language="en",
+        source_language="zh",
         translation_api_key="",
         translation_model="",
     )
@@ -229,6 +243,63 @@ def test_argos_preflight_does_not_require_api_key_or_model(monkeypatch, tmp_path
     assert report.ok is True
     assert not any(check.name == "translation_api_key" for check in report.checks)
     assert not any(check.name == "translation_model" for check in report.checks)
+
+
+def test_nllb_preflight_is_network_free_and_warns_when_model_is_missing(monkeypatch, tmp_path):
+    source, model, output = _make_inputs(tmp_path)
+    monkeypatch.setattr(
+        "buzz.localization.preflight._find_bundled_or_path_executable",
+        lambda name: f"C:/{name}.exe",
+    )
+    monkeypatch.setattr(
+        "buzz.localization.preflight.importlib.util.find_spec",
+        lambda name: object(),
+    )
+    monkeypatch.setattr(
+        "buzz.localization.providers.nllb_model_is_available", lambda: False,
+    )
+    monkeypatch.setattr(
+        "buzz.localization.providers.nllb_model_path", lambda: tmp_path / "nllb",
+    )
+    monkeypatch.setattr(
+        "buzz.localization.preflight.shutil.disk_usage",
+        lambda path: type("Usage", (), {"free": 10 * 1024**3})(),
+    )
+
+    report = run_localization_preflight(
+        source, model, output, translation_provider="nllb", translation_api_key="",
+        translation_model="",
+    )
+
+    assert report.ok is True
+    assert not any(check.name == "translation_api_key" for check in report.checks)
+    assert "first use downloads" in " ".join(report.warnings)
+
+
+def test_nllb_preflight_requires_all_runtime_packages(monkeypatch, tmp_path):
+    source, model, output = _make_inputs(tmp_path)
+    monkeypatch.setattr(
+        "buzz.localization.preflight._find_bundled_or_path_executable",
+        lambda name: f"C:/{name}.exe",
+    )
+    packages = {"torch", "transformers", "huggingface_hub"}
+    monkeypatch.setattr(
+        "buzz.localization.preflight.importlib.util.find_spec",
+        lambda name: object() if name in packages else None,
+    )
+    monkeypatch.setattr(
+        "buzz.localization.preflight.shutil.disk_usage",
+        lambda path: type("Usage", (), {"free": 10 * 1024**3})(),
+    )
+
+    report = run_localization_preflight(
+        source, model, output, translation_provider="nllb", translation_api_key="",
+        translation_model="",
+    )
+
+    runtime = next(check for check in report.checks if check.name == "nllb_runtime")
+    assert runtime.ok is False
+    assert "sentencepiece" in runtime.message
 
 
 def test_argos_preflight_blocks_missing_route(monkeypatch, tmp_path):
@@ -338,3 +409,21 @@ def test_preflight_rejects_unknown_translation_provider(tmp_path):
             output,
             translation_provider="unknown",
         )
+
+
+def test_paraformer_preflight_is_network_free_and_rejects_english(monkeypatch, tmp_path):
+    source, model, output = _make_inputs(tmp_path)
+    monkeypatch.setattr("buzz.localization.preflight._find_bundled_or_path_executable", lambda name: f"C:/{name}.exe")
+    monkeypatch.setattr("buzz.localization.preflight.importlib.util.find_spec", lambda name: object())
+    monkeypatch.setattr("buzz.localization.preflight.shutil.disk_usage", lambda path: type("Usage", (), {"free": 10 * 1024**3})())
+    monkeypatch.setattr("buzz.localization.paraformer.paraformer_runtime_available", lambda: True)
+    monkeypatch.setattr("buzz.localization.paraformer.paraformer_model_is_cached", lambda cache: False)
+
+    report = run_localization_preflight(
+        source, "", output, translation_provider="nllb", source_language="en",
+        translation_api_key="", translation_model="", asr_provider="paraformer-zh",
+    )
+
+    assert report.ok is False
+    assert any("only supports Chinese" in error for error in report.errors)
+    assert any(check.name == "paraformer_model" and not check.required for check in report.checks)

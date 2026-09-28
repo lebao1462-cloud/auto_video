@@ -119,6 +119,7 @@ class TextColorIcon(Icon):
         super().__init__(get_path("assets/icons/gui-text-color.svg"), parent)
 
 
+APP_ICON_PATH = get_path("assets/auto-video.png")
 BUZZ_ICON_PATH = get_path("assets/buzz.ico")
 BUZZ_LARGE_ICON_PATH = get_path("assets/buzz-icon-1024.png")
 

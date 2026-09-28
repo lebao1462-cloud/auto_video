@@ -20,7 +20,7 @@ class UpdateInfo:
 class UpdateChecker(QObject):
     update_available = pyqtSignal(object)
 
-    VERSION_JSON_URL = "https://github.com/chidiwilliams/buzz/releases/latest/download/version_info.json"
+    VERSION_JSON_URL = "https://github.com/lebao1462-cloud/auto_video/releases/latest/download/version_info.json"
 
     CHECK_INTERVAL_DAYS = 7
 

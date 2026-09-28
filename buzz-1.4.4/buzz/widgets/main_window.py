@@ -17,13 +17,17 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QFileDialog,
+    QLabel,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
 )
 
 from buzz.db.entity.transcription import Transcription
 from buzz.db.service.transcription_service import TranscriptionService
 from buzz.file_transcriber_queue_worker import FileTranscriberQueueWorker
 from buzz.locale import _
-from buzz.settings.settings import APP_NAME, Settings
+from buzz.settings.settings import APP_DISPLAY_NAME, Settings
 from buzz.update_checker import UpdateChecker, UpdateInfo
 from buzz.widgets.update_dialog import UpdateDialog
 from buzz.settings.shortcuts import Shortcuts
@@ -35,7 +39,7 @@ from buzz.transcriber.transcriber import (
     SUPPORTED_AUDIO_FORMATS,
     Segment,
 )
-from buzz.widgets.icon import BUZZ_ICON_PATH
+from buzz.widgets.icon import APP_ICON_PATH
 from buzz.widgets.import_url_dialog import ImportURLDialog
 from buzz.widgets.main_window_toolbar import MainWindowToolbar
 from buzz.widgets.localization_dialog import LocalizationDialog
@@ -61,10 +65,10 @@ class MainWindow(QMainWindow):
     def __init__(self, transcription_service: TranscriptionService):
         super().__init__(flags=Qt.WindowType.Window)
 
-        self.setWindowTitle(APP_NAME)
-        self.setWindowIcon(QIcon(BUZZ_ICON_PATH))
+        self.setWindowTitle(APP_DISPLAY_NAME)
+        self.setWindowIcon(QIcon(APP_ICON_PATH))
 
-        self.setAcceptDrops(True)
+        self.setAcceptDrops(False)
 
         self.settings = Settings()
 
@@ -92,9 +96,9 @@ class MainWindow(QMainWindow):
         self.toolbar.stop_transcription_action_triggered.connect(
             self.on_stop_transcription_action_triggered
         )
-        self.addToolBar(self.toolbar)
+        # Retain legacy actions for internal callers, outside the home UI.
+        self.toolbar.hide()
         self.toolbar.update_action_triggered.connect(self.on_update_action_triggered)
-        self.setUnifiedTitleAndToolBarOnMac(True)
 
         self.preferences = self.load_preferences(settings=self.settings)
         self.menu_bar = MenuBar(
@@ -133,7 +137,8 @@ class MainWindow(QMainWindow):
             self.on_transcriptions_updated
         )
 
-        self.setCentralWidget(self.table_widget)
+        self.table_widget.hide()
+        self.setCentralWidget(self.create_home_widget())
 
         # Start transcriber thread
         self.transcriber_thread = QThread()
@@ -167,8 +172,47 @@ class MainWindow(QMainWindow):
         self.transcription_viewer_widget = None
         self.localization_dialog = None
 
-        #Initialize and run update checker
-        self._init_update_checker()
+        # No upstream update checks; releases are managed by this project.
+
+    def create_home_widget(self):
+        home = QWidget(self)
+        layout = QVBoxLayout(home)
+        layout.setContentsMargins(32, 32, 32, 32)
+        layout.setSpacing(24)
+        layout.addStretch()
+
+        title = QLabel("Dịch & lồng tiếng video", home)
+        title_font = title.font()
+        title_font.setPointSize(title_font.pointSize() + 10)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setWordWrap(True)
+        layout.addWidget(title)
+
+        description = QLabel(
+            "Chuyển video tiếng Anh hoặc tiếng Trung thành video tiếng Việt "
+            "với giọng đọc và phụ đề.", home
+        )
+        description.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        self.localize_video_button = QPushButton("Dịch & lồng tiếng video", home)
+        self.localize_video_button.setMinimumHeight(56)
+        self.localize_video_button.clicked.connect(
+            self.on_localize_video_action_triggered
+        )
+        layout.addWidget(self.localize_video_button, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+        steps = QLabel(
+            "1. Chọn video → 2. Chọn dịch/giọng/phụ đề → 3. Bắt đầu", home
+        )
+        steps.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        steps.setWordWrap(True)
+        layout.addWidget(steps)
+        layout.addStretch()
+        return home
 
     def on_preferences_changed(self, preferences: Preferences):
         self.preferences = preferences

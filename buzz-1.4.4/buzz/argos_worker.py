@@ -3,7 +3,28 @@ import sys
 from pathlib import Path
 
 
+def _configure_stanza_offline():
+    """Keep Argos' packaged Stanza resources read-only/offline."""
+    from argostranslate import sbd as argos_sbd
+    import stanza
+
+    def lazy_pipeline(self):
+        if self.stanza_pipeline is None:
+            self.stanza_pipeline = stanza.Pipeline(
+                lang=self.stanza_lang_code,
+                dir=str(self.pkg.package_path / "stanza"),
+                processors="tokenize",
+                use_gpu=argos_sbd.settings.device == "cuda",
+                logging_level="WARNING",
+                download_method=None,
+            )
+        return self.stanza_pipeline
+
+    argos_sbd.StanzaSentencizer.lazy_pipeline = lazy_pipeline
+
+
 def _installed_languages():
+    _configure_stanza_offline()
     from argostranslate import translate as argos_translate
 
     return argos_translate.get_installed_languages()

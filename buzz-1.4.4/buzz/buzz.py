@@ -27,7 +27,7 @@ if getattr(sys, "frozen", False) is False and platform.system() != "Windows":
 
 # Sets stdout/stderr to no-op TextIO when None (run as Windows GUI with --noconsole).
 # stdout fix: torch.hub uses sys.stdout.write() for download progress and crashes if None.
-# stderr fix: Resolves https://github.com/chidiwilliams/buzz/issues/221
+# Keep stderr available for background worker diagnostics.
 if sys.stdout is None:
     sys.stdout = TextIO()
 if sys.stderr is None:

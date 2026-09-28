@@ -87,11 +87,14 @@ __all__ = [
     "FinalRenderResult",
     "render_localized_mp4",
     "ArgosTranslationProvider",
+    "NLLBTranslationProvider",
     "GeminiTranslationProvider",
     "EdgeTTSProvider",
     "LocalizationProviderError",
     "OpenAICompatibleTranslationProvider",
     "argos_route_available",
+    "nllb_model_is_available",
+    "nllb_model_path",
     "LocalizationCancelled",
     "LocalizationProgress",
     "LocalizationStage",
@@ -115,11 +118,14 @@ from buzz.localization.preflight import (
 )
 from buzz.localization.providers import (
     ArgosTranslationProvider,
+    NLLBTranslationProvider,
     GeminiTranslationProvider,
     EdgeTTSProvider,
     LocalizationProviderError,
     OpenAICompatibleTranslationProvider,
     argos_route_available,
+    nllb_model_is_available,
+    nllb_model_path,
 )
 from buzz.localization.workflow import (
     LocalizationCancelled,

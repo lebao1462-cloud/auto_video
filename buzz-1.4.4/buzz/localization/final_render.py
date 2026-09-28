@@ -17,6 +17,10 @@ class FinalRenderOptions:
     audio_bitrate: str = "192k"
     crf: int = 18
     preset: str = "medium"
+    cover_original_subtitles: bool = False
+    cover_height_ratio: float = 0.18
+    cover_blur_radius: int = 20
+    cover_dark_opacity: float = 0.22
 
     def __post_init__(self):
         if self.subtitle_mode not in {"soft", "burn", "none"}:
@@ -29,6 +33,12 @@ class FinalRenderOptions:
             raise ValueError("audio_codec is required")
         if not self.audio_bitrate:
             raise ValueError("audio_bitrate is required")
+        if not 0 < self.cover_height_ratio < 1:
+            raise ValueError("cover_height_ratio must be between 0 and 1")
+        if self.cover_blur_radius < 1:
+            raise ValueError("cover_blur_radius must be at least 1")
+        if not 0 <= self.cover_dark_opacity <= 1:
+            raise ValueError("cover_dark_opacity must be between 0 and 1")
 
 
 @dataclass(frozen=True)
@@ -147,14 +157,39 @@ def render_localized_mp4(
     elif render_options.subtitle_mode == "burn":
         assert subtitle_path is not None
         escaped_subtitle = _escape_subtitle_filter_path(subtitle_path)
+        video_filter = f"subtitles='{escaped_subtitle}'"
+        video_map = "0:v:0"
+        if render_options.cover_original_subtitles:
+            cover_start = 1.0 - render_options.cover_height_ratio
+            filter_complex = (
+                "[0:v]split=2[base][blur_src];"
+                "[blur_src]"
+                f"crop=iw:ih*{render_options.cover_height_ratio:.4f}:"
+                f"0:ih*{cover_start:.4f},"
+                f"boxblur=luma_radius={render_options.cover_blur_radius}:"
+                "luma_power=2[blurred];"
+                "[base][blurred]overlay=0:H-h[covered];"
+                "[covered]"
+                f"drawbox=x=0:y=ih*{cover_start:.4f}:"
+                f"w=iw:h=ih*{render_options.cover_height_ratio:.4f}:"
+                f"color=black@{render_options.cover_dark_opacity:.2f}:t=fill,"
+                f"subtitles='{escaped_subtitle}'[vout]"
+            )
+            command.extend(["-filter_complex", filter_complex])
+            video_map = "[vout]"
+            video_filter = None
         command.extend(
             [
                 "-map",
-                "0:v:0",
+                video_map,
                 "-map",
                 "1:a:0",
-                "-vf",
-                f"subtitles='{escaped_subtitle}'",
+            ]
+        )
+        if video_filter is not None:
+            command.extend(["-vf", video_filter])
+        command.extend(
+            [
                 "-c:v",
                 render_options.video_codec,
                 "-preset",

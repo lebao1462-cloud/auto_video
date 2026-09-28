@@ -1,6 +1,12 @@
 from dataclasses import dataclass
+import hashlib
+import json
+import logging
+import os
 from pathlib import Path
 import subprocess
+import tempfile
+import time
 
 from openai import OpenAI
 
@@ -8,8 +14,71 @@ from buzz.localization.audio_mix import _ffmpeg_env, _run_ffmpeg
 from buzz.localization.tts import TTSRequest, TTSResult
 
 
+logger = logging.getLogger(__name__)
+
+
 class LocalizationProviderError(RuntimeError):
     """Raised when a concrete localization provider fails."""
+
+
+NLLB_MODEL_ID = "facebook/nllb-200-distilled-600M"
+NLLB_MODEL_DIRECTORY_NAME = "nllb-200-distilled-600M"
+NLLB_LANGUAGE_CODES = {"en": "eng_Latn", "zh": "zho_Hans", "vi": "vie_Latn"}
+
+
+def nllb_model_path() -> Path:
+    """Return the explicit local NLLB directory without creating or downloading it."""
+    configured_root = os.getenv("BUZZ_MODEL_ROOT")
+    if configured_root:
+        root = Path(configured_root)
+    elif os.name == "nt" and Path("D:/").exists():
+        root = Path("D:/Dev/buzz-models")
+    else:
+        root = Path.home() / ".cache" / "buzz-models"
+    return root / "nllb" / NLLB_MODEL_DIRECTORY_NAME
+
+
+def nllb_model_is_available() -> bool:
+    """Cheap local-only check used by preflight; it never contacts Hugging Face."""
+    path = nllb_model_path()
+    has_weights = any(
+        (path / filename).is_file()
+        for filename in ("model.safetensors", "pytorch_model.bin")
+    )
+    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        index_path = path / index_name
+        if not index_path.is_file():
+            continue
+        try:
+            shard_names = json.loads(index_path.read_text(encoding="utf-8"))["weight_map"].values()
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            continue
+        has_weights = bool(shard_names) and all(
+            (path / shard_name).is_file() for shard_name in shard_names
+        )
+        if has_weights:
+            break
+    has_tokenizer = (path / "tokenizer_config.json").is_file() and any(
+        (path / filename).is_file()
+        for filename in ("tokenizer.json", "sentencepiece.bpe.model")
+    )
+    return path.is_dir() and (path / "config.json").is_file() and has_weights and has_tokenizer
+
+
+def normalize_gemini_model_name(model: str) -> str:
+    """Accept Gemini display names and convert them to API model IDs."""
+    value = model.strip()
+    if not value:
+        return value
+    if value.startswith("models/"):
+        prefix = "models/"
+        value = value[len(prefix):]
+    else:
+        prefix = ""
+    value = value.lower().replace("_", "-").replace(" ", "-")
+    while "--" in value:
+        value = value.replace("--", "-")
+    return prefix + value
 
 
 @dataclass
@@ -125,7 +194,7 @@ def _run_argos_worker(
         "encoding": "utf-8",
         "errors": "replace",
         "timeout": 180,
-        "env": os.environ.copy(),
+        "env": {**os.environ, "PYTHONIOENCODING": "utf-8"},
     }
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -203,9 +272,122 @@ class ArgosTranslationProvider:
 
 
 @dataclass
+class NLLBTranslationProvider:
+    """Local Meta NLLB-200 translation for direct English/Chinese to Vietnamese."""
+
+    batch_size: int = 2
+    max_input_length: int = 512
+    max_new_tokens: int = 256
+
+    def __post_init__(self):
+        self._tokenizer = None
+        self._model = None
+
+    def _load(self):
+        if self._model is not None:
+            return
+        try:
+            import sentencepiece  # noqa: F401 - required by the NLLB tokenizer
+            import torch
+            from huggingface_hub import snapshot_download
+            from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+        except ImportError as exc:
+            raise LocalizationProviderError(
+                "NLLB requires torch, transformers, huggingface_hub, and sentencepiece "
+                "in the Auto Video Python environment."
+            ) from exc
+
+        local_path = nllb_model_path()
+        try:
+            model_path = local_path
+            if not nllb_model_is_available():
+                # Materialize the complete public repository at the explicit D:-backed
+                # model location. Transformers is subsequently kept local-only.
+                model_path = Path(snapshot_download(
+                    repo_id=NLLB_MODEL_ID,
+                    local_dir=local_path,
+                    cache_dir=local_path.parent / ".huggingface-cache",
+                ))
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path, local_files_only=True
+            )
+            model = AutoModelForSeq2SeqLM.from_pretrained(
+                model_path, local_files_only=True, torch_dtype=torch.float32
+            )
+        except Exception as exc:
+            location = str(local_path)
+            if nllb_model_is_available():
+                message = f"Unable to load local NLLB model at {location}: {exc}"
+            else:
+                message = (
+                    f"Unable to download NLLB model to {location}. Connect once for "
+                    f"the download, then NLLB works offline: {exc}"
+                )
+            raise LocalizationProviderError(message) from exc
+
+        self._tokenizer = tokenizer
+        self._model = model.to("cpu").eval()
+
+    @staticmethod
+    def _validate(source_language: str, target_language: str) -> None:
+        if source_language not in {"en", "zh"}:
+            raise ValueError("Source language must be 'en' or 'zh'")
+        if target_language != "vi":
+            raise ValueError("NLLB localization target must be 'vi'")
+
+    def translate(self, text: str, source_language: str, target_language: str) -> str:
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Translation text cannot be empty")
+        self._validate(source_language, target_language)
+        return self._translate_texts([text], source_language)[0]
+
+    def _translate_texts(self, texts: list[str], source_language: str) -> list[str]:
+        self._load()
+        import torch
+
+        tokenizer = self._tokenizer
+        tokenizer.src_lang = NLLB_LANGUAGE_CODES[source_language]
+        target_id = tokenizer.convert_tokens_to_ids(NLLB_LANGUAGE_CODES["vi"])
+        translations: list[str] = []
+        for start in range(0, len(texts), self.batch_size):
+            batch = [" ".join(text.split()) for text in texts[start:start + self.batch_size]]
+            try:
+                encoded = tokenizer(
+                    batch, return_tensors="pt", padding=True, truncation=True,
+                    max_length=self.max_input_length,
+                )
+                with torch.inference_mode():
+                    generated = self._model.generate(
+                        **encoded, forced_bos_token_id=target_id,
+                        do_sample=False, num_beams=4, early_stopping=True,
+                        max_new_tokens=self.max_new_tokens,
+                    )
+                decoded = tokenizer.batch_decode(generated, skip_special_tokens=True)
+            except Exception as exc:
+                raise LocalizationProviderError(f"NLLB translation failed: {exc}") from exc
+            if len(decoded) != len(batch) or any(not item.strip() for item in decoded):
+                raise LocalizationProviderError("NLLB returned empty or incomplete translations")
+            translations.extend(item.strip() for item in decoded)
+        return translations
+
+    def translate_segments(
+        self, segments, source_language: str, target_language: str, *, context=()
+    ) -> list[tuple[str, str]]:
+        """Translate independent segments while preserving their source text and order."""
+        self._validate(source_language, target_language)
+        if not segments:
+            return []
+        source_texts = [item.text for item in segments]
+        if any(not isinstance(text, str) or not text.strip() for text in source_texts):
+            raise ValueError("Translation text cannot be empty")
+        translated = self._translate_texts(source_texts, source_language)
+        return [(text, vietnamese) for text, vietnamese in zip(source_texts, translated)]
+
+
+@dataclass
 class GeminiTranslationProvider:
     api_key: str
-    model: str = "gemini-2.5-flash"
+    model: str = "gemini-3.8-flash"
     timeout: float = 60.0
 
     def __post_init__(self):
@@ -213,6 +395,7 @@ class GeminiTranslationProvider:
             raise ValueError("Gemini API key is required")
         if not self.model:
             raise ValueError("Gemini model is required")
+        self.model = normalize_gemini_model_name(self.model)
         try:
             from google import genai
             from google.genai import types as genai_types
@@ -226,6 +409,45 @@ class GeminiTranslationProvider:
                 timeout=max(1, int(self.timeout * 1000)),
             ),
         )
+
+    def _generate_content_with_retry(self, *, contents, config=None):
+        primary = getattr(self, "model", "gemini-3.8-flash")
+        fallback = "gemini-3.5-flash-lite"
+        attempts = [
+            (primary, 0),
+            (primary, 5),
+            (primary, 15),
+        ]
+        if primary != fallback:
+            attempts.extend([
+                (fallback, 0),
+                (fallback, 10),
+            ])
+
+        last_error = None
+        for model, delay in attempts:
+            if delay:
+                time.sleep(delay)
+            try:
+                kwargs = {
+                    "model": model,
+                    "contents": contents,
+                }
+                if config is not None:
+                    kwargs["config"] = config
+                response = self._client.models.generate_content(**kwargs)
+                self.last_model_used = model
+                return response
+            except Exception as exc:
+                last_error = exc
+                message = str(exc).upper()
+                retryable = any(token in message for token in (
+                    "503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
+                    "TIMEOUT", "TIMED OUT", "CONNECTION",
+                ))
+                if not retryable:
+                    raise
+        raise last_error
 
     def translate(
         self,
@@ -249,8 +471,7 @@ class GeminiTranslationProvider:
             + text.strip()
         )
         try:
-            response = self._client.models.generate_content(
-                model=self.model,
+            response = self._generate_content_with_retry(
                 contents=prompt,
             )
         except Exception as exc:
@@ -263,10 +484,168 @@ class GeminiTranslationProvider:
             raise LocalizationProviderError("Gemini returned empty translation text")
         return translated.strip()
 
+    def translate_segments(
+        self,
+        segments,
+        source_language: str,
+        target_language: str,
+        *,
+        context=(),
+    ) -> list[tuple[str, str]]:
+        """Correct recognition and translate a timestamped batch in one request."""
+        if source_language not in {"zh", "en"} or target_language != "vi":
+            raise ValueError("Gemini batch requires English/Chinese to Vietnamese")
+        if not segments:
+            return []
+        payload = {
+            "source_language": source_language,
+            "context_only": [
+                {"start": item.start, "end": item.end, "text": item.text}
+                for item in context
+            ],
+            "segments": [
+                {"id": index, "start": item.start, "end": item.end, "text": item.text}
+                for index, item in enumerate(segments)
+            ],
+        }
+        prompt = (
+            "You are translating a video for Vietnamese dubbing. Read all segments "
+            "together for context. For Chinese, fix obvious Whisper recognition errors "
+            "using context, while preserving meaning, product terms, names, numbers "
+            "and units. For English, preserve the original transcript. Translate each "
+            "corrected segment to concise, natural spoken Vietnamese. Never combine, "
+            "drop, reorder, or split segments. Context-only entries are for background "
+            "and must NOT appear in the output. Keep each ID unchanged. Return a JSON "
+            "object with only a 'segments' array of objects with integer 'id', string "
+            "'corrected_text' and string 'translated_text'. Input JSON:\n"
+            + json.dumps(payload, ensure_ascii=False)
+        )
+        try:
+            response = self._generate_content_with_retry(
+                contents=prompt,
+                config={"response_mime_type": "application/json"},
+            )
+            result = json.loads(response.text)
+            items = result["segments"]
+            if not isinstance(items, list) or len(items) != len(segments):
+                raise ValueError("wrong number of segments")
+            by_id = {}
+            for item in items:
+                identifier = item["id"]
+                if (type(identifier) is not int or identifier in by_id
+                        or identifier not in range(len(segments))):
+                    raise ValueError("duplicate or invalid segment ID")
+                corrected = item["corrected_text"]
+                translated = item["translated_text"]
+                if not isinstance(corrected, str) or not corrected.strip():
+                    raise ValueError("empty corrected transcript")
+                if not isinstance(translated, str) or not translated.strip():
+                    raise ValueError("empty Vietnamese translation")
+                source_text = corrected if source_language == "zh" else segments[identifier].text
+                by_id[identifier] = (source_text.strip(), translated.strip())
+            if set(by_id) != set(range(len(segments))):
+                raise ValueError("missing or unexpected segment ID")
+            return [by_id[index] for index in range(len(segments))]
+        except Exception as exc:
+            raise LocalizationProviderError(
+                f"Gemini batch translation failed: {exc}"
+            ) from exc
+
 
 @dataclass
 class EdgeTTSProvider:
     default_voice: str = "vi-VN-HoaiMyNeural"
+
+    # A service throttle can outlive the short retries that are appropriate for a
+    # dropped connection.  This remains finite, while allowing more than three
+    # minutes for Edge to become available again.
+    transient_retry_delays = (5, 10, 20, 40, 60, 90, 120)
+
+    @staticmethod
+    def _cache_paths(output_path: Path) -> tuple[Path, Path]:
+        return output_path, output_path.with_name(
+            f"{output_path.stem}.tts-cache.json"
+        )
+
+    @staticmethod
+    def _cache_fingerprint(
+        request: TTSRequest,
+        voice: str,
+        rate: str,
+        volume: str,
+        pitch: str,
+        edge_tts_version: str | None,
+    ) -> str:
+        """Return a stable identity for audio-affecting Edge TTS settings."""
+        payload = {
+            "provider": "edge-tts",
+            "provider_version": edge_tts_version,
+            "text": request.text,
+            "language": request.language,
+            "voice": voice,
+            "rate": rate,
+            "volume": volume,
+            "pitch": pitch,
+        }
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _read_cached_result(
+        output_path: Path, checkpoint_path: Path, fingerprint: str,
+        expected_voice: str,
+    ) -> TTSResult | None:
+        """Return a verified cache entry, never trusting a bare audio file."""
+        try:
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            if checkpoint.get("fingerprint") != fingerprint:
+                return None
+            if checkpoint.get("audio_file") != str(output_path):
+                return None
+            if not output_path.is_file() or output_path.stat().st_size <= 0:
+                return None
+            duration = _probe_audio_duration(output_path)
+            if duration <= 0:
+                return None
+            metadata = checkpoint.get("metadata")
+            if not isinstance(metadata, dict):
+                return None
+            voice = checkpoint.get("voice")
+            if voice != expected_voice:
+                return None
+            return TTSResult(
+                audio_file=str(output_path), audio_duration=duration,
+                provider="edge-tts", voice=voice, metadata=metadata,
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError,
+                LocalizationProviderError):
+            return None
+
+    @staticmethod
+    def _write_checkpoint(
+        checkpoint_path: Path, fingerprint: str, result: TTSResult
+    ) -> None:
+        payload = {
+            "fingerprint": fingerprint,
+            "audio_file": result.audio_file,
+            "voice": result.voice,
+            "metadata": dict(result.metadata),
+        }
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=checkpoint_path.parent,
+            prefix=f".{checkpoint_path.name}.", suffix=".tmp", delete=False,
+        )
+        temporary_path = Path(handle.name)
+        try:
+            with handle:
+                json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary_path.replace(checkpoint_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
     def synthesize(self, request: TTSRequest) -> TTSResult:
         if request.language != "vi":
@@ -276,6 +655,7 @@ class EdgeTTSProvider:
 
         try:
             import edge_tts
+            from edge_tts.exceptions import NoAudioReceived, WebSocketError
         except ImportError as exc:
             raise LocalizationProviderError(
                 "edge-tts is required for Vietnamese TTS"
@@ -288,25 +668,67 @@ class EdgeTTSProvider:
         volume = str(options.get("volume", "+0%"))
         pitch = str(options.get("pitch", "+0Hz"))
 
-        try:
-            communicate = edge_tts.Communicate(
-                request.text,
-                voice,
-                rate=rate,
-                volume=volume,
-                pitch=pitch,
-            )
-            communicate.save_sync(output_file)
-        except Exception as exc:
-            raise LocalizationProviderError(f"Edge TTS failed: {exc}") from exc
-
         output_path = Path(output_file)
+        _, checkpoint_path = self._cache_paths(output_path)
+        fingerprint = self._cache_fingerprint(
+            request, voice, rate, volume, pitch,
+            getattr(edge_tts, "__version__", None),
+        )
+        cached = self._read_cached_result(
+            output_path, checkpoint_path, fingerprint, voice
+        )
+        if cached is not None:
+            logger.info("Reusing verified Edge TTS checkpoint for %s", output_path.name)
+            return cached
+
+        # A stale checkpoint must not survive a failed replacement and later be
+        # mistaken for the new request.
+        output_path.unlink(missing_ok=True)
+        checkpoint_path.unlink(missing_ok=True)
+        retry_delays = self.transient_retry_delays
+        max_attempts = len(retry_delays) + 1
+        for attempt in range(1, max_attempts + 1):
+            output_path.unlink(missing_ok=True)
+            try:
+                communicate = edge_tts.Communicate(
+                    request.text,
+                    voice,
+                    rate=rate,
+                    volume=volume,
+                    pitch=pitch,
+                )
+                communicate.save_sync(output_file)
+                if output_path.is_file() and output_path.stat().st_size > 0:
+                    break
+                raise NoAudioReceived(
+                    "Edge TTS returned no audio data."
+                )
+            except (NoAudioReceived, WebSocketError) as exc:
+                if attempt >= max_attempts:
+                    output_path.unlink(missing_ok=True)
+                    raise LocalizationProviderError(
+                        f"Edge TTS failed after {max_attempts} attempts: {exc}"
+                    ) from exc
+                delay = retry_delays[attempt - 1]
+                logger.warning(
+                    "Edge TTS transient failure (%d/%d); retrying voice %s in %d seconds",
+                    attempt, max_attempts, voice, delay,
+                )
+                time.sleep(delay)
+            except Exception as exc:
+                output_path.unlink(missing_ok=True)
+                raise LocalizationProviderError(f"Edge TTS failed: {exc}") from exc
+
         if not output_path.is_file() or output_path.stat().st_size <= 0:
             raise LocalizationProviderError("Edge TTS did not create an audio file")
 
-        _trim_edge_tts_silence(output_path)
-        duration = _probe_audio_duration(output_path)
-        return TTSResult(
+        try:
+            _trim_edge_tts_silence(output_path)
+            duration = _probe_audio_duration(output_path)
+        except Exception:
+            output_path.unlink(missing_ok=True)
+            raise
+        result = TTSResult(
             audio_file=str(output_path),
             audio_duration=duration,
             provider="edge-tts",
@@ -318,6 +740,13 @@ class EdgeTTSProvider:
                 "pitch": pitch,
             },
         )
+        try:
+            self._write_checkpoint(checkpoint_path, fingerprint, result)
+        except Exception:
+            output_path.unlink(missing_ok=True)
+            checkpoint_path.unlink(missing_ok=True)
+            raise
+        return result
 
 
 def _trim_edge_tts_silence(audio_file: Path) -> None:

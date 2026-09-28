@@ -106,18 +106,17 @@ class WhisperFileTranscriber(FileTranscriber):
         except OSError:
             pass
 
-        # Close the receive pipe to unblock the read_line thread
+        # Let the reader consume the final language and segment messages before
+        # closing its pipe. Closing it first can discard language detection.
+        if self.read_line_thread and self.read_line_thread.is_alive():
+            self.read_line_thread.join(timeout=3)
+        if self.read_line_thread and self.read_line_thread.is_alive():
+            logging.warning("Read line thread didn't terminate gracefully in transcribe()")
         try:
             if self.recv_pipe and not self.recv_pipe.closed:
                 self.recv_pipe.close()
         except OSError:
             pass
-
-        # Join read_line_thread with timeout to prevent hanging
-        if self.read_line_thread and self.read_line_thread.is_alive():
-            self.read_line_thread.join(timeout=3)
-            if self.read_line_thread.is_alive():
-                logging.warning("Read line thread didn't terminate gracefully in transcribe()")
 
         self.started_process = False
 

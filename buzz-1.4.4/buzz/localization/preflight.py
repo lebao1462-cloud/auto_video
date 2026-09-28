@@ -93,12 +93,12 @@ def run_localization_preflight(
     source_language: str | None = None,
     require_edge_tts: bool = True,
     use_background_separation: bool = False,
+    asr_provider: str = "paraformer-zh",
 ) -> LocalizationPreflightReport:
     source = Path(source_video_file)
-    model = Path(model_path)
     output = Path(output_directory)
 
-    if translation_provider not in {"argos", "gemini", "openai-compatible"}:
+    if translation_provider not in {"argos", "nllb", "gemini", "openai-compatible"}:
         raise ValueError("Unsupported translation provider")
 
     checks: list[PreflightCheck] = []
@@ -115,16 +115,24 @@ def run_localization_preflight(
     )
     source_size = source.stat().st_size if source_ok else 0
 
-    model_ok = model.exists()
-    checks.append(
-        PreflightCheck(
-            "whisper_model",
-            model_ok,
-            "Whisper model path is available."
-            if model_ok
-            else "Whisper model path does not exist.",
-        )
+    if asr_provider == "paraformer":
+        asr_provider = "paraformer-zh"
+    if asr_provider not in {"paraformer", "paraformer-zh"}:
+        raise ValueError("Localization requires the Paraformer-zh ASR provider")
+    from buzz.localization.paraformer import (
+        modelscope_cache_path, paraformer_model_is_cached, paraformer_runtime_available,
     )
+    runtime = paraformer_runtime_available()
+    cache = modelscope_cache_path()
+    checks.append(PreflightCheck("funasr_runtime", runtime,
+        "FunASR runtime is available." if runtime else "FunASR runtime is missing. Install funasr==1.4.16."))
+    cached = paraformer_model_is_cached(cache)
+    checks.append(PreflightCheck("paraformer_model", cached,
+        f"Paraformer models are cached at {cache}; Chinese transcription runs offline."
+        if cached else f"Paraformer models are not cached at {cache}; first use downloads them, then runs offline.", required=False))
+    checks.append(PreflightCheck("paraformer_language", source_language != "en",
+        "Paraformer-zh accepts Chinese or auto detection." if source_language != "en"
+        else "Paraformer-zh only supports Chinese source audio."))
 
     for executable in ("ffmpeg", "ffprobe"):
         path = _find_bundled_or_path_executable(executable)
@@ -147,7 +155,7 @@ def run_localization_preflight(
             if edge_available
             else (
                 "Edge TTS runtime is missing. Install edge-tts==7.2.8 "
-                "in the Buzz Python environment."
+                "in the Auto Video Python environment."
             ),
             required=require_edge_tts,
         )
@@ -175,7 +183,7 @@ def run_localization_preflight(
                 if argos_runtime
                 else (
                     "Argos Translate runtime is missing. Install "
-                    "argostranslate in the Buzz Python environment."
+                    "argostranslate in the Auto Video Python environment."
                 ),
             )
         )
@@ -208,6 +216,52 @@ def run_localization_preflight(
                         f"Unable to inspect installed Argos routes: {exc}",
                     )
                 )
+    elif translation_provider == "nllb":
+        nllb_runtime = (
+            importlib.util.find_spec("torch") is not None
+            and importlib.util.find_spec("transformers") is not None
+            and importlib.util.find_spec("huggingface_hub") is not None
+            and importlib.util.find_spec("sentencepiece") is not None
+        )
+        checks.append(
+            PreflightCheck(
+                "nllb_runtime",
+                nllb_runtime,
+                "NLLB runtime is available."
+                if nllb_runtime
+                else (
+                    "NLLB requires torch, transformers, huggingface_hub, and "
+                    "sentencepiece in the Auto Video Python environment."
+                ),
+            )
+        )
+        try:
+            from buzz.localization.providers import nllb_model_is_available, nllb_model_path
+
+            available = nllb_model_is_available()
+            path = nllb_model_path()
+            checks.append(
+                PreflightCheck(
+                    "nllb_model",
+                    available,
+                    f"NLLB model is available locally at {path}."
+                    if available
+                    else (
+                        f"NLLB model is not downloaded at {path}; first use downloads it "
+                        "once, then direct English/Chinese to Vietnamese translation works offline."
+                    ),
+                    required=False,
+                )
+            )
+        except Exception as exc:
+            checks.append(
+                PreflightCheck(
+                    "nllb_model",
+                    False,
+                    f"Unable to inspect the NLLB model location: {exc}",
+                    required=False,
+                )
+            )
     elif translation_provider == "gemini":
         gemini_runtime = importlib.util.find_spec("google.genai") is not None
         checks.append(
@@ -274,6 +328,15 @@ def run_localization_preflight(
     )
 
     required_bytes = estimate_required_workspace_bytes(source_size)
+    if source_ok:
+        try:
+            from buzz.localization.audio_mix import probe_media_duration
+            if probe_media_duration(source) > 900:
+                # Encoded parts accumulate until joining; PCM and stems are
+                # removed after each part rather than spanning the whole video.
+                required_bytes = max(4 * 1024**3, source_size * 3 + 4 * 1024**3)
+        except Exception:
+            pass
     free_bytes = 0
     if output_ok:
         try:

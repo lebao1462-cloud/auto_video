@@ -6,12 +6,12 @@ from unittest.mock import patch, Mock
 
 import pytest
 from PyQt6.QtCore import QSize, Qt
-from PyQt6.QtGui import QKeyEvent, QAction
+from PyQt6.QtGui import QKeyEvent
 from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QToolBar,
-    QMenuBar,
+    QLabel,
     QTableView,
 )
 from pytestqt.qtbot import QtBot
@@ -20,6 +20,7 @@ from buzz.locale import _
 from buzz.db.entity.transcription import Transcription
 from buzz.db.service.transcription_service import TranscriptionService
 from buzz.widgets.main_window import MainWindow
+from buzz.widgets.localization_dialog import LocalizationDialog
 from buzz.widgets.transcriber.file_transcriber_widget import FileTranscriberWidget
 
 mock_transcriptions: List[Transcription] = [
@@ -34,10 +35,62 @@ def get_test_asset(filename: str):
 
 
 class TestMainWindow:
+    def test_home_has_direct_localization_and_no_legacy_ui(
+        self, qtbot, transcription_service
+    ):
+        window = MainWindow(transcription_service)
+        qtbot.add_widget(window)
+        try:
+            window.show()
+            assert window.localize_video_button.isVisible()
+            assert window.localize_video_button.text() == "Dịch & lồng tiếng video"
+            assert window.centralWidget() is not window.table_widget
+            assert not window.table_widget.isVisible()
+            assert all(not toolbar.isVisible() for toolbar in window.findChildren(QToolBar))
+            assert [action.text().rstrip("\u200b") for action in window.menuBar().actions()] == [_("Help")]
+            assert not window.acceptDrops()
+            assert any(
+                "1. Chọn video → 2. Chọn dịch/giọng/phụ đề → 3. Bắt đầu" == label.text()
+                for label in window.centralWidget().findChildren(QLabel)
+            )
+        finally:
+            window.close()
+
+    def test_home_button_opens_reuses_and_reopens_localization_dialog(
+        self, qtbot, transcription_service, monkeypatch, settings
+    ):
+        monkeypatch.setattr(
+            "buzz.widgets.localization_dialog.Settings",
+            Mock(return_value=settings, Key=settings.Key),
+        )
+        monkeypatch.setattr("buzz.widgets.localization_dialog.get_password", lambda key: "")
+        window = MainWindow(transcription_service)
+        qtbot.add_widget(window)
+        try:
+            window.show()
+            qtbot.mouseClick(window.localize_video_button, Qt.MouseButton.LeftButton)
+            dialog = window.localization_dialog
+            assert isinstance(dialog, LocalizationDialog)
+            assert dialog.isVisible()
+            dialog.source_edit.setText("selected-video.mp4")
+            window.localize_video_button.click()
+            assert window.localization_dialog is dialog
+            assert dialog.source_edit.text() == "selected-video.mp4"
+            dialog.reject()
+            assert window.localization_dialog is None
+            window.localize_video_button.click()
+            assert isinstance(window.localization_dialog, LocalizationDialog)
+            assert window.localization_dialog is not dialog
+            assert window.localization_dialog.isVisible()
+        finally:
+            if window.localization_dialog is not None:
+                window.localization_dialog.reject()
+            window.close()
+
     def test_should_set_window_title_and_icon(self, qtbot, transcription_service):
         window = MainWindow(transcription_service)
         qtbot.add_widget(window)
-        assert window.windowTitle() == "Buzz"
+        assert window.windowTitle() == "Auto Video"
         assert window.windowIcon().pixmap(QSize(64, 64)).isNull() is False
         window.close()
 
@@ -69,15 +122,12 @@ class TestMainWindow:
         self, qtbot: QtBot, db, transcription_service
     ):
         window = MainWindow(transcription_service)
-        menu: QMenuBar = window.menuBar()
-        file_action = menu.actions()[0]
-        import_url_action: QAction = file_action.menu().actions()[1]
 
         with patch(
             "buzz.widgets.import_url_dialog.ImportURLDialog.prompt"
         ) as prompt_mock:
             prompt_mock.return_value = "https://github.com/chidiwilliams/buzz/raw/main/testdata/whisper-french.mp3"
-            import_url_action.trigger()
+            window.on_new_url_transcription_action_triggered()
 
         file_transcriber_widget: FileTranscriberWidget = window.findChild(
             FileTranscriberWidget

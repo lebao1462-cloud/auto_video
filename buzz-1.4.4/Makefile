@@ -1,16 +1,16 @@
 # Change also in pyproject.toml and buzz/__version__.py
-version := 1.4.4
+version := 0.1.0
 
-mac_app_path := ./dist/Buzz.app
-mac_zip_path := ./dist/Buzz-${version}-mac.zip
-mac_dmg_path := ./dist/Buzz-${version}-mac.dmg
+mac_app_path := ./dist/AutoVideo.app
+mac_zip_path := ./dist/AutoVideo-${version}-mac.zip
+mac_dmg_path := ./dist/AutoVideo-${version}-mac.dmg
 
-bundle_windows: dist/Buzz
+bundle_windows: dist/AutoVideo
 	iscc installer.iss
 
-bundle_mac: dist/Buzz.app codesign_all_mac zip_mac notarize_zip staple_app_mac dmg_mac
+bundle_mac: dist/AutoVideo.app codesign_all_mac zip_mac notarize_zip staple_app_mac dmg_mac
 
-bundle_mac_unsigned: dist/Buzz.app zip_mac dmg_mac_unsigned
+bundle_mac_unsigned: dist/AutoVideo.app zip_mac dmg_mac_unsigned
 
 clean:
 ifeq ($(OS), Windows_NT)
@@ -45,8 +45,8 @@ endif
 benchmarks: buzz/whisper_cpp
 	pytest -s -vv --benchmark-only --benchmark-json benchmarks.json
 
-dist/Buzz dist/Buzz.app: buzz/whisper_cpp
-	pyinstaller --noconfirm Buzz.spec
+dist/AutoVideo dist/AutoVideo.app: buzz/whisper_cpp
+	pyinstaller --noconfirm AutoVideo.spec
 
 version:
 	echo "VERSION = \"${version}\"" > buzz/__version__.py
@@ -113,13 +113,13 @@ print_identities_mac:
 dmg_mac:
 	ditto -x -k "${mac_zip_path}" dist/dmg
 	create-dmg \
-		--volname "Buzz" \
+		--volname "AutoVideo" \
 		--volicon "./assets/buzz.icns" \
 		--window-pos 200 120 \
 		--window-size 600 300 \
 		--icon-size 100 \
-		--icon "Buzz.app" 175 120 \
-		--hide-extension "Buzz.app" \
+		--icon "AutoVideo.app" 175 120 \
+		--hide-extension "AutoVideo.app" \
 		--app-drop-link 425 120 \
 		--codesign "$$BUZZ_CODESIGN_IDENTITY" \
 		--notarize "$$BUZZ_KEYCHAIN_NOTARY_PROFILE" \
@@ -130,13 +130,13 @@ dmg_mac:
 dmg_mac_unsigned:
 	ditto -x -k "${mac_zip_path}" dist/dmg
 	create-dmg \
-		--volname "Buzz" \
+		--volname "AutoVideo" \
 		--volicon "./assets/buzz.icns" \
 		--window-pos 200 120 \
 		--window-size 600 300 \
 		--icon-size 100 \
-		--icon "Buzz.app" 175 120 \
-		--hide-extension "Buzz.app" \
+		--icon "AutoVideo.app" 175 120 \
+		--hide-extension "AutoVideo.app" \
 		--app-drop-link 425 120 \
 		"${mac_dmg_path}" \
 		"dist/dmg/"
@@ -150,22 +150,22 @@ notarize_zip:
 zip_mac:
 	ditto -c -k --keepParent "${mac_app_path}" "${mac_zip_path}"
 
-codesign_all_mac: dist/Buzz.app
-	for i in $$(find dist/Buzz.app/Contents/Resources/torch/bin -name "*" -type f); \
+codesign_all_mac: dist/AutoVideo.app
+	for i in $$(find dist/AutoVideo.app/Contents/Resources/torch/bin -name "*" -type f); \
 	do \
 		codesign --force --options=runtime --sign "$$BUZZ_CODESIGN_IDENTITY" --timestamp "$$i"; \
 	done
-	for i in $$(find dist/Buzz.app/Contents/Resources -name "*.dylib" -o -name "*.so" -type f); \
+	for i in $$(find dist/AutoVideo.app/Contents/Resources -name "*.dylib" -o -name "*.so" -type f); \
 	do \
 		codesign --force --options=runtime --sign "$$BUZZ_CODESIGN_IDENTITY" --timestamp "$$i"; \
 	done
-	for i in $$(find dist/Buzz.app/Contents/MacOS -name "*.dylib" -o -name "*.so" -o -name "Qt*" -o -name "Python" -type f); \
+	for i in $$(find dist/AutoVideo.app/Contents/MacOS -name "*.dylib" -o -name "*.so" -o -name "Qt*" -o -name "Python" -type f); \
 	do \
 		codesign --force --options=runtime --sign "$$BUZZ_CODESIGN_IDENTITY" --timestamp "$$i"; \
 	done
-	codesign --force --options=runtime --sign "$$BUZZ_CODESIGN_IDENTITY" --timestamp dist/Buzz.app/Contents/MacOS/Buzz
-	codesign --force --options=runtime --sign "$$BUZZ_CODESIGN_IDENTITY" --entitlements ./entitlements.plist --timestamp dist/Buzz.app
-	codesign --verify --deep --strict --verbose=2 dist/Buzz.app
+	codesign --force --options=runtime --sign "$$BUZZ_CODESIGN_IDENTITY" --timestamp dist/AutoVideo.app/Contents/MacOS/AutoVideo
+	codesign --force --options=runtime --sign "$$BUZZ_CODESIGN_IDENTITY" --entitlements ./entitlements.plist --timestamp dist/AutoVideo.app
+	codesign --verify --deep --strict --verbose=2 dist/AutoVideo.app
 
 # HELPERS
 
@@ -173,7 +173,7 @@ codesign_all_mac: dist/Buzz.app
 notarize_log:
 	xcrun notarytool log ${id} --keychain-profile "$$BUZZ_KEYCHAIN_NOTARY_PROFILE"
 
-# Make GGML model from whisper. Example: make ggml model_path=/Users/chidiwilliams/.cache/whisper/medium.pt
+# Make GGML model from whisper. Example: make ggml model_path=/Users/user/.cache/whisper/medium.pt
 ggml:
 	python3 ./whisper.cpp/models/convert-pt-to-ggml.py ${model_path} .venv/lib/python3.12/site-packages/whisper dist
 

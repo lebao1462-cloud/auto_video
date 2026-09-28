@@ -1,5 +1,7 @@
 import json
+import math
 from pathlib import Path
+import struct
 import wave
 
 import pytest
@@ -350,6 +352,36 @@ def test_real_ffmpeg_renders_timeline_and_background(tmp_path):
         assert wav_file.getnchannels() == 1
         actual_duration = wav_file.getnframes() / wav_file.getframerate()
     assert actual_duration == pytest.approx(3.0, abs=0.05)
+
+
+def test_real_ffmpeg_keeps_delayed_speech_at_its_timestamp(tmp_path):
+    speech = tmp_path / "tone.wav"
+    sample_rate = 16000
+    samples = [
+        int(12000 * math.sin(2 * math.pi * 440 * i / sample_rate))
+        for i in range(sample_rate // 4)
+    ]
+    with wave.open(str(speech), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(struct.pack(f"<{len(samples)}h", *samples))
+
+    result = mix_localized_audio(
+        make_transcript([make_segment(speech, start=2.0, end=2.3)]),
+        tmp_path / "localized.wav",
+        options=AudioMixingOptions(sample_rate=sample_rate, channels=1),
+    )
+
+    with wave.open(result.audio_file, "rb") as wav_file:
+        assert wav_file.getnframes() / sample_rate == pytest.approx(2.3, abs=0.02)
+        wav_file.setpos(int(0.1 * sample_rate))
+        early = wav_file.readframes(sample_rate // 10)
+        wav_file.setpos(int(2.05 * sample_rate))
+        late = wav_file.readframes(sample_rate // 10)
+
+    assert max(abs(value) for value in struct.unpack(f"<{len(early)//2}h", early)) < 100
+    assert max(abs(value) for value in struct.unpack(f"<{len(late)//2}h", late)) > 100
 
 
 def test_extract_audio_track_builds_expected_command(tmp_path):

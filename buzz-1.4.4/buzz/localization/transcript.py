@@ -81,6 +81,7 @@ def transcribe_for_localization(
     video_path: str,
     transcription_options: TranscriptionOptions,
     model_path: str,
+    asr_provider: str = "whisper",
     transcriber_factory: (
         Callable[[FileTranscriptionTask], FileTranscriber] | None
     ) = None,
@@ -98,6 +99,18 @@ def transcribe_for_localization(
         raise ValueError(
             "Phase 1 requires an English ('en') or Chinese ('zh') source language"
         )
+    # ``paraformer`` was used by an unreleased UI build. Accept it at the API
+    # boundary so saved drafts do not break, while persistently using the
+    # explicit engine identifier below.
+    if asr_provider == "paraformer":
+        asr_provider = "paraformer-zh"
+    if asr_provider not in {"whisper", "paraformer-zh"}:
+        raise ValueError("Localization ASR provider must be 'whisper' or 'paraformer-zh'")
+    if asr_provider == "paraformer-zh":
+        if transcription_options.language == "en":
+            raise ValueError("Paraformer-zh is Chinese optimized. Choose Whisper for explicit English transcription.")
+        from buzz.localization.paraformer import transcribe_with_paraformer
+        return transcribe_with_paraformer(str(source_path))
 
     task = FileTranscriptionTask(
         file_path=str(source_path),
@@ -117,6 +130,16 @@ def transcribe_for_localization(
         getattr(transcriber, "detected_language", None)
         or transcription_options.language
     )
+    if not source_language:
+        # Some backends omit detection on quiet clips. Use the recognized
+        # writing system only when no language code was returned.
+        text = " ".join(segment.text or "" for segment in segments)
+        has_chinese = sum("\u4e00" <= char <= "\u9fff" for char in text) >= 2
+        has_latin = sum(char.isascii() and char.isalpha() for char in text) >= 3
+        if has_chinese:
+            source_language = "zh"
+        elif has_latin or not segments:
+            source_language = "en"
 
     return localization_transcript_from_segments(
         source_file=str(source_path),

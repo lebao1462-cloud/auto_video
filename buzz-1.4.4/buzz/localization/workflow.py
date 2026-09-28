@@ -53,6 +53,7 @@ class LocalizationProgress:
 @dataclass(frozen=True)
 class LocalizationWorkflowOptions:
     output_directory: str
+    chunk_duration_seconds: int = 900
     use_background_separation: bool = False
     subtitle_format: str = "srt"
     tts_voice: str | None = None
@@ -67,6 +68,8 @@ class LocalizationWorkflowOptions:
             raise ValueError("subtitle_format must be 'srt' or 'vtt'")
         if not self.output_directory:
             raise ValueError("output_directory is required")
+        if self.chunk_duration_seconds < 0:
+            raise ValueError("chunk_duration_seconds must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -85,7 +88,7 @@ class LocalizationWorkflowResult:
         }
 
 
-def localize_video(
+def _localize_single_video(
     source_video_file: str,
     transcription_options: TranscriptionOptions,
     model_path: str,
@@ -96,6 +99,7 @@ def localize_video(
     progress_callback: Callable[[LocalizationProgress], None] | None = None,
     cancel_event: threading.Event | None = None,
     transcribe_func: Callable[..., LocalizationTranscript] = transcribe_for_localization,
+    asr_provider: str = "whisper",
 ) -> LocalizationWorkflowResult:
     source = Path(source_video_file)
     if not source.is_file():
@@ -121,11 +125,8 @@ def localize_video(
             progress_callback(LocalizationProgress(stage, done, steps, message))
 
     check_cancelled()
-    transcript = transcribe_func(
-        str(source),
-        transcription_options,
-        model_path,
-    )
+    transcribe_kwargs = {"asr_provider": asr_provider} if asr_provider != "whisper" else {}
+    transcript = transcribe_func(str(source), transcription_options, model_path, **transcribe_kwargs)
     report(LocalizationStage.TRANSCRIBE, "Source transcription completed")
 
     translated = translate_for_localization(transcript, translation_provider)
@@ -207,6 +208,41 @@ def localize_video(
         subtitle=subtitle_result,
         localized_audio_file=str(localized_audio),
         workspace=str(workspace),
+    )
+
+
+def localize_video(
+    source_video_file: str,
+    transcription_options: TranscriptionOptions,
+    model_path: str,
+    translation_provider: TranslationProvider,
+    tts_provider: TTSProvider,
+    options: LocalizationWorkflowOptions,
+    *,
+    progress_callback: Callable[[LocalizationProgress], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    transcribe_func: Callable[..., LocalizationTranscript] = transcribe_for_localization,
+    asr_provider: str = "whisper",
+) -> LocalizationWorkflowResult:
+    source = Path(source_video_file)
+    if not source.is_file():
+        raise ValueError(f"Input media file does not exist: {source_video_file}")
+    if cancel_event is not None and cancel_event.is_set():
+        raise LocalizationCancelled("Localization was cancelled")
+    if options.chunk_duration_seconds:
+        duration = probe_media_duration(source)
+        if duration > options.chunk_duration_seconds:
+            from buzz.localization.chunked import localize_chunked_video
+            return localize_chunked_video(
+                source, duration, transcription_options, model_path,
+                translation_provider, tts_provider, options, progress_callback,
+                cancel_event, transcribe_func, asr_provider,
+            )
+    return _localize_single_video(
+        source_video_file, transcription_options, model_path,
+        translation_provider, tts_provider, options,
+        progress_callback=progress_callback, cancel_event=cancel_event,
+        transcribe_func=transcribe_func, asr_provider=asr_provider,
     )
 
 

@@ -395,3 +395,42 @@ def test_real_ffmpeg_renders_mp4_with_burned_subtitle(tmp_path):
     assert "codec_type=subtitle" not in probe.stdout
     assert result.subtitle_mode == "burn"
     assert result.subtitle_included is True
+
+
+def test_burn_subtitle_can_blur_original_subtitle_area(tmp_path):
+    video, audio, subtitle = create_inputs(tmp_path)
+    runner = FakeRunner()
+
+    render_localized_mp4(
+        video,
+        audio,
+        tmp_path / "final.mp4",
+        subtitle_file=subtitle,
+        options=FinalRenderOptions(
+            subtitle_mode="burn",
+            cover_original_subtitles=True,
+        ),
+        ffmpeg_runner=runner,
+    )
+
+    command = runner.commands[0]
+    fc = command[command.index("-filter_complex") + 1]
+    assert "[0:v]split=2[base][blur_src]" in fc
+    assert "crop=iw:ih*0.1800:0:ih*0.8200" in fc
+    assert "boxblur=luma_radius=20:luma_power=2" in fc
+    assert "[base][blurred]overlay=0:H-h[covered]" in fc
+    assert "color=black@0.22:t=fill" in fc
+    assert "subtitles='" in fc
+    assert command[command.index("-map") + 1] == "[vout]"
+
+def test_cover_options_are_validated():
+    with pytest.raises(ValueError, match="cover_height_ratio"):
+        FinalRenderOptions(cover_height_ratio=0)
+    with pytest.raises(ValueError, match="cover_height_ratio"):
+        FinalRenderOptions(cover_height_ratio=1)
+    with pytest.raises(ValueError, match="cover_blur_radius"):
+        FinalRenderOptions(cover_blur_radius=0)
+    with pytest.raises(ValueError, match="cover_dark_opacity"):
+        FinalRenderOptions(cover_dark_opacity=-0.1)
+    with pytest.raises(ValueError, match="cover_dark_opacity"):
+        FinalRenderOptions(cover_dark_opacity=1.1)

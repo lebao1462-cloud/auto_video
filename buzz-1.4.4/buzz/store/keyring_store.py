@@ -13,6 +13,7 @@ from buzz.settings.settings import APP_NAME
 
 class Key(enum.Enum):
     OPENAI_API_KEY = "OpenAI API key"
+    GEMINI_API_KEY = "Gemini API key"
 
 
 def _is_linux() -> bool:

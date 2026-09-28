@@ -135,6 +135,34 @@ def test_rejects_translation_task(tmp_path):
         )
 
 
+def test_paraformer_rejects_explicit_english_without_importing_runtime(tmp_path):
+    video_path = tmp_path / "input.mp4"
+    video_path.write_bytes(b"test media placeholder")
+
+    with pytest.raises(ValueError, match="Choose Whisper"):
+        transcribe_for_localization(
+            str(video_path), TranscriptionOptions(language="en"), "",
+            asr_provider="paraformer-zh",
+        )
+
+
+def test_paraformer_routes_auto_to_its_adapter(monkeypatch, tmp_path):
+    video_path = tmp_path / "input.mp4"
+    video_path.write_bytes(b"test media placeholder")
+    expected = localization_transcript_from_segments(
+        str(video_path), "zh", [Segment(0, 1000, "Chinese")]
+    )
+    monkeypatch.setattr(
+        "buzz.localization.paraformer.transcribe_with_paraformer",
+        lambda path: expected,
+    )
+
+    assert transcribe_for_localization(
+        str(video_path), TranscriptionOptions(language=None), "",
+        asr_provider="paraformer-zh",
+    ) is expected
+
+
 def test_propagates_transcriber_errors(tmp_path):
     video_path = tmp_path / "input.mp4"
     video_path.write_bytes(b"test media placeholder")
@@ -148,3 +176,36 @@ def test_propagates_transcriber_errors(tmp_path):
             model_path="model.bin",
             transcriber_factory=Mock(return_value=transcriber),
         )
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [("吸力很强，自动回充。", "zh"), ("The robot returns to charge.", "en")],
+)
+def test_infers_supported_language_when_backend_omits_detection(tmp_path, text, expected):
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"placeholder")
+    transcriber = Mock(detected_language=None)
+    transcriber.transcribe.return_value = [Segment(0, 1800, text)]
+
+    transcript = transcribe_for_localization(
+        str(source), TranscriptionOptions(language=None), "model.bin",
+        transcriber_factory=Mock(return_value=transcriber),
+    )
+
+    assert transcript.source_language == expected
+
+
+def test_silent_chunk_without_detection_has_no_segments(tmp_path):
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"placeholder")
+    transcriber = Mock(detected_language=None)
+    transcriber.transcribe.return_value = []
+
+    transcript = transcribe_for_localization(
+        str(source), TranscriptionOptions(language=None), "model.bin",
+        transcriber_factory=Mock(return_value=transcriber),
+    )
+
+    assert transcript.source_language == "en"
+    assert transcript.segments == ()

@@ -104,7 +104,6 @@ datas += safe_copy_metadata("dora-search")
 datas += safe_copy_metadata("lhotse")
 
 # Allow transformers package to load __init__.py file dynamically:
-# https://github.com/chidiwilliams/buzz/issues/272
 datas += collect_data_files("transformers", include_py_files=True)
 
 datas += collect_data_files("faster_whisper", include_py_files=True)
@@ -120,6 +119,8 @@ datas += collect_data_files("pytorch_lightning", include_py_files=True)
 datas += [("buzz/assets/*", "assets")]
 datas += [("buzz/locale", "locale")]
 datas += [("buzz/schema.sql", ".")]
+datas += [("LICENSE", ".")]
+datas += [("HELP.html", ".")]
 
 block_cipher = None
 
@@ -227,9 +228,9 @@ exe = EXE(
     pyz,
     a.scripts,
     options,
-    icon="./assets/buzz.ico",
+    icon="./assets/auto-video.ico",
     exclude_binaries=True,
-    name="Buzz",
+    name="AutoVideo",
     debug=DEBUG,
     bootloader_ignore_signals=False,
     strip=False,
@@ -249,17 +250,17 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="Buzz",
+    name="AutoVideo",
 )
 app = BUNDLE(
     coll,
-    name="Buzz.app",
-    icon="./assets/buzz.icns",
-    bundle_identifier="com.chidiwilliams.buzz",
+    name="AutoVideo.app",
+    icon="./assets/auto-video.icns",
+    bundle_identifier="com.lebao1462.autovideo",
     version=VERSION,
     info_plist={
         "NSPrincipalClass": "NSApplication",
         "NSHighResolutionCapable": "True",
-        "NSMicrophoneUsageDescription": "Allow Buzz to record audio from your microphone.",
+        "NSMicrophoneUsageDescription": "Allow Auto Video to record audio from your microphone.",
     },
 )
