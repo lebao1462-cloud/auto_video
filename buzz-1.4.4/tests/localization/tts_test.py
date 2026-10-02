@@ -269,3 +269,109 @@ def test_does_not_mutate_input_transcript(tmp_path):
     assert transcript.to_dict() == original
     with pytest.raises(FrozenInstanceError):
         transcript.target_language = "en"
+
+
+def test_successful_segments_resume_after_later_provider_failure(tmp_path):
+    transcript = make_transcript(segments=[
+        TranslatedLocalizationSegment(0, 1, "A", "Một"),
+        TranslatedLocalizationSegment(1, 2, "B", "Hai"),
+        TranslatedLocalizationSegment(2, 3, "C", "Ba"),
+    ])
+
+    class RestartableProvider(FakeTTSProvider):
+        def __init__(self, fail):
+            super().__init__()
+            self.fail = fail
+
+        def synthesize(self, request):
+            if self.fail and request.text == "Ba":
+                self.calls.append(request)
+                raise TimeoutError("provider unavailable")
+            return super().synthesize(request)
+
+    first_provider = RestartableProvider(True)
+    with pytest.raises(TimeoutError, match="provider unavailable"):
+        synthesize_for_localization(transcript, first_provider, tmp_path)
+
+    second_provider = RestartableProvider(False)
+    result = synthesize_for_localization(transcript, second_provider, tmp_path)
+
+    assert [request.text for request in first_provider.calls] == ["Một", "Hai", "Ba"]
+    assert [request.text for request in second_provider.calls] == ["Ba"]
+    assert len(result.segments) == 3
+
+
+@pytest.mark.parametrize("change", ["text", "voice", "options"])
+def test_request_change_invalidates_only_affected_segment(tmp_path, change):
+    original = make_transcript(segments=[
+        TranslatedLocalizationSegment(0, 1, "A", "Một"),
+        TranslatedLocalizationSegment(1, 2, "B", "Hai"),
+    ])
+    synthesize_for_localization(
+        original, FakeTTSProvider(), tmp_path, voice="vi-1", options={"rate": "+0%"}
+    )
+    changed = original
+    voice = "vi-1"
+    options = {"rate": "+0%"}
+    if change == "text":
+        changed = make_transcript(segments=[
+            original.segments[0],
+            TranslatedLocalizationSegment(1, 2, "B", "Hai mới"),
+        ])
+    elif change == "voice":
+        # Apply the changed setting only to segment 1 by synthesizing it directly.
+        from buzz.localization.tts import synthesize_segment
+        provider = FakeTTSProvider()
+        synthesize_segment(TTSRequest(
+            "Hai", "vi", str(tmp_path / "segment-000001"), "vi-2", options
+        ), provider)
+        assert [request.text for request in provider.calls] == ["Hai"]
+        assert (tmp_path / "segment-000000.localization-tts.json").is_file()
+        return
+    else:
+        from buzz.localization.tts import synthesize_segment
+        provider = FakeTTSProvider()
+        synthesize_segment(TTSRequest(
+            "Hai", "vi", str(tmp_path / "segment-000001"), voice, {"rate": "+5%"}
+        ), provider)
+        assert [request.text for request in provider.calls] == ["Hai"]
+        assert (tmp_path / "segment-000000.localization-tts.json").is_file()
+        return
+
+    provider = FakeTTSProvider()
+    synthesize_for_localization(changed, provider, tmp_path, voice=voice, options=options)
+    assert [request.text for request in provider.calls] == ["Hai mới"]
+
+
+@pytest.mark.parametrize("damage", ["missing", "empty", "changed"])
+def test_missing_or_corrupt_checkpointed_audio_is_regenerated(tmp_path, damage):
+    transcript = make_transcript()
+    first = synthesize_for_localization(transcript, FakeTTSProvider(), tmp_path)
+    audio = Path(first.segments[0].audio_file)
+    if damage == "missing":
+        audio.unlink()
+    elif damage == "empty":
+        audio.write_bytes(b"")
+    else:
+        audio.write_bytes(b"different audio")
+
+    provider = FakeTTSProvider()
+    synthesize_for_localization(transcript, provider, tmp_path)
+
+    assert len(provider.calls) == 1
+    assert audio.read_bytes() == b"fake audio"
+
+
+def test_provider_failure_never_writes_completion_checkpoint(tmp_path):
+    class PartialFailure:
+        def synthesize(self, request):
+            Path(request.output_file_stem + ".wav").write_bytes(b"partial")
+            raise TimeoutError("failed after partial output")
+
+    with pytest.raises(TimeoutError, match="partial output"):
+        synthesize_for_localization(make_transcript(), PartialFailure(), tmp_path)
+
+    assert not (tmp_path / "segment-000000.localization-tts.json").exists()
+    retry = FakeTTSProvider()
+    synthesize_for_localization(make_transcript(), retry, tmp_path)
+    assert len(retry.calls) == 1

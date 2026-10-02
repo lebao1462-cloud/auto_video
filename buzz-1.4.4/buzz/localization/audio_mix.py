@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Callable
 
 from buzz.assets import APP_BASE_DIR
@@ -12,6 +13,12 @@ from buzz.localization.timing import TimedLocalizationTranscript
 
 class AudioMixingError(RuntimeError):
     """Raised when localized audio processing or mixing fails."""
+
+
+# Keep ample headroom below Windows' 32,767-character CreateProcess limit for
+# input/output paths and the rest of the FFmpeg arguments.
+_FILTER_COMPLEX_SCRIPT_THRESHOLD = 8192
+_MAX_MIX_INPUTS = 32
 
 
 @dataclass(frozen=True)
@@ -57,6 +64,8 @@ def _run_ffmpeg(command: list[str]) -> None:
     kwargs = {
         "capture_output": True,
         "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
         "env": _ffmpeg_env(),
     }
     if sys.platform == "win32":
@@ -100,6 +109,8 @@ def probe_media_duration(
                 command,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 env=_ffmpeg_env(),
             )
 
@@ -256,6 +267,82 @@ def _atempo_filter(playback_rate: float) -> str:
     return f"atempo={playback_rate:.8f}"
 
 
+def _temporary_audio_path(directory: Path) -> Path:
+    handle, name = tempfile.mkstemp(
+        suffix=".wav", prefix="buzz-speech-mix-", dir=directory
+    )
+    os.close(handle)
+    path = Path(name)
+    path.unlink()
+    return path
+
+
+def _run_audio_filter(
+    inputs: list[Path], filters: list[str], output_label: str,
+    output_path: Path, duration: float, options: AudioMixingOptions,
+    ffmpeg_runner: Callable[[list[str]], None], *, codec: str,
+) -> None:
+    """Run one bounded-size FFmpeg audio-filter invocation."""
+    filter_complex = ";".join(filters)
+    command = ["ffmpeg", "-y", "-nostdin"]
+    for input_path in inputs:
+        command.extend(["-i", str(input_path)])
+    filter_script_path: Path | None = None
+    try:
+        if len(filter_complex) >= _FILTER_COMPLEX_SCRIPT_THRESHOLD:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", newline="\n",
+                suffix=".fffilter", prefix="buzz-filter-",
+                dir=output_path.parent, delete=False,
+            ) as filter_script:
+                filter_script.write(filter_complex)
+                filter_script_path = Path(filter_script.name)
+            command.extend(["-filter_complex_script", str(filter_script_path)])
+        else:
+            command.extend(["-filter_complex", filter_complex])
+        channel_layout = "mono" if options.channels == 1 else "stereo"
+        command.extend([
+            "-map", output_label, "-ar", str(options.sample_rate),
+            "-ac", str(options.channels), "-channel_layout", channel_layout,
+            "-c:a", codec, "-t", f"{duration:.6f}", str(output_path),
+        ])
+        ffmpeg_runner(command)
+    finally:
+        if filter_script_path is not None:
+            filter_script_path.unlink(missing_ok=True)
+
+
+def _mix_track_batch(
+    tracks: list[tuple[Path, float, float]], output_path: Path,
+    options: AudioMixingOptions, ffmpeg_runner: Callable[[list[str]], None],
+) -> tuple[Path, float, float]:
+    """Mix rendered tracks while retaining their absolute timeline origins."""
+    origin = min(track[1] for track in tracks)
+    end = max(track[2] for track in tracks)
+    duration = end - origin
+    filters = []
+    labels = []
+    for index, (_, start, _) in enumerate(tracks):
+        delay_ms = round((start - origin) * 1000)
+        filters.append(
+            f"[{index}:a]adelay={delay_ms}:all=1,"
+            f"apad=whole_dur={duration:.6f},atrim=0:{duration:.6f}[track{index}]"
+        )
+        labels.append(f"[track{index}]")
+    if len(labels) == 1:
+        filters.append(f"{labels[0]}anull[speechmix]")
+    else:
+        filters.append(
+            "".join(labels)
+            + f"amix=inputs={len(labels)}:normalize=0:duration=longest[speechmix]"
+        )
+    _run_audio_filter(
+        [track[0] for track in tracks], filters, "[speechmix]", output_path,
+        duration, options, ffmpeg_runner, codec="pcm_f32le",
+    )
+    return output_path, origin, end
+
+
 def mix_localized_audio(
     transcript: TimedLocalizationTranscript,
     output_file: str | Path,
@@ -280,24 +367,19 @@ def mix_localized_audio(
         raise ValueError("Output file is required")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    inputs: list[str] = []
     for index, segment in enumerate(transcript.segments):
         audio_path = Path(segment.audio_file)
         if not audio_path.is_file():
             raise AudioMixingError(
                 f"Segment {index} audio file does not exist: {segment.audio_file}"
             )
-        inputs.extend(["-i", str(audio_path)])
-
-    background_index = None
+    background_path = None
     if background_audio_file is not None:
         background_path = Path(background_audio_file)
         if not background_path.is_file():
             raise AudioMixingError(
                 f"Background audio file does not exist: {background_audio_file}"
             )
-        background_index = len(transcript.segments)
-        inputs.extend(["-i", str(background_path)])
 
     last_segment_end = max(float(segment.end) for segment in transcript.segments)
     if target_duration is None:
@@ -317,79 +399,144 @@ def mix_localized_audio(
             )
         final_duration = max(target_duration, last_segment_end)
 
-    filters: list[str] = []
-    speech_labels: list[str] = []
-
-    for index, segment in enumerate(transcript.segments):
-        delay_ms = round(float(segment.start) * 1000)
-        chain = [
-            f"aresample={mix_options.sample_rate}",
-            _atempo_filter(float(segment.playback_rate)),
-        ]
-        if mix_options.speech_gain_db:
-            chain.append(f"volume={mix_options.speech_gain_db}dB")
-        chain.extend(
-            [
-                f"adelay={delay_ms}:all=1",
-                f"apad=whole_dur={final_duration:.6f}",
-                "asetpts=N/SR/TB",
-                f"atrim=0:{final_duration:.6f}",
+    # Keep the established one-pass behavior for ordinary transcripts. The
+    # hierarchical path below is only needed when argv fan-in becomes risky.
+    if len(transcript.segments) <= _MAX_MIX_INPUTS:
+        direct_inputs = [Path(segment.audio_file) for segment in transcript.segments]
+        filters: list[str] = []
+        labels: list[str] = []
+        for index, segment in enumerate(transcript.segments):
+            chain = [
+                f"aresample={mix_options.sample_rate}",
+                _atempo_filter(float(segment.playback_rate)),
+                f"atrim=0:{float(segment.slot_duration):.6f}",
             ]
+            if mix_options.speech_gain_db:
+                chain.append(f"volume={mix_options.speech_gain_db}dB")
+            chain.extend([
+                f"adelay={round(float(segment.start) * 1000)}:all=1",
+                f"apad=whole_dur={final_duration:.6f}", "asetpts=N/SR/TB",
+                f"atrim=0:{final_duration:.6f}",
+            ])
+            filters.append(
+                f"[{index}:a]" + ",".join(chain) + f"[speech{index}]"
+            )
+            labels.append(f"[speech{index}]")
+        if len(labels) == 1:
+            filters.append(f"{labels[0]}anull[speechmix]")
+        else:
+            filters.append(
+                "".join(labels)
+                + f"amix=inputs={len(labels)}:normalize=0:duration=longest[speechmix]"
+            )
+        if background_path is not None:
+            background_index = len(direct_inputs)
+            direct_inputs.append(background_path)
+            filters.extend([
+                f"[{background_index}:a]aresample={mix_options.sample_rate},"
+                f"volume={mix_options.background_gain_db}dB,"
+                f"apad=whole_dur={final_duration:.6f},"
+                f"atrim=0:{final_duration:.6f}[background]",
+                "[background][speechmix]amix=inputs=2:normalize=0:duration=longest,"
+                "alimiter=limit=0.95[final]",
+            ])
+        else:
+            filters.append("[speechmix]alimiter=limit=0.95[final]")
+        _run_audio_filter(
+            direct_inputs, filters, "[final]", output_path, final_duration,
+            mix_options, ffmpeg_runner, codec="pcm_s16le",
         )
-        filters.append(
-            f"[{index}:a]" + ",".join(chain) + f"[speech{index}]"
+        if not output_path.is_file():
+            raise AudioMixingError("FFmpeg did not create the localized audio file")
+        return LocalizedAudioResult(
+            audio_file=str(output_path), duration=final_duration,
+            sample_rate=mix_options.sample_rate, channels=mix_options.channels,
+            background_mixed=background_path is not None,
         )
-        speech_labels.append(f"[speech{index}]")
 
-    if len(speech_labels) == 1:
-        filters.append(f"{speech_labels[0]}anull[speechmix]")
-    else:
-        filters.append(
-            "".join(speech_labels)
-            + f"amix=inputs={len(speech_labels)}:normalize=0:"
-            "duration=longest[speechmix]"
-        )
+    temporary_paths: list[Path] = []
+    try:
+        tracks: list[tuple[Path, float, float]] = []
+        segments = list(transcript.segments)
+        for offset in range(0, len(segments), _MAX_MIX_INPUTS):
+            batch = segments[offset:offset + _MAX_MIX_INPUTS]
+            # Use millisecond-aligned batch origins so splitting the delay over
+            # multiple stages cannot introduce an extra rounding millisecond.
+            origin = min(round(float(segment.start) * 1000) for segment in batch) / 1000
+            end = max(float(segment.end) for segment in batch)
+            duration = end - origin
+            filters: list[str] = []
+            labels: list[str] = []
+            for index, segment in enumerate(batch):
+                chain = [
+                    f"aresample={mix_options.sample_rate}",
+                    _atempo_filter(float(segment.playback_rate)),
+                    f"atrim=0:{float(segment.slot_duration):.6f}",
+                ]
+                if mix_options.speech_gain_db:
+                    chain.append(f"volume={mix_options.speech_gain_db}dB")
+                chain.extend([
+                    f"adelay={round((float(segment.start) - origin) * 1000)}:all=1",
+                    f"apad=whole_dur={duration:.6f}", "asetpts=N/SR/TB",
+                    f"atrim=0:{duration:.6f}",
+                ])
+                filters.append(
+                    f"[{index}:a]" + ",".join(chain) + f"[speech{index}]"
+                )
+                labels.append(f"[speech{index}]")
+            if len(labels) == 1:
+                filters.append(f"{labels[0]}anull[speechmix]")
+            else:
+                filters.append(
+                    "".join(labels)
+                    + f"amix=inputs={len(labels)}:normalize=0:duration=longest[speechmix]"
+                )
+            batch_path = _temporary_audio_path(output_path.parent)
+            temporary_paths.append(batch_path)
+            _run_audio_filter(
+                [Path(segment.audio_file) for segment in batch], filters,
+                "[speechmix]", batch_path, duration, mix_options, ffmpeg_runner,
+                codec="pcm_f32le",
+            )
+            tracks.append((batch_path, origin, end))
 
-    if background_index is not None:
-        filters.append(
-            f"[{background_index}:a]"
-            f"aresample={mix_options.sample_rate},"
-            f"volume={mix_options.background_gain_db}dB,"
+        while len(tracks) > 1:
+            next_tracks = []
+            for offset in range(0, len(tracks), _MAX_MIX_INPUTS):
+                batch_path = _temporary_audio_path(output_path.parent)
+                temporary_paths.append(batch_path)
+                next_tracks.append(_mix_track_batch(
+                    tracks[offset:offset + _MAX_MIX_INPUTS], batch_path,
+                    mix_options, ffmpeg_runner,
+                ))
+            tracks = next_tracks
+
+        speech_path, speech_origin, _ = tracks[0]
+        final_inputs = [speech_path]
+        final_filters = [
+            f"[0:a]adelay={round(speech_origin * 1000)}:all=1,"
             f"apad=whole_dur={final_duration:.6f},"
-            f"atrim=0:{final_duration:.6f}[background]"
+            f"atrim=0:{final_duration:.6f}[speechmix]"
+        ]
+        if background_path is not None:
+            final_inputs.append(background_path)
+            final_filters.extend([
+                f"[1:a]aresample={mix_options.sample_rate},"
+                f"volume={mix_options.background_gain_db}dB,"
+                f"apad=whole_dur={final_duration:.6f},"
+                f"atrim=0:{final_duration:.6f}[background]",
+                "[background][speechmix]amix=inputs=2:normalize=0:duration=longest,"
+                "alimiter=limit=0.95[final]",
+            ])
+        else:
+            final_filters.append("[speechmix]alimiter=limit=0.95[final]")
+        _run_audio_filter(
+            final_inputs, final_filters, "[final]", output_path, final_duration,
+            mix_options, ffmpeg_runner, codec="pcm_s16le",
         )
-        filters.append(
-            "[background][speechmix]"
-            "amix=inputs=2:normalize=0:duration=longest,"
-            "alimiter=limit=0.95[final]"
-        )
-    else:
-        filters.append("[speechmix]alimiter=limit=0.95[final]")
-
-    channel_layout = "mono" if mix_options.channels == 1 else "stereo"
-    command = [
-        "ffmpeg",
-        "-y",
-        "-nostdin",
-        *inputs,
-        "-filter_complex",
-        ";".join(filters),
-        "-map",
-        "[final]",
-        "-ar",
-        str(mix_options.sample_rate),
-        "-ac",
-        str(mix_options.channels),
-        "-channel_layout",
-        channel_layout,
-        "-c:a",
-        "pcm_s16le",
-        "-t",
-        f"{final_duration:.6f}",
-        str(output_path),
-    ]
-
-    ffmpeg_runner(command)
+    finally:
+        for temporary_path in temporary_paths:
+            temporary_path.unlink(missing_ok=True)
 
     if not output_path.is_file():
         raise AudioMixingError("FFmpeg did not create the localized audio file")
@@ -399,5 +546,5 @@ def mix_localized_audio(
         duration=final_duration,
         sample_rate=mix_options.sample_rate,
         channels=mix_options.channels,
-        background_mixed=background_index is not None,
+        background_mixed=background_path is not None,
     )

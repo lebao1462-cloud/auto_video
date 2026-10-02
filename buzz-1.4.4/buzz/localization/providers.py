@@ -1,11 +1,15 @@
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import hashlib
 import json
 import logging
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
+import threading
 import time
 
 from openai import OpenAI
@@ -15,6 +19,12 @@ from buzz.localization.tts import TTSRequest, TTSResult
 
 
 logger = logging.getLogger(__name__)
+
+GEMINI_MODEL_IDS = frozenset({
+    "gemini-2.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.8-flash",
+})
 
 
 class LocalizationProviderError(RuntimeError):
@@ -389,6 +399,7 @@ class GeminiTranslationProvider:
     api_key: str
     model: str = "gemini-3.8-flash"
     timeout: float = 60.0
+    rate_limit_fallback_models: tuple[str, ...] | None = None
 
     def __post_init__(self):
         if not self.api_key:
@@ -396,6 +407,23 @@ class GeminiTranslationProvider:
         if not self.model:
             raise ValueError("Gemini model is required")
         self.model = normalize_gemini_model_name(self.model)
+        configured_fallbacks = self.rate_limit_fallback_models
+        if configured_fallbacks is None:
+            configured_fallbacks = tuple(filter(None, (
+                value.strip() for value in os.getenv(
+                    "BUZZ_GEMINI_429_FALLBACK_MODELS", "gemini-3.5-flash-lite"
+                ).split(",")
+            )))
+        normalized_fallbacks = tuple(
+            normalize_gemini_model_name(value) for value in configured_fallbacks
+        )
+        unknown = set(normalized_fallbacks) - GEMINI_MODEL_IDS
+        if unknown:
+            raise ValueError(
+                "Gemini fallback models must use model IDs already supported by Buzz: "
+                + ", ".join(sorted(unknown))
+            )
+        self.rate_limit_fallback_models = normalized_fallbacks
         try:
             from google import genai
             from google.genai import types as genai_types
@@ -412,41 +440,41 @@ class GeminiTranslationProvider:
 
     def _generate_content_with_retry(self, *, contents, config=None):
         primary = getattr(self, "model", "gemini-3.8-flash")
-        fallback = "gemini-3.5-flash-lite"
-        attempts = [
-            (primary, 0),
-            (primary, 5),
-            (primary, 15),
-        ]
-        if primary != fallback:
-            attempts.extend([
-                (fallback, 0),
-                (fallback, 10),
-            ])
-
         last_error = None
-        for model, delay in attempts:
-            if delay:
-                time.sleep(delay)
-            try:
-                kwargs = {
-                    "model": model,
-                    "contents": contents,
-                }
-                if config is not None:
-                    kwargs["config"] = config
-                response = self._client.models.generate_content(**kwargs)
-                self.last_model_used = model
-                return response
-            except Exception as exc:
-                last_error = exc
-                message = str(exc).upper()
-                retryable = any(token in message for token in (
-                    "503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
-                    "TIMEOUT", "TIMED OUT", "CONNECTION",
-                ))
-                if not retryable:
-                    raise
+        fallbacks = getattr(self, "rate_limit_fallback_models", None)
+        if fallbacks is None:
+            fallbacks = ("gemini-3.5-flash-lite",)
+        models = [primary]
+        retryable_failure = False
+        rate_limited = False
+        for model in models + [m for m in fallbacks if m != primary]:
+            if model != primary and not rate_limited:
+                break
+            for delay in (0, 5, 15):
+                if delay:
+                    time.sleep(delay)
+                try:
+                    kwargs = {"model": model, "contents": contents}
+                    if config is not None:
+                        kwargs["config"] = config
+                    response = self._client.models.generate_content(**kwargs)
+                    self.last_model_used = model
+                    return response
+                except Exception as exc:
+                    last_error = exc
+                    message = str(exc).upper()
+                    current_rate_limit = (
+                        "429" in message or "RESOURCE_EXHAUSTED" in message
+                    )
+                    rate_limited = rate_limited or current_rate_limit
+                    retryable = current_rate_limit or any(token in message for token in (
+                        "503", "UNAVAILABLE", "TIMEOUT", "TIMED OUT", "CONNECTION",
+                    ))
+                    retryable_failure = retryable_failure or retryable
+                    if not retryable:
+                        raise
+            if not retryable_failure:
+                break
         raise last_error
 
     def translate(
@@ -504,7 +532,8 @@ class GeminiTranslationProvider:
                 for item in context
             ],
             "segments": [
-                {"id": index, "start": item.start, "end": item.end, "text": item.text}
+                {"id": getattr(item, "segment_id", str(index)),
+                 "start": item.start, "end": item.end, "text": item.text}
                 for index, item in enumerate(segments)
             ],
         }
@@ -516,7 +545,7 @@ class GeminiTranslationProvider:
             "corrected segment to concise, natural spoken Vietnamese. Never combine, "
             "drop, reorder, or split segments. Context-only entries are for background "
             "and must NOT appear in the output. Keep each ID unchanged. Return a JSON "
-            "object with only a 'segments' array of objects with integer 'id', string "
+            "object with only a 'segments' array of objects with unchanged 'id', string "
             "'corrected_text' and string 'translated_text'. Input JSON:\n"
             + json.dumps(payload, ensure_ascii=False)
         )
@@ -529,11 +558,19 @@ class GeminiTranslationProvider:
             items = result["segments"]
             if not isinstance(items, list) or len(items) != len(segments):
                 raise ValueError("wrong number of segments")
+            expected_ids = [
+                getattr(item, "segment_id", str(index))
+                for index, item in enumerate(segments)
+            ]
+            uses_stable_ids = any(
+                hasattr(item, "segment_id") for item in segments
+            )
             by_id = {}
             for item in items:
                 identifier = item["id"]
-                if (type(identifier) is not int or identifier in by_id
-                        or identifier not in range(len(segments))):
+                if not uses_stable_ids and type(identifier) is int:
+                    identifier = str(identifier)
+                if identifier in by_id or identifier not in expected_ids:
                     raise ValueError("duplicate or invalid segment ID")
                 corrected = item["corrected_text"]
                 translated = item["translated_text"]
@@ -541,25 +578,141 @@ class GeminiTranslationProvider:
                     raise ValueError("empty corrected transcript")
                 if not isinstance(translated, str) or not translated.strip():
                     raise ValueError("empty Vietnamese translation")
-                source_text = corrected if source_language == "zh" else segments[identifier].text
+                source_index = expected_ids.index(identifier)
+                source_text = corrected if source_language == "zh" else segments[source_index].text
                 by_id[identifier] = (source_text.strip(), translated.strip())
-            if set(by_id) != set(range(len(segments))):
+            if set(by_id) != set(expected_ids):
                 raise ValueError("missing or unexpected segment ID")
-            return [by_id[index] for index in range(len(segments))]
+            return [by_id[identifier] for identifier in expected_ids]
         except Exception as exc:
             raise LocalizationProviderError(
                 f"Gemini batch translation failed: {exc}"
             ) from exc
 
+    def shorten_translation(
+        self,
+        *,
+        source_text: str,
+        translated_text: str,
+        source_language: str,
+        target_language: str,
+        required_rate: float,
+        max_playback_rate: float,
+    ) -> str:
+        """Make one Vietnamese dubbing line shorter without dropping meaning."""
+        if source_language not in {"en", "zh"} or target_language != "vi":
+            raise ValueError("Gemini shortening requires English/Chinese to Vietnamese")
+        target_ratio = max_playback_rate / required_rate
+        prompt = (
+            "Rewrite one Vietnamese dubbing line so it can be spoken in less time. "
+            "Preserve the complete meaning, names, numbers, units, negation, and key "
+            "details. Use concise natural spoken Vietnamese; do not summarize away "
+            "content and do not add commentary. Return only the rewritten Vietnamese "
+            f"line. Aim for at most {target_ratio:.0%} of the current spoken length.\n"
+            f"Source ({source_language}): {source_text.strip()}\n"
+            f"Current Vietnamese: {translated_text.strip()}"
+        )
+        try:
+            response = self._generate_content_with_retry(contents=prompt)
+        except Exception as exc:
+            raise LocalizationProviderError(
+                f"Gemini translation shortening request failed: {exc}"
+            ) from exc
+        shortened = getattr(response, "text", None)
+        if not isinstance(shortened, str) or not shortened.strip():
+            raise LocalizationProviderError("Gemini returned empty shortened translation")
+        return shortened.strip()
+
 
 @dataclass
 class EdgeTTSProvider:
     default_voice: str = "vi-VN-HoaiMyNeural"
+    max_concurrency: int = 1
+    retry_delays: tuple[float, ...] | None = None
 
     # A service throttle can outlive the short retries that are appropriate for a
     # dropped connection.  This remains finite, while allowing more than three
     # minutes for Edge to become available again.
     transient_retry_delays = (5, 10, 20, 40, 60, 90, 120)
+
+    def __post_init__(self) -> None:
+        if isinstance(self.max_concurrency, bool) or self.max_concurrency < 1:
+            raise ValueError("Edge TTS max_concurrency must be at least 1")
+        if self.retry_delays is None:
+            self.retry_delays = self.transient_retry_delays
+        else:
+            self.retry_delays = tuple(float(delay) for delay in self.retry_delays)
+            if any(delay < 0 for delay in self.retry_delays):
+                raise ValueError("Edge TTS retry delays cannot be negative")
+        self._synthesis_slots = threading.BoundedSemaphore(self.max_concurrency)
+
+    def tts_cache_identity(self) -> dict[str, str | None]:
+        """Settings outside TTSRequest that can change synthesized audio."""
+        try:
+            import edge_tts
+            version = getattr(edge_tts, "__version__", None)
+        except ImportError:
+            version = None
+        return {
+            "provider": "edge-tts",
+            "provider_version": version,
+            "default_voice": self.default_voice,
+        }
+
+    @staticmethod
+    def _safe_exception_details(exc: Exception) -> str:
+        """Return actionable exception details with common secrets removed."""
+        message = str(exc).replace("\r", " ").replace("\n", " ").strip()
+        message = re.sub(
+            r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?|"
+            r"(?:api[_-]?key|token|secret|sig|signature)\s*[:=]\s*)"
+            r"[^\s,;&]+",
+            r"\1[REDACTED]",
+            message,
+        )
+        message = re.sub(
+            r"(?i)([?&](?:api[_-]?key|token|access_token|sig|signature)=)"
+            r"[^&#\s]+",
+            r"\1[REDACTED]",
+            message,
+        )
+        if len(message) > 500:
+            message = message[:497] + "..."
+
+        status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+        response = getattr(exc, "response", None)
+        status = status or getattr(response, "status_code", None) or getattr(
+            response, "status", None
+        )
+        details = f"{type(exc).__name__}: {message or '<no message>'}"
+        if status is not None and f"status={status}" not in details:
+            details += f" (status={status})"
+        return details
+
+    @staticmethod
+    def _retry_after_seconds(exc: Exception) -> float | None:
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", None) or getattr(exc, "headers", None)
+        value = None
+        if headers is not None:
+            try:
+                value = headers.get("Retry-After") or headers.get("retry-after")
+            except (AttributeError, TypeError):
+                pass
+        if value is None:
+            value = getattr(exc, "retry_after", None)
+        if value is None:
+            return None
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            try:
+                retry_at = parsedate_to_datetime(str(value))
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                return None
 
     @staticmethod
     def _cache_paths(output_path: Path) -> tuple[Path, Path]:
@@ -685,39 +838,56 @@ class EdgeTTSProvider:
         # mistaken for the new request.
         output_path.unlink(missing_ok=True)
         checkpoint_path.unlink(missing_ok=True)
-        retry_delays = self.transient_retry_delays
+        retry_delays = self.retry_delays
         max_attempts = len(retry_delays) + 1
-        for attempt in range(1, max_attempts + 1):
-            output_path.unlink(missing_ok=True)
-            try:
-                communicate = edge_tts.Communicate(
-                    request.text,
-                    voice,
-                    rate=rate,
-                    volume=volume,
-                    pitch=pitch,
-                )
-                communicate.save_sync(output_file)
-                if output_path.is_file() and output_path.stat().st_size > 0:
-                    break
-                raise NoAudioReceived(
-                    "Edge TTS returned no audio data."
-                )
-            except (NoAudioReceived, WebSocketError) as exc:
-                if attempt >= max_attempts:
-                    output_path.unlink(missing_ok=True)
-                    raise LocalizationProviderError(
-                        f"Edge TTS failed after {max_attempts} attempts: {exc}"
-                    ) from exc
-                delay = retry_delays[attempt - 1]
-                logger.warning(
-                    "Edge TTS transient failure (%d/%d); retrying voice %s in %d seconds",
-                    attempt, max_attempts, voice, delay,
-                )
-                time.sleep(delay)
-            except Exception as exc:
+        with self._synthesis_slots:
+            for attempt in range(1, max_attempts + 1):
                 output_path.unlink(missing_ok=True)
-                raise LocalizationProviderError(f"Edge TTS failed: {exc}") from exc
+                try:
+                    communicate = edge_tts.Communicate(
+                        request.text,
+                        voice,
+                        rate=rate,
+                        volume=volume,
+                        pitch=pitch,
+                    )
+                    communicate.save_sync(output_file)
+                    if output_path.is_file() and output_path.stat().st_size > 0:
+                        break
+                    raise NoAudioReceived(
+                        "Edge TTS returned no audio data."
+                    )
+                except (NoAudioReceived, WebSocketError) as exc:
+                    details = self._safe_exception_details(exc)
+                    if attempt >= max_attempts:
+                        output_path.unlink(missing_ok=True)
+                        logger.error(
+                            "Edge TTS final failure (%d/%d) for voice %s: %s",
+                            attempt, max_attempts, voice, details,
+                        )
+                        raise LocalizationProviderError(
+                            f"Edge TTS failed after {max_attempts} attempts: {details}"
+                        ) from exc
+                    delay = max(
+                        retry_delays[attempt - 1],
+                        self._retry_after_seconds(exc) or 0.0,
+                    )
+                    logger.warning(
+                        "Edge TTS transient failure (%d/%d) for voice %s: %s; "
+                        "retrying in %.1f seconds",
+                        attempt, max_attempts, voice, details, delay,
+                    )
+                    time.sleep(delay)
+                except Exception as exc:
+                    output_path.unlink(missing_ok=True)
+                    details = self._safe_exception_details(exc)
+                    logger.error(
+                        "Edge TTS final failure (1/%d) for voice %s: %s",
+                        max_attempts, voice, details,
+                    )
+                    raise LocalizationProviderError(
+                        f"Edge TTS failed: {details}"
+                    ) from exc
 
         if not output_path.is_file() or output_path.stat().st_size <= 0:
             raise LocalizationProviderError("Edge TTS did not create an audio file")
@@ -782,6 +952,8 @@ def _probe_audio_duration(audio_file: Path) -> float:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=_ffmpeg_env(),
         )
     except Exception as exc:

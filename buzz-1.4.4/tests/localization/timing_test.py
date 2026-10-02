@@ -98,6 +98,26 @@ def test_much_longer_audio_is_rejected_instead_of_overcompressed():
         )
 
 
+def test_tiny_rate_overrun_is_clamped_to_configured_maximum():
+    result = synchronize_for_localization(
+        make_transcript([make_segment(end=1.0, audio_duration=2.006)]),
+        TimingPolicy(max_playback_rate=2.0),
+    )
+
+    segment = result.segments[0]
+    assert segment.timing_action == "speed_up"
+    assert segment.playback_rate == pytest.approx(2.0)
+    assert segment.adjusted_audio_duration == pytest.approx(1.0)
+
+
+def test_clearly_excessive_rate_is_rejected_with_tolerance_enabled():
+    with pytest.raises(TimingSynchronizationError, match="2.100.*above maximum 2.000"):
+        synchronize_for_localization(
+            make_transcript([make_segment(end=1.0, audio_duration=2.1)]),
+            TimingPolicy(max_playback_rate=2.0),
+        )
+
+
 def test_custom_policy_controls_allowed_speed_change():
     transcript = make_transcript([make_segment(end=2.0, audio_duration=2.6)])
 

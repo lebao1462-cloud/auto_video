@@ -2,6 +2,8 @@ import json
 import math
 from pathlib import Path
 import struct
+import subprocess
+import sys
 import wave
 
 import pytest
@@ -10,7 +12,9 @@ from buzz.localization.audio_mix import (
     AudioMixingError,
     AudioMixingOptions,
     LocalizedAudioResult,
+    _run_ffmpeg,
     mix_localized_audio,
+    probe_media_duration,
 )
 from buzz.localization.timing import (
     TimedLocalizationSegment,
@@ -75,6 +79,30 @@ class FakeRunner:
             Path(command[-1]).write_bytes(b"fake wav")
 
 
+def test_ffmpeg_output_decoding_handles_utf8_bytes_invalid_in_cp1252():
+    # U+8425 includes byte 0x90 in UTF-8; cp1252 cannot decode that byte.
+    _run_ffmpeg([
+        sys.executable,
+        "-c",
+        "import sys; sys.stderr.buffer.write('处理营业视频.mp4'.encode('utf-8'))",
+    ])
+
+
+def test_ffprobe_uses_explicit_robust_utf8_decoding(monkeypatch):
+    media = Path(__file__)
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, "1.25\n", "处理营业视频")
+
+    monkeypatch.setattr("buzz.localization.audio_mix.subprocess.run", fake_run)
+
+    assert probe_media_duration(media) == 1.25
+    assert captured["encoding"] == "utf-8"
+    assert captured["errors"] == "replace"
+
+
 def test_builds_speech_only_mix_command(tmp_path):
     speech = tmp_path / "speech.wav"
     make_wav(speech)
@@ -118,7 +146,27 @@ def test_applies_phase4_playback_rate_and_start_delay(tmp_path):
         runner.commands[0].index("-filter_complex") + 1
     ]
     assert "atempo=1.20000000" in filter_complex
+    assert "atrim=0:2.000000" in filter_complex
     assert "adelay=1250:all=1" in filter_complex
+
+
+def test_clamped_max_rate_is_valid_for_ffmpeg_and_trimmed_to_slot(tmp_path):
+    speech = tmp_path / "speech.wav"
+    make_wav(speech)
+    runner = FakeRunner()
+
+    mix_localized_audio(
+        make_transcript(
+            [make_segment(speech, end=1.0, playback_rate=2.0, timing_action="speed_up")]
+        ),
+        tmp_path / "localized.wav",
+        ffmpeg_runner=runner,
+    )
+
+    filter_complex = runner.commands[0][
+        runner.commands[0].index("-filter_complex") + 1
+    ]
+    assert "atempo=2.00000000,atrim=0:1.000000" in filter_complex
 
 
 def test_places_multiple_segments_on_timeline(tmp_path):
@@ -145,6 +193,62 @@ def test_places_multiple_segments_on_timeline(tmp_path):
     assert "[speech0][speech1]amix=inputs=2" in filter_complex
     assert "adelay=2000:all=1" in filter_complex
     assert result.duration == 4.0
+
+
+def test_many_segments_use_bounded_hierarchical_commands_and_clean_up(tmp_path):
+    unicode_dir = tmp_path / "xử-lý-音声"
+    unicode_dir.mkdir()
+    speech = unicode_dir / "lời-thoại.wav"
+    make_wav(speech)
+    commands = []
+    script_paths = []
+
+    def runner(command):
+        commands.append(command)
+        if "-filter_complex_script" in command:
+            script_path = Path(command[command.index("-filter_complex_script") + 1])
+            script_paths.append(script_path)
+            assert script_path.read_text(encoding="utf-8")
+        Path(command[-1]).write_bytes(b"fake wav")
+
+    segments = [
+        make_segment(speech, start=index * 0.1, end=(index + 1) * 0.1)
+        for index in range(1000)
+    ]
+    mix_localized_audio(
+        make_transcript(segments),
+        unicode_dir / "tiếng-Việt.wav",
+        ffmpeg_runner=runner,
+    )
+
+    assert len(commands) > 2
+    assert max(command.count("-i") for command in commands) <= 32
+    assert max(len(subprocess.list2cmdline(command)) for command in commands) < 16000
+    assert all(not path.exists() for path in script_paths)
+    assert not list(unicode_dir.glob("buzz-speech-mix-*.wav"))
+
+
+def test_many_segment_intermediates_are_cleaned_up_when_ffmpeg_fails(tmp_path):
+    speech = tmp_path / "speech.wav"
+    make_wav(speech)
+    calls = 0
+
+    def failing_runner(command):
+        nonlocal calls
+        calls += 1
+        Path(command[-1]).write_bytes(b"partial wav")
+        if calls == 3:
+            raise AudioMixingError("expected failure")
+
+    segments = [make_segment(speech) for _ in range(200)]
+    with pytest.raises(AudioMixingError, match="expected failure"):
+        mix_localized_audio(
+            make_transcript(segments),
+            tmp_path / "localized.wav",
+            ffmpeg_runner=failing_runner,
+        )
+
+    assert not list(tmp_path.glob("buzz-speech-mix-*.wav"))
 
 
 def test_mixes_background_with_configured_gain(tmp_path):

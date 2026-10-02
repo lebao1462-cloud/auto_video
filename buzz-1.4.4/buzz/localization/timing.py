@@ -7,8 +7,26 @@ from buzz.localization.tts import (
 )
 
 
+# Durations from timestamp and encoded-audio probes can differ by a few frames.
+# Accept at most a 0.5% rate overrun, but render at the configured maximum.
+_MAX_PLAYBACK_RATE_RELATIVE_TOLERANCE = 0.005
+
+
 class TimingSynchronizationError(ValueError):
     """Raised when speech cannot fit the source timeline within the timing policy."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        segment_index: int | None = None,
+        required_rate: float | None = None,
+        max_playback_rate: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.segment_index = segment_index
+        self.required_rate = required_rate
+        self.max_playback_rate = max_playback_rate
 
 
 @dataclass(frozen=True)
@@ -146,13 +164,19 @@ def synchronize_for_localization(
                 trailing_padding = slot_duration - adjusted_duration
                 action = "pad_silence"
         else:
-            if required_rate > timing_policy.max_playback_rate:
+            tolerated_max_rate = timing_policy.max_playback_rate * (
+                1.0 + _MAX_PLAYBACK_RATE_RELATIVE_TOLERANCE
+            )
+            if required_rate > tolerated_max_rate:
                 raise TimingSynchronizationError(
                     "Segment "
                     f"{index} requires playback rate {required_rate:.3f}, "
-                    f"above maximum {timing_policy.max_playback_rate:.3f}"
+                    f"above maximum {timing_policy.max_playback_rate:.3f}",
+                    segment_index=index,
+                    required_rate=required_rate,
+                    max_playback_rate=timing_policy.max_playback_rate,
                 )
-            playback_rate = required_rate
+            playback_rate = min(required_rate, timing_policy.max_playback_rate)
             adjusted_duration = slot_duration
             trailing_padding = 0.0
             action = "speed_up"

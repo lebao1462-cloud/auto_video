@@ -2,6 +2,8 @@ from pathlib import Path
 from contextlib import nullcontext
 import json
 import sys
+import threading
+import time
 from types import ModuleType, SimpleNamespace
 import wave
 
@@ -59,6 +61,22 @@ def test_nllb_model_path_uses_configured_model_root(monkeypatch, tmp_path):
     monkeypatch.setenv("BUZZ_MODEL_ROOT", str(tmp_path / "models"))
 
     assert nllb_model_path() == tmp_path / "models" / "nllb" / "nllb-200-distilled-600M"
+
+
+def test_tts_audio_probe_uses_explicit_robust_utf8_decoding(monkeypatch):
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured.update(kwargs)
+        return __import__("subprocess").CompletedProcess(
+            command, 0, "2.5\n", "合成营业音频"
+        )
+
+    monkeypatch.setattr("buzz.localization.providers.subprocess.run", fake_run)
+
+    assert _probe_audio_duration(Path("中文语音.mp3")) == 2.5
+    assert captured["encoding"] == "utf-8"
+    assert captured["errors"] == "replace"
 
 
 def _write_complete_nllb_model(path):
@@ -402,6 +420,110 @@ def test_edge_tts_transient_retries_are_extended_and_finite(monkeypatch, tmp_pat
     assert not (tmp_path / "segment.mp3").exists()
 
 
+def test_edge_tts_logs_sanitized_diagnostics_and_final_failure(
+    monkeypatch, tmp_path, caplog
+):
+    def websocket_failure(output_file):
+        error = websocket_exception(
+            "HTTP 429 timeout token=super-secret "
+            "wss://example.test/path?api_key=also-secret"
+        )
+        error.status_code = 429
+        raise error
+
+    _, _, websocket_exception = _install_fake_edge_tts(
+        monkeypatch, websocket_failure
+    )
+    monkeypatch.setattr("buzz.localization.providers.time.sleep", lambda delay: None)
+    provider = EdgeTTSProvider(retry_delays=(0,))
+
+    with caplog.at_level("WARNING", logger="buzz.localization.providers"):
+        with pytest.raises(LocalizationProviderError) as caught:
+            provider.synthesize(TTSRequest(
+                "Xin chao", "vi", str(tmp_path / "diagnostic")
+            ))
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "WebSocketError" in messages
+    assert "status=429" in messages
+    assert "HTTP 429 timeout" in messages
+    assert "transient failure (1/2)" in messages
+    assert "final failure (2/2)" in messages
+    assert "super-secret" not in messages
+    assert "also-secret" not in messages
+    assert "super-secret" not in str(caught.value)
+
+
+def test_edge_tts_honors_retry_after(monkeypatch, tmp_path):
+    attempts = 0
+
+    def rate_limited_once(output_file):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            error = websocket_exception("HTTP 429 Too Many Requests")
+            error.response = type("Response", (), {
+                "status_code": 429, "headers": {"Retry-After": "12"}
+            })()
+            raise error
+        Path(output_file).write_bytes(b"fake mp3")
+
+    _, _, websocket_exception = _install_fake_edge_tts(
+        monkeypatch, rate_limited_once
+    )
+    sleeps = []
+    monkeypatch.setattr("buzz.localization.providers.time.sleep", sleeps.append)
+    monkeypatch.setattr("buzz.localization.providers._trim_edge_tts_silence", lambda path: None)
+    monkeypatch.setattr("buzz.localization.providers._probe_audio_duration", lambda path: 1.0)
+
+    EdgeTTSProvider(retry_delays=(1,)).synthesize(TTSRequest(
+        "Xin chao", "vi", str(tmp_path / "rate-limited")
+    ))
+
+    assert sleeps == [12.0]
+
+
+def test_edge_tts_conservative_default_serializes_concurrent_calls(
+    monkeypatch, tmp_path
+):
+    active = 0
+    peak_active = 0
+    state_lock = threading.Lock()
+
+    def slow_save(output_file):
+        nonlocal active, peak_active
+        with state_lock:
+            active += 1
+            peak_active = max(peak_active, active)
+        time.sleep(0.03)
+        Path(output_file).write_bytes(b"fake mp3")
+        with state_lock:
+            active -= 1
+
+    _install_fake_edge_tts(monkeypatch, slow_save)
+    monkeypatch.setattr("buzz.localization.providers._trim_edge_tts_silence", lambda path: None)
+    monkeypatch.setattr("buzz.localization.providers._probe_audio_duration", lambda path: 1.0)
+    provider = EdgeTTSProvider()
+    errors = []
+
+    def synthesize(index):
+        try:
+            provider.synthesize(TTSRequest(
+                "Xin chao", "vi", str(tmp_path / f"concurrent-{index}")
+            ))
+        except Exception as exc:
+            errors.append(exc)
+
+    workers = [threading.Thread(target=synthesize, args=(index,)) for index in range(3)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+
+    assert errors == []
+    assert peak_active == 1
+
+
 def test_edge_tts_non_transient_error_fails_without_retry(monkeypatch, tmp_path):
     def invalid_parameter(output_file):
         Path(output_file).write_bytes(b"partial")
@@ -558,6 +680,32 @@ def test_gemini_provider_supports_chinese_source():
     assert provider.translate("早上好", "zh", "vi") == "Chào buổi sáng"
 
 
+def test_gemini_shortens_one_translation_for_timing_recovery():
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    captured = {}
+
+    class Response:
+        text = "Cau ngan, du nghia"
+
+    def generate(**kwargs):
+        captured.update(kwargs)
+        return Response()
+
+    provider._generate_content_with_retry = generate
+    result = provider.shorten_translation(
+        source_text="Keep every important detail",
+        translated_text="Ban dich hien tai qua dai",
+        source_language="en", target_language="vi",
+        required_rate=2.083, max_playback_rate=2.0,
+    )
+
+    assert result == "Cau ngan, du nghia"
+    assert "Preserve the complete meaning" in captured["contents"]
+    assert "96%" in captured["contents"]
+
+
 def test_gemini_provider_requires_key_and_model():
     from buzz.localization.providers import GeminiTranslationProvider
 
@@ -609,8 +757,8 @@ def test_gemini_batch_corrects_chinese_and_validates_ids():
             assert payload["context_only"][0]["text"] == "机器人"
             return SimpleNamespace(text=json.dumps({
                 "segments": [
-                    {"id": 1, "corrected_text": "自动回充", "translated_text": "Tự về sạc"},
-                    {"id": 0, "corrected_text": "吸力很强", "translated_text": "Lực hút mạnh"},
+                    {"id": "1", "corrected_text": "自动回充", "translated_text": "Tự về sạc"},
+                    {"id": "0", "corrected_text": "吸力很强", "translated_text": "Lực hút mạnh"},
                 ]
             }, ensure_ascii=False))
 
@@ -633,7 +781,7 @@ def test_gemini_batch_rejects_missing_id():
     provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
     provider._client = SimpleNamespace(
         models=SimpleNamespace(generate_content=lambda **kwargs:
-            SimpleNamespace(text='{"segments":[{"id":9,"corrected_text":"a","translated_text":"b"}]}'))
+            SimpleNamespace(text='{"segments":[{"id":"9","corrected_text":"a","translated_text":"b"}]}'))
     )
     with pytest.raises(LocalizationProviderError, match="segment ID"):
         provider.translate_segments([LocalizationSegment(0, 1, "a")], "zh", "vi")
@@ -649,7 +797,7 @@ def test_gemini_display_name_is_normalized_to_api_id():
     assert provider.model == "gemini-3.8-flash"
 
 
-def test_gemini_retries_and_falls_back_on_503(monkeypatch):
+def test_gemini_retries_and_uses_configured_fallback_on_429(monkeypatch):
     from types import SimpleNamespace
     from buzz.localization.providers import GeminiTranslationProvider
 
@@ -658,11 +806,12 @@ def test_gemini_retries_and_falls_back_on_503(monkeypatch):
         def generate_content(self, **kwargs):
             calls.append(kwargs["model"])
             if kwargs["model"] == "gemini-3.8-flash":
-                raise RuntimeError("503 UNAVAILABLE")
+                raise RuntimeError("429 RESOURCE_EXHAUSTED")
             return SimpleNamespace(text="Xin chào")
 
     provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
     provider.model = "gemini-3.8-flash"
+    provider.rate_limit_fallback_models = ("gemini-3.5-flash-lite",)
     provider._client = SimpleNamespace(models=Models())
     monkeypatch.setattr(
         "buzz.localization.providers.time.sleep",

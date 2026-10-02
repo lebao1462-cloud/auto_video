@@ -1,5 +1,6 @@
 import json
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import pytest
 
@@ -219,3 +220,69 @@ def test_batch_translation_keeps_timestamps_and_corrected_chinese():
     assert result.segments[30].end == 31
     assert result.segments[30].source_text == "修正0"
     assert result.segments[30].translated_text == "Dịch 0"
+
+
+def test_batch_wrong_count_retries_then_recursively_splits():
+    class SplittingProvider:
+        model = "test-model"
+
+        def __init__(self):
+            self.calls = []
+
+        def translate_segments(self, segments, source_language, target_language, *, context):
+            self.calls.append(tuple(item.segment_id for item in segments))
+            if len(segments) > 1:
+                return []
+            return [(segments[0].text, f"Dịch {segments[0].text}")]
+
+    provider = SplittingProvider()
+    transcript = make_transcript(segments=[
+        LocalizationSegment(0, 1, "one"),
+        LocalizationSegment(1, 2, "two"),
+    ])
+
+    result = translate_for_localization(transcript, provider)
+
+    assert len(provider.calls) == 4
+    assert provider.calls[0] == provider.calls[1]
+    assert provider.calls[2][0] == provider.calls[0][0]
+    assert provider.calls[3][0] == provider.calls[0][1]
+    assert [item.translated_text for item in result.segments] == [
+        "Dịch one", "Dịch two"
+    ]
+
+
+def test_translation_checkpoint_resumes_by_source_provider_and_model():
+    class CheckpointProvider:
+        model = "model-a"
+
+        def __init__(self):
+            self.calls = 0
+
+        def translate_segments(self, segments, source_language, target_language, *, context):
+            self.calls += 1
+            return [(item.text, f"Dịch {item.text}") for item in segments]
+
+    checkpoint = Path("translation-checkpoint-test.json").resolve()
+    checkpoint.unlink(missing_ok=True)
+    transcript = make_transcript(segments=[LocalizationSegment(0, 1, "one")])
+    try:
+        first = CheckpointProvider()
+        translate_for_localization(transcript, first, checkpoint_path=checkpoint)
+        resumed = CheckpointProvider()
+
+        result = translate_for_localization(
+            transcript, resumed, checkpoint_path=checkpoint
+        )
+
+        assert resumed.calls == 0
+        assert result.segments[0].translated_text == "Dịch one"
+
+        changed_model = CheckpointProvider()
+        changed_model.model = "model-b"
+        translate_for_localization(
+            transcript, changed_model, checkpoint_path=checkpoint
+        )
+        assert changed_model.calls == 1
+    finally:
+        checkpoint.unlink(missing_ok=True)

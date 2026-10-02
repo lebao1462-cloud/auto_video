@@ -5,15 +5,23 @@ import wave
 
 import pytest
 
+from buzz.localization.audio_mix import probe_media_duration
 from buzz.localization.transcript import LocalizationSegment, LocalizationTranscript
-from buzz.localization.translation import TranslationProvider
+from buzz.localization.translation import TranslationProvider, _segment_id
 from buzz.localization.tts import TTSRequest, TTSResult
+from buzz.localization.tts import (
+    SynthesizedLocalizationSegment,
+    SynthesizedLocalizationTranscript,
+    synthesize_segment,
+)
+from buzz.localization.timing import TimingPolicy, TimingSynchronizationError
 from buzz.localization.workflow import (
     LocalizationCancelled,
     LocalizationStage,
     LocalizationWorkflowOptions,
     cleanup_localization_workspace,
     localize_video,
+    _synchronize_with_translation_recovery,
 )
 from buzz.localization.final_render import FinalRenderOptions
 from buzz.transcriber.transcriber import Task, TranscriptionOptions
@@ -43,6 +51,121 @@ class FakeTTSProvider:
             provider="fake",
             voice=request.voice or "vi-test",
         )
+
+
+def _synthesized_for_recovery(tmp_path, durations=(1.0, 2.083)):
+    segments = []
+    for index, duration in enumerate(durations):
+        audio = tmp_path / f"segment-{index:06d}.wav"
+        audio.write_bytes(b"audio")
+        segments.append(SynthesizedLocalizationSegment(
+            start=float(index), end=float(index + 1),
+            source_text=f"source {index}", translated_text=f"translation {index}",
+            audio_file=str(audio), audio_duration=duration,
+            provider="fake", voice="vi-test",
+        ))
+    return SynthesizedLocalizationTranscript(
+        source_language="en", target_language="vi", source_file="source.mp4",
+        segments=tuple(segments),
+    )
+
+
+class ShorteningProvider:
+    def __init__(self):
+        self.calls = []
+
+    def shorten_translation(self, **kwargs):
+        self.calls.append(kwargs)
+        return "bản dịch ngắn"
+
+
+class RecoveryTTSProvider:
+    def __init__(self, durations):
+        self.durations = iter(durations)
+        self.requests = []
+
+    def synthesize(self, request):
+        self.requests.append(request)
+        output = Path(request.output_file_stem + ".wav")
+        output.write_bytes(b"replacement")
+        return TTSResult(
+            audio_file=str(output), audio_duration=next(self.durations),
+            provider="fake", voice=request.voice,
+        )
+
+
+def test_timing_recovery_shortens_and_regenerates_only_failing_segment(tmp_path):
+    original = _synthesized_for_recovery(tmp_path)
+    translator = ShorteningProvider()
+    tts = RecoveryTTSProvider([1.8])
+    seed_provider = RecoveryTTSProvider([1.0])
+    synthesize_segment(TTSRequest(
+        text=original.segments[0].translated_text,
+        language="vi",
+        output_file_stem=str(tmp_path / "segment-000000"),
+        voice="vi-test",
+    ), seed_provider)
+    unaffected_checkpoint = tmp_path / "segment-000000.localization-tts.json"
+    unaffected_contents = unaffected_checkpoint.read_bytes()
+
+    timed = _synchronize_with_translation_recovery(
+        original, translator, tts,
+        LocalizationWorkflowOptions(
+            output_directory=str(tmp_path),
+            timing_policy=TimingPolicy(max_playback_rate=2.0),
+        ),
+    )
+
+    assert len(translator.calls) == 1
+    assert translator.calls[0]["translated_text"] == "translation 1"
+    assert len(tts.requests) == 1
+    assert tts.requests[0].output_file_stem.endswith("segment-000001")
+    assert timed.segments[0].translated_text == "translation 0"
+    assert timed.segments[0].audio_file == original.segments[0].audio_file
+    assert timed.segments[1].translated_text == "bản dịch ngắn"
+    assert timed.segments[1].playback_rate == pytest.approx(1.8)
+    assert unaffected_checkpoint.read_bytes() == unaffected_contents
+    assert (tmp_path / "segment-000001.localization-tts.json").is_file()
+
+
+def test_timing_recovery_is_bounded_and_reports_final_failure(tmp_path):
+    class RepeatedShorteningProvider(ShorteningProvider):
+        def shorten_translation(self, **kwargs):
+            self.calls.append(kwargs)
+            return f"bản dịch ngắn {len(self.calls)}"
+
+    translator = RepeatedShorteningProvider()
+    tts = RecoveryTTSProvider([2.05, 2.02])
+
+    with pytest.raises(
+        TimingSynchronizationError,
+        match="after 2 concise-translation retries.*hard playback-rate ceiling",
+    ):
+        _synchronize_with_translation_recovery(
+            _synthesized_for_recovery(tmp_path), translator, tts,
+            LocalizationWorkflowOptions(
+                output_directory=str(tmp_path),
+                timing_policy=TimingPolicy(max_playback_rate=2.0),
+                timing_recovery_attempts=2,
+            ),
+        )
+
+    assert len(translator.calls) == 2
+    assert len(tts.requests) == 2
+
+
+def test_timing_recovery_never_exceeds_hard_playback_rate_ceiling(tmp_path):
+    timed = _synchronize_with_translation_recovery(
+        _synthesized_for_recovery(tmp_path), ShorteningProvider(),
+        RecoveryTTSProvider([2.005]),
+        LocalizationWorkflowOptions(
+            output_directory=str(tmp_path),
+            timing_policy=TimingPolicy(max_playback_rate=2.0),
+        ),
+    )
+
+    assert timed.segments[1].playback_rate == 2.0
+    assert max(segment.playback_rate for segment in timed.segments) <= 2.0
 
 
 def create_test_video(path: Path, duration: int = 2):
@@ -294,8 +417,17 @@ def test_end_to_end_workflow_accepts_argos_provider(
 def test_end_to_end_workflow_accepts_gemini_provider(monkeypatch, tmp_path):
     from buzz.localization.providers import GeminiTranslationProvider
 
+    segment_id = _segment_id(
+        0,
+        LocalizationSegment(start=0.25, end=1.50, text="Hello everyone"),
+    )
+
     class Response:
-        text = '{"segments":[{"id":0,"corrected_text":"Hello everyone","translated_text":"Xin chào mọi người"}]}'
+        text = (
+            '{"segments":[{"id":"' + segment_id
+            + '","corrected_text":"Hello everyone",'
+            '"translated_text":"Xin chào mọi người"}]}'
+        )
 
     class Models:
         def generate_content(self, **kwargs):
@@ -385,6 +517,121 @@ def test_chunked_video_joins_parts_and_offsets_subtitles(tmp_path):
         abs(float(pts) - second_start) < 0.01
         for pts in packets.stdout.splitlines() if pts.strip()
     )
+
+
+def test_chunked_video_resumes_completed_parts_and_reprocesses_invalid_artifact(
+    tmp_path,
+):
+    source = tmp_path / "resume_source.mp4"
+    create_test_video(source, duration=4)
+    output = tmp_path / "output"
+    transcribe_calls = []
+    translation_calls = []
+    tts_calls = []
+
+    def counting_transcribe(video_path, transcription_options, model_path):
+        transcribe_calls.append(video_path)
+        return fake_transcribe(video_path, transcription_options, model_path)
+
+    class CountingTranslationProvider(FakeTranslationProvider):
+        def translate(self, text, source_language, target_language):
+            translation_calls.append(text)
+            return super().translate(text, source_language, target_language)
+
+    class CountingTTSProvider(FakeTTSProvider):
+        def synthesize(self, request):
+            tts_calls.append(request.text)
+            return super().synthesize(request)
+
+    options = LocalizationWorkflowOptions(
+        output_directory=str(output), chunk_duration_seconds=2,
+        render_options=FinalRenderOptions(subtitle_mode="soft"),
+    )
+    provider = CountingTranslationProvider()
+    tts_provider = CountingTTSProvider()
+
+    localize_video(
+        str(source), TranscriptionOptions(language="en", task=Task.TRANSCRIBE),
+        "unused-model-path", provider, tts_provider, options,
+        transcribe_func=counting_transcribe,
+    )
+    assert len(transcribe_calls) == len(translation_calls) == len(tts_calls) == 2
+
+    progress = []
+    localize_video(
+        str(source), TranscriptionOptions(language="en", task=Task.TRANSCRIBE),
+        "unused-model-path", provider, tts_provider, options,
+        progress_callback=progress.append, transcribe_func=counting_transcribe,
+    )
+    assert len(transcribe_calls) == len(translation_calls) == len(tts_calls) == 2
+    assert sum("reused completed part" in item.message for item in progress) == 2
+
+    workspace = output / "resume_source_localization_work"
+    (workspace / "part_0002" / "source.vi.mp4").unlink()
+    result = localize_video(
+        str(source), TranscriptionOptions(language="en", task=Task.TRANSCRIBE),
+        "unused-model-path", provider, tts_provider, options,
+        transcribe_func=counting_transcribe,
+    )
+    assert len(transcribe_calls) == len(translation_calls) == len(tts_calls) == 3
+    assert result.subtitle.cue_count == 2
+    assert "00:00:02," in Path(result.subtitle.subtitle_file).read_text(encoding="utf-8")
+    assert probe_media_duration(result.final_video.video_file) == pytest.approx(4.0, abs=0.2)
+
+
+def test_chunked_video_changed_option_and_source_invalidate_completed_parts(tmp_path):
+    source = tmp_path / "invalidate_source.mp4"
+    create_test_video(source, duration=4)
+    output = tmp_path / "output"
+    calls = []
+
+    def counting_transcribe(video_path, transcription_options, model_path):
+        calls.append(video_path)
+        return fake_transcribe(video_path, transcription_options, model_path)
+
+    def run(*, voice=None):
+        return localize_video(
+            str(source), TranscriptionOptions(language="en", task=Task.TRANSCRIBE),
+            "unused-model-path", FakeTranslationProvider(), FakeTTSProvider(),
+            LocalizationWorkflowOptions(
+                output_directory=str(output), chunk_duration_seconds=2,
+                tts_voice=voice,
+            ),
+            transcribe_func=counting_transcribe,
+        )
+
+    run()
+    assert len(calls) == 2
+    run(voice="vi-VN-NamMinhNeural")
+    assert len(calls) == 4
+    source.touch()
+    run(voice="vi-VN-NamMinhNeural")
+    assert len(calls) == 6
+
+
+def test_chunked_video_failure_does_not_write_completion_manifest(tmp_path):
+    source = tmp_path / "failure_source.mp4"
+    create_test_video(source, duration=4)
+    output = tmp_path / "output"
+
+    def failing_transcribe(*args, **kwargs):
+        raise RuntimeError("test transcription failure")
+
+    with pytest.raises(RuntimeError, match="test transcription failure"):
+        localize_video(
+            str(source), TranscriptionOptions(language="en", task=Task.TRANSCRIBE),
+            "unused-model-path", FakeTranslationProvider(), FakeTTSProvider(),
+            LocalizationWorkflowOptions(
+                output_directory=str(output), chunk_duration_seconds=2,
+            ),
+            transcribe_func=failing_transcribe,
+        )
+
+    manifest = (
+        output / "failure_source_localization_work" / "part_0001"
+        / "localization-part-complete.json"
+    )
+    assert not manifest.exists()
 
 
 def test_chunked_video_cancellation_between_parts(tmp_path):

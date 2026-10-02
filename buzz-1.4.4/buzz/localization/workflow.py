@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 import shutil
@@ -14,10 +14,21 @@ from buzz.localization.audio_mix import (
 )
 from buzz.localization.final_render import FinalRenderOptions, FinalRenderResult, render_localized_mp4
 from buzz.localization.subtitles import SubtitleOptions, SubtitleResult, write_subtitles
-from buzz.localization.timing import TimingPolicy, synchronize_for_localization
+from buzz.localization.timing import (
+    TimingPolicy,
+    TimingSynchronizationError,
+    synchronize_for_localization,
+)
 from buzz.localization.transcript import LocalizationTranscript, transcribe_for_localization
 from buzz.localization.translation import TranslationProvider, translate_for_localization
-from buzz.localization.tts import TTSProvider, synthesize_for_localization
+from buzz.localization.tts import (
+    SynthesizedLocalizationTranscript,
+    TTSProvider,
+    TTSRequest,
+    TTSResult,
+    synthesize_segment,
+    synthesize_for_localization,
+)
 from buzz.transcriber.transcriber import TranscriptionOptions
 
 
@@ -59,6 +70,7 @@ class LocalizationWorkflowOptions:
     tts_voice: str | None = None
     tts_options: Mapping[str, object] = field(default_factory=dict)
     timing_policy: TimingPolicy = field(default_factory=TimingPolicy)
+    timing_recovery_attempts: int = 2
     audio_options: AudioMixingOptions = field(default_factory=AudioMixingOptions)
     subtitle_options: SubtitleOptions = field(default_factory=SubtitleOptions)
     render_options: FinalRenderOptions = field(default_factory=FinalRenderOptions)
@@ -70,6 +82,9 @@ class LocalizationWorkflowOptions:
             raise ValueError("output_directory is required")
         if self.chunk_duration_seconds < 0:
             raise ValueError("chunk_duration_seconds must be non-negative")
+        if (isinstance(self.timing_recovery_attempts, bool)
+                or self.timing_recovery_attempts < 0):
+            raise ValueError("timing_recovery_attempts must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -86,6 +101,80 @@ class LocalizationWorkflowResult:
             "localized_audio_file": self.localized_audio_file,
             "workspace": self.workspace,
         }
+
+
+def _synchronize_with_translation_recovery(
+    synthesized: SynthesizedLocalizationTranscript,
+    translation_provider: TranslationProvider,
+    tts_provider: TTSProvider,
+    options: LocalizationWorkflowOptions,
+):
+    current = synthesized
+    attempts_by_segment: dict[int, int] = {}
+    while True:
+        try:
+            return synchronize_for_localization(current, options.timing_policy)
+        except TimingSynchronizationError as exc:
+            index = exc.segment_index
+            shorten = getattr(translation_provider, "shorten_translation", None)
+            attempts = attempts_by_segment.get(index, 0) if index is not None else 0
+            if (index is None or exc.required_rate is None
+                    or not callable(shorten)
+                    or attempts >= options.timing_recovery_attempts):
+                detail = (
+                    f" after {attempts} concise-translation retries"
+                    if callable(shorten) and index is not None else
+                    "; the active translation provider cannot shorten individual segments"
+                )
+                raise TimingSynchronizationError(
+                    f"{exc}{detail}. Segment audio was not cut and the hard playback-rate "
+                    "ceiling remains enforced.",
+                    segment_index=index,
+                    required_rate=exc.required_rate,
+                    max_playback_rate=exc.max_playback_rate,
+                ) from exc
+
+            segment = current.segments[index]
+            shortened = shorten(
+                source_text=segment.source_text,
+                translated_text=segment.translated_text,
+                source_language=current.source_language,
+                target_language=current.target_language,
+                required_rate=exc.required_rate,
+                max_playback_rate=options.timing_policy.max_playback_rate,
+            )
+            if not isinstance(shortened, str) or not shortened.strip():
+                raise ValueError("Translation provider returned an invalid shortened segment")
+            result = synthesize_segment(TTSRequest(
+                text=shortened.strip(),
+                language=current.target_language,
+                output_file_stem=str(Path(segment.audio_file).with_suffix("")),
+                voice=options.tts_voice,
+                options=dict(options.tts_options),
+            ), tts_provider)
+            if (not isinstance(result, TTSResult)
+                    or not isinstance(result.audio_file, str)
+                    or not result.audio_file
+                    or not Path(result.audio_file).is_file()
+                    or not isinstance(result.audio_duration, (int, float))
+                    or isinstance(result.audio_duration, bool)
+                    or result.audio_duration <= 0
+                    or not isinstance(result.provider, str)
+                    or not result.provider.strip()):
+                raise ValueError("TTS provider returned an invalid recovery response")
+            replacement = replace(
+                segment,
+                translated_text=shortened.strip(),
+                audio_file=result.audio_file,
+                audio_duration=float(result.audio_duration),
+                provider=result.provider,
+                voice=result.voice,
+                provider_metadata=dict(result.metadata),
+            )
+            segments = list(current.segments)
+            segments[index] = replacement
+            current = replace(current, segments=tuple(segments))
+            attempts_by_segment[index] = attempts + 1
 
 
 def _localize_single_video(
@@ -129,7 +218,11 @@ def _localize_single_video(
     transcript = transcribe_func(str(source), transcription_options, model_path, **transcribe_kwargs)
     report(LocalizationStage.TRANSCRIBE, "Source transcription completed")
 
-    translated = translate_for_localization(transcript, translation_provider)
+    translated = translate_for_localization(
+        transcript,
+        translation_provider,
+        checkpoint_path=workspace / "translation-checkpoint.json",
+    )
     report(LocalizationStage.TRANSLATE, "Vietnamese translation completed")
 
     tts_dir = workspace / "tts"
@@ -142,7 +235,9 @@ def _localize_single_video(
     )
     report(LocalizationStage.TTS, "Vietnamese TTS completed")
 
-    timed = synchronize_for_localization(synthesized, options.timing_policy)
+    timed = _synchronize_with_translation_recovery(
+        synthesized, translation_provider, tts_provider, options
+    )
     report(LocalizationStage.TIMING, "Speech timing plan completed")
 
     source_duration = probe_media_duration(source)
