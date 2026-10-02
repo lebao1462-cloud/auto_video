@@ -38,7 +38,9 @@ def make_segment(
     end=2.0,
     playback_rate=1.0,
     timing_action="none",
+    slot_duration=None,
 ):
+    slot_duration = end - start if slot_duration is None else slot_duration
     return TimedLocalizationSegment(
         start=start,
         end=end,
@@ -49,7 +51,7 @@ def make_segment(
         provider="fake",
         voice="vi-test",
         provider_metadata={"format": "wav"},
-        slot_duration=end - start,
+        slot_duration=slot_duration,
         playback_rate=playback_rate,
         adjusted_audio_duration=(end - start),
         leading_padding=0.0,
@@ -314,6 +316,40 @@ def test_output_duration_uses_last_segment_end(tmp_path):
     command = runner.commands[0]
     assert command[command.index("-t") + 1] == "7.500000"
     assert result.duration == 7.5
+
+
+def test_output_duration_preserves_borrowed_audio_slot(tmp_path):
+    speech = tmp_path / "speech.wav"
+    make_wav(speech)
+    runner = FakeRunner()
+
+    result = mix_localized_audio(
+        make_transcript([make_segment(speech, end=2.0, slot_duration=2.5)]),
+        tmp_path / "localized.wav", ffmpeg_runner=runner,
+    )
+
+    command = runner.commands[0]
+    assert "atrim=0:2.500000" in command[command.index("-filter_complex") + 1]
+    assert command[command.index("-t") + 1] == "2.500000"
+    assert result.duration == 2.5
+
+
+def test_hierarchical_mix_preserves_borrowed_audio_slot_extent(tmp_path):
+    speech = tmp_path / "speech.wav"
+    make_wav(speech)
+    runner = FakeRunner()
+    segments = [make_segment(speech, end=1.0, slot_duration=1.5)]
+    segments.extend(make_segment(speech, end=1.0) for _ in range(32))
+
+    result = mix_localized_audio(
+        make_transcript(segments), tmp_path / "localized.wav", ffmpeg_runner=runner,
+    )
+
+    assert result.duration == 1.5
+    assert any(
+        "atrim=0:1.500000" in command[command.index("-filter_complex") + 1]
+        for command in runner.commands if "-filter_complex" in command
+    )
 
 
 def test_respects_sample_rate_and_channels(tmp_path):

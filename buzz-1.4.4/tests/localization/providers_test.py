@@ -706,6 +706,43 @@ def test_gemini_shortens_one_translation_for_timing_recovery():
     assert "96%" in captured["contents"]
 
 
+def test_gemini_batch_shortens_in_one_json_request_and_validates_ids():
+    import json
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    calls = []
+    def generate(**kwargs):
+        calls.append(kwargs)
+        payload = json.loads(kwargs["contents"].split("Input JSON:\n", 1)[1])
+        return SimpleNamespace(text=json.dumps({"segments": [
+            {"id": payload["segments"][1]["id"], "shortened_text": "ngan hai"},
+            {"id": payload["segments"][0]["id"], "shortened_text": "ngan mot"},
+        ]}))
+
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider._generate_content_with_retry = generate
+    segments = [
+        {"id": "a", "source_text": "one", "translated_text": "mot dai",
+         "required_rate": 1.5, "max_playback_rate": 1.1},
+        {"id": "b", "source_text": "two", "translated_text": "hai dai",
+         "required_rate": 1.4, "max_playback_rate": 1.1},
+    ]
+    assert provider.shorten_translations(
+        segments=segments, source_language="en", target_language="vi"
+    ) == ["ngan mot", "ngan hai"]
+    assert len(calls) == 1
+    assert calls[0]["config"]["response_mime_type"] == "application/json"
+
+    provider._generate_content_with_retry = lambda **kwargs: SimpleNamespace(
+        text='{"segments":[{"id":"a","shortened_text":"x"}]}'
+    )
+    with pytest.raises(LocalizationProviderError, match="shortened segments|segment ID"):
+        provider.shorten_translations(
+            segments=segments, source_language="en", target_language="vi"
+        )
+
+
 def test_gemini_provider_requires_key_and_model():
     from buzz.localization.providers import GeminiTranslationProvider
 
@@ -821,8 +858,139 @@ def test_gemini_retries_and_uses_configured_fallback_on_429(monkeypatch):
     assert provider.translate("Hello", "en", "vi") == "Xin chào"
     assert calls == [
         "gemini-3.8-flash",
-        "gemini-3.8-flash",
-        "gemini-3.8-flash",
         "gemini-3.5-flash-lite",
     ]
     assert provider.last_model_used == "gemini-3.5-flash-lite"
+
+
+def test_gemini_uses_configured_fallback_after_retryable_503(monkeypatch):
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    calls = []
+    class Models:
+        def generate_content(self, **kwargs):
+            calls.append(kwargs["model"])
+            if kwargs["model"] == "gemini-3.8-flash":
+                raise RuntimeError("503 UNAVAILABLE")
+            return SimpleNamespace(text="Xin chao")
+
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider.model = "gemini-3.8-flash"
+    provider.rate_limit_fallback_models = ("gemini-3.5-flash-lite",)
+    provider._client = SimpleNamespace(models=Models())
+    monkeypatch.setattr("buzz.localization.providers.time.sleep", lambda seconds: None)
+
+    assert provider.translate("Hello", "en", "vi") == "Xin chao"
+    assert calls == ["gemini-3.8-flash"] * 3 + ["gemini-3.5-flash-lite"]
+
+
+def test_gemini_default_fallback_order_dedupes_primary(monkeypatch):
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    monkeypatch.delenv("BUZZ_GEMINI_429_FALLBACK_MODELS", raising=False)
+    provider = GeminiTranslationProvider(api_key="test-key", model="gemini-3.5-flash-lite")
+    assert provider._model_candidates() == (
+        "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.8-flash",
+        "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash",
+        "gemini-2.5-flash-lite", "gemini-2.5-flash",
+    )
+
+
+def test_gemini_rpd_model_is_skipped_on_later_requests():
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    calls = []
+    class Models:
+        def generate_content(self, **kwargs):
+            calls.append(kwargs["model"])
+            if kwargs["model"] == "primary":
+                raise RuntimeError("429 RESOURCE_EXHAUSTED requests_per_day")
+            return SimpleNamespace(text="ok")
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider.model, provider.rate_limit_fallback_models = "primary", ("fallback",)
+    provider._client = SimpleNamespace(models=Models())
+    assert provider.translate("one", "en", "vi") == "ok"
+    assert provider.translate("two", "en", "vi") == "ok"
+    assert calls == ["primary", "fallback", "fallback"]
+
+
+def test_gemini_rpm_falls_back_then_reenables_after_cooldown(monkeypatch):
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    now, calls = [0.0], []
+    class Models:
+        def generate_content(self, **kwargs):
+            calls.append(kwargs["model"])
+            if kwargs["model"] == "primary" and calls.count("primary") == 1:
+                raise RuntimeError("429 RESOURCE_EXHAUSTED requests_per_minute")
+            return SimpleNamespace(text="ok")
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider.model, provider.rate_limit_fallback_models = "primary", ("fallback",)
+    provider._client = SimpleNamespace(models=Models())
+    monkeypatch.setattr("buzz.localization.providers.time.monotonic", lambda: now[0])
+    assert provider.translate("one", "en", "vi") == "ok"
+    now[0] = 66.0
+    assert provider.translate("two", "en", "vi") == "ok"
+    assert calls == ["primary", "fallback", "primary"]
+
+
+def test_gemini_ambiguous_429_uses_cooldown():
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    assert GeminiTranslationProvider._gemini_quota_kind(RuntimeError("429 quota exceeded")) == "rpm"
+
+
+def test_gemini_all_rpm_models_wait_and_retry(monkeypatch):
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    now, calls, sleeps = [0.0], [], []
+    class Models:
+        def generate_content(self, **kwargs):
+            calls.append(kwargs["model"])
+            if len(calls) <= len(provider._model_candidates()):
+                raise RuntimeError("429 RESOURCE_EXHAUSTED RPM")
+            return SimpleNamespace(text="ok")
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider.model, provider.rate_limit_fallback_models = "primary", ("fallback",)
+    provider._client = SimpleNamespace(models=Models())
+    monkeypatch.setattr("buzz.localization.providers.time.monotonic", lambda: now[0])
+    monkeypatch.setattr("buzz.localization.providers.time.sleep", sleep)
+    assert provider.translate("one", "en", "vi") == "ok"
+    assert calls == [*provider._model_candidates(), "primary"]
+    assert sleeps == [65.0]
+
+
+def test_gemini_all_rpd_models_raise_clear_error():
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider, LocalizationProviderError
+
+    def fail(**kwargs):
+        raise RuntimeError("429 RESOURCE_EXHAUSTED per day")
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider.model, provider.rate_limit_fallback_models = "primary", ("fallback",)
+    provider._client = SimpleNamespace(models=SimpleNamespace(generate_content=fail))
+    with pytest.raises(LocalizationProviderError, match="daily quota is exhausted"):
+        provider.translate("one", "en", "vi")
+
+
+def test_gemini_non_retryable_error_fails_immediately():
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    calls = []
+    def fail(**kwargs):
+        calls.append(kwargs["model"])
+        raise RuntimeError("400 INVALID_ARGUMENT")
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider.model, provider.rate_limit_fallback_models = "primary", ("fallback",)
+    provider._client = SimpleNamespace(models=SimpleNamespace(generate_content=fail))
+    with pytest.raises(Exception, match="INVALID_ARGUMENT"):
+        provider._generate_content_with_retry(contents="x")
+    assert calls == ["primary"]

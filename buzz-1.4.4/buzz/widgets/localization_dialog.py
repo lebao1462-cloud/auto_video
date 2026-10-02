@@ -117,7 +117,7 @@ class LocalizationWorker(QObject):
                     output_directory=self.output_directory,
                     use_background_separation=self.use_background_separation,
                     tts_voice=self.tts_voice,
-                    timing_policy=TimingPolicy(max_playback_rate=2.0),
+                    timing_policy=TimingPolicy(),
                     render_options=FinalRenderOptions(
                         subtitle_mode=self.subtitle_mode,
                         cover_original_subtitles=self.cover_original_subtitles,
@@ -207,7 +207,7 @@ class LocalizationDialog(QDialog):
             self._save_current_api_key
         )
         self.translation_model_edit = QLineEdit(
-            os.getenv("BUZZ_TRANSLATION_MODEL", "gemini-3.8-flash")
+            os.getenv("BUZZ_TRANSLATION_MODEL", "gemini-3.5-flash-lite")
         )
         self.translation_model_edit.editingFinished.connect(
             self._normalize_translation_model
@@ -401,7 +401,7 @@ class LocalizationDialog(QDialog):
             )
             if self.translation_model_edit.text().strip() in {"", "gpt-4o-mini"}:
                 self.translation_model_edit.setText(
-                    os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+                    os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
                 )
         else:
             self.translation_provider_status.setText(

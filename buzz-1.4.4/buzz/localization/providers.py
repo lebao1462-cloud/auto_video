@@ -21,10 +21,26 @@ from buzz.localization.tts import TTSRequest, TTSResult
 logger = logging.getLogger(__name__)
 
 GEMINI_MODEL_IDS = frozenset({
+    "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
+    "gemini-3.1-flash-lite",
     "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
     "gemini-3.8-flash",
 })
+
+DEFAULT_GEMINI_FALLBACK_MODELS = (
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+)
 
 
 class LocalizationProviderError(RuntimeError):
@@ -397,9 +413,12 @@ class NLLBTranslationProvider:
 @dataclass
 class GeminiTranslationProvider:
     api_key: str
-    model: str = "gemini-3.8-flash"
+    model: str = "gemini-3.5-flash-lite"
     timeout: float = 60.0
     rate_limit_fallback_models: tuple[str, ...] | None = None
+
+    _quota_cooldown_seconds = 65.0
+    _transient_retry_delays = (0, 5, 15)
 
     def __post_init__(self):
         if not self.api_key:
@@ -409,11 +428,13 @@ class GeminiTranslationProvider:
         self.model = normalize_gemini_model_name(self.model)
         configured_fallbacks = self.rate_limit_fallback_models
         if configured_fallbacks is None:
-            configured_fallbacks = tuple(filter(None, (
-                value.strip() for value in os.getenv(
-                    "BUZZ_GEMINI_429_FALLBACK_MODELS", "gemini-3.5-flash-lite"
-                ).split(",")
-            )))
+            # The 429-specific name remains supported for existing deployments.
+            configured = os.getenv("BUZZ_GEMINI_FALLBACK_MODELS")
+            if configured is None:
+                configured = os.getenv("BUZZ_GEMINI_429_FALLBACK_MODELS", "")
+            configured_fallbacks = tuple(
+                value.strip() for value in configured.split(",") if value.strip()
+            )
         normalized_fallbacks = tuple(
             normalize_gemini_model_name(value) for value in configured_fallbacks
         )
@@ -424,6 +445,8 @@ class GeminiTranslationProvider:
                 + ", ".join(sorted(unknown))
             )
         self.rate_limit_fallback_models = normalized_fallbacks
+        self._rpd_exhausted_models: set[str] = set()
+        self._rpm_cooldowns: dict[str, float] = {}
         try:
             from google import genai
             from google.genai import types as genai_types
@@ -438,44 +461,134 @@ class GeminiTranslationProvider:
             ),
         )
 
-    def _generate_content_with_retry(self, *, contents, config=None):
-        primary = getattr(self, "model", "gemini-3.8-flash")
-        last_error = None
+    def _model_candidates(self) -> tuple[str, ...]:
+        """Return selected, configured, then built-in models without duplicates."""
+        primary = getattr(self, "model", "gemini-3.5-flash-lite")
         fallbacks = getattr(self, "rate_limit_fallback_models", None)
         if fallbacks is None:
-            fallbacks = ("gemini-3.5-flash-lite",)
-        models = [primary]
-        retryable_failure = False
-        rate_limited = False
-        for model in models + [m for m in fallbacks if m != primary]:
-            if model != primary and not rate_limited:
-                break
-            for delay in (0, 5, 15):
-                if delay:
-                    time.sleep(delay)
-                try:
-                    kwargs = {"model": model, "contents": contents}
-                    if config is not None:
-                        kwargs["config"] = config
-                    response = self._client.models.generate_content(**kwargs)
-                    self.last_model_used = model
-                    return response
-                except Exception as exc:
-                    last_error = exc
-                    message = str(exc).upper()
-                    current_rate_limit = (
-                        "429" in message or "RESOURCE_EXHAUSTED" in message
+            fallbacks = DEFAULT_GEMINI_FALLBACK_MODELS
+        # Always retain the built-in chain, even when an environment or caller
+        # adds preferred fallbacks. The selected primary is always attempted first.
+        return tuple(dict.fromkeys((
+            primary, *fallbacks, *DEFAULT_GEMINI_FALLBACK_MODELS,
+        )))
+
+    def _generate_content_with_retry(self, *, contents, config=None):
+        """Generate content while sharing quota state across this provider session."""
+        models = self._model_candidates()
+        exhausted = getattr(self, "_rpd_exhausted_models", None)
+        if exhausted is None:
+            exhausted = self._rpd_exhausted_models = set()
+        cooldowns = getattr(self, "_rpm_cooldowns", None)
+        if cooldowns is None:
+            cooldowns = self._rpm_cooldowns = {}
+
+        last_error = None
+        transient_failed: set[str] = set()
+        while True:
+            now = time.monotonic()
+            eligible = [
+                model for model in models
+                if (model not in exhausted and model not in transient_failed
+                    and cooldowns.get(model, 0) <= now)
+            ]
+            if not eligible:
+                if all(model in exhausted for model in models):
+                    raise LocalizationProviderError(
+                        "Gemini daily quota is exhausted for every configured model. "
+                        "Try again after quota resets or configure another model."
                     )
-                    rate_limited = rate_limited or current_rate_limit
-                    retryable = current_rate_limit or any(token in message for token in (
-                        "503", "UNAVAILABLE", "TIMEOUT", "TIMED OUT", "CONNECTION",
-                    ))
-                    retryable_failure = retryable_failure or retryable
-                    if not retryable:
-                        raise
-            if not retryable_failure:
-                break
-        raise last_error
+                remaining = [
+                    model for model in models
+                    if model not in exhausted and model not in transient_failed
+                ]
+                if not remaining:
+                    if last_error is not None:
+                        raise last_error
+                    raise LocalizationProviderError("No Gemini models are available")
+                next_ready = min(cooldowns.get(model, now) for model in remaining)
+                wait_seconds = max(0.0, next_ready - now)
+                # A finite wait prevents a tight loop even if a clock is adjusted.
+                wait_seconds = min(wait_seconds, self._quota_cooldown_seconds)
+                logger.warning(
+                    "All available Gemini models are cooling down; waiting %.1f seconds",
+                    wait_seconds,
+                )
+                time.sleep(max(wait_seconds, 0.1))
+                continue
+
+            for model in eligible:
+                quota_limited = False
+                for delay in self._transient_retry_delays:
+                    if delay:
+                        time.sleep(delay)
+                    try:
+                        kwargs = {"model": model, "contents": contents}
+                        if config is not None:
+                            kwargs["config"] = config
+                        response = self._client.models.generate_content(**kwargs)
+                        self.last_model_used = model
+                        return response
+                    except Exception as exc:
+                        last_error = exc
+                        quota_kind = self._gemini_quota_kind(exc)
+                        if quota_kind == "rpd":
+                            exhausted.add(model)
+                            quota_limited = True
+                            logger.warning("Gemini model %s daily quota exhausted; switching models", model)
+                            break
+                        if quota_kind == "rpm":
+                            quota_limited = True
+                            cooldowns[model] = (
+                                time.monotonic() + self._quota_cooldown_seconds
+                            )
+                            logger.warning("Gemini model %s rate-limited; cooling down before retry", model)
+                            break
+                        if not self._is_gemini_transient_error(exc):
+                            raise
+                        if delay != self._transient_retry_delays[-1]:
+                            logger.warning("Gemini model %s transient failure; retrying", model)
+                if not quota_limited:
+                    transient_failed.add(model)
+                # Every model either succeeded, was switched, or exhausted retries.
+
+            if all(model in exhausted for model in models):
+                raise LocalizationProviderError(
+                    "Gemini daily quota is exhausted for every configured model. "
+                    "Try again after quota resets or configure another model."
+                )
+            if last_error is not None:
+                logger.warning("Gemini model attempts failed; trying another available model")
+
+    @staticmethod
+    def _gemini_quota_kind(exc: Exception) -> str | None:
+        """Return rpd/rpm for quota errors; unknown 429s are temporary RPM limits."""
+        message = str(exc).lower()
+        if "429" not in message and "resource_exhausted" not in message:
+            return None
+        compact_message = re.sub(r"[^a-z0-9]+", "", message)
+        daily_markers = (
+            "rpd", "per day", "per_day", "daily", "requestsperday",
+            "requests_per_day", "request_count_per_day",
+        )
+        minute_markers = (
+            "rpm", "per minute", "per_minute", "per-minute", "requestsperminute",
+            "requests_per_minute", "request_count_per_minute",
+        )
+        if any(re.sub(r"[^a-z0-9]+", "", marker) in compact_message
+               for marker in daily_markers):
+            return "rpd"
+        if any(re.sub(r"[^a-z0-9]+", "", marker) in compact_message
+               for marker in minute_markers):
+            return "rpm"
+        return "rpm"
+
+    @staticmethod
+    def _is_gemini_transient_error(exc: Exception) -> bool:
+        message = str(exc).upper()
+        return any(token in message for token in (
+            "503", "UNAVAILABLE", "TIMEOUT", "TIMED OUT", "CONNECTION",
+        ))
 
     def translate(
         self,
@@ -622,6 +735,114 @@ class GeminiTranslationProvider:
         if not isinstance(shortened, str) or not shortened.strip():
             raise LocalizationProviderError("Gemini returned empty shortened translation")
         return shortened.strip()
+
+    def shorten_translations(
+        self, *, segments, source_language: str, target_language: str,
+    ) -> list[str]:
+        """Shorten a batch of Vietnamese dubbing lines in one JSON request."""
+        if source_language not in {"en", "zh"} or target_language != "vi":
+            raise ValueError("Gemini shortening requires English/Chinese to Vietnamese")
+        if not segments:
+            return []
+        payload_segments = []
+        expected_ids = []
+        for item in segments:
+            identifier = item["id"]
+            if not isinstance(identifier, str) or not identifier or identifier in expected_ids:
+                raise ValueError("Batch shortening requires unique non-empty segment IDs")
+            source_text = item["source_text"]
+            translated_text = item["translated_text"]
+            required_rate = item["required_rate"]
+            max_playback_rate = item["max_playback_rate"]
+            if (not isinstance(source_text, str) or not source_text.strip()
+                    or not isinstance(translated_text, str) or not translated_text.strip()
+                    or not isinstance(required_rate, (int, float)) or required_rate <= 0
+                    or not isinstance(max_playback_rate, (int, float))
+                    or max_playback_rate <= 0):
+                raise ValueError("Batch shortening received an invalid segment")
+            expected_ids.append(identifier)
+            payload_segments.append({
+                "id": identifier,
+                "source_text": source_text.strip(),
+                "current_vietnamese": translated_text.strip(),
+                "required_rate": required_rate,
+                "max_playback_rate": max_playback_rate,
+                "target_length_ratio": max_playback_rate / required_rate,
+                "target_word_count": max(3, int(len(translated_text.split()) * (max_playback_rate / required_rate) * 0.72)),
+            })
+        prompt = (
+            "Rewrite each Vietnamese dubbing line to fit its timing target. Preserve "
+            "the complete meaning, names, numbers, units, negation, and key details. "
+            "Use concise natural spoken Vietnamese; do not add commentary or drop, "
+            "combine, reorder, or split entries. Respect each entry target_word_count "
+            "as a hard maximum whenever possible. Return JSON only: an object with a "
+            "'segments' array, each containing its unchanged 'id' and non-empty "
+            "'shortened_text'. Input JSON:\n"
+            + json.dumps({"source_language": source_language, "segments": payload_segments},
+                         ensure_ascii=False)
+        )
+        validation_error = None
+        for validation_attempt in range(2):
+            request_prompt = prompt
+            if validation_attempt:
+                request_prompt += (
+                    "\nSTRICT RETRY: Copy every input id exactly once. Do not invent, "
+                    "omit, duplicate, rename, reorder, or alter any id."
+                )
+            try:
+                response = self._generate_content_with_retry(
+                    contents=request_prompt,
+                    config={"response_mime_type": "application/json"},
+                )
+            except Exception as exc:
+                raise LocalizationProviderError(
+                    f"Gemini batch translation shortening failed: {exc}"
+                ) from exc
+            try:
+                items = json.loads(response.text)["segments"]
+                if not isinstance(items, list) or len(items) != len(expected_ids):
+                    raise ValueError("wrong number of shortened segments")
+                by_id = {}
+                for item in items:
+                    identifier = item["id"]
+                    shortened = item["shortened_text"]
+                    if identifier in by_id or identifier not in expected_ids:
+                        raise ValueError("duplicate or invalid segment ID")
+                    if not isinstance(shortened, str) or not shortened.strip():
+                        raise ValueError("empty shortened translation")
+                    by_id[identifier] = shortened.strip()
+                if set(by_id) != set(expected_ids):
+                    raise ValueError("missing or unexpected segment ID")
+                return [by_id[identifier] for identifier in expected_ids]
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                validation_error = exc
+                if validation_attempt == 0:
+                    logger.warning(
+                        "Gemini batch shortening returned invalid structured output; retrying once"
+                    )
+
+        if len(segments) > 1:
+            midpoint = len(segments) // 2
+            logger.warning(
+                "Gemini batch shortening output remained invalid; splitting batch %d -> %d + %d",
+                len(segments), midpoint, len(segments) - midpoint,
+            )
+            return (
+                self.shorten_translations(
+                    segments=segments[:midpoint],
+                    source_language=source_language,
+                    target_language=target_language,
+                )
+                + self.shorten_translations(
+                    segments=segments[midpoint:],
+                    source_language=source_language,
+                    target_language=target_language,
+                )
+            )
+        raise LocalizationProviderError(
+            f"Gemini batch translation shortening failed: {validation_error}"
+        ) from validation_error
+
 
 
 @dataclass

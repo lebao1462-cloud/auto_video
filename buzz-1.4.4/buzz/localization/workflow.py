@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -17,6 +18,7 @@ from buzz.localization.subtitles import SubtitleOptions, SubtitleResult, write_s
 from buzz.localization.timing import (
     TimingPolicy,
     TimingSynchronizationError,
+    _MAX_PLAYBACK_RATE_RELATIVE_TOLERANCE,
     synchronize_for_localization,
 )
 from buzz.localization.transcript import LocalizationTranscript, transcribe_for_localization
@@ -70,7 +72,7 @@ class LocalizationWorkflowOptions:
     tts_voice: str | None = None
     tts_options: Mapping[str, object] = field(default_factory=dict)
     timing_policy: TimingPolicy = field(default_factory=TimingPolicy)
-    timing_recovery_attempts: int = 2
+    timing_recovery_attempts: int = 4
     audio_options: AudioMixingOptions = field(default_factory=AudioMixingOptions)
     subtitle_options: SubtitleOptions = field(default_factory=SubtitleOptions)
     render_options: FinalRenderOptions = field(default_factory=FinalRenderOptions)
@@ -111,19 +113,77 @@ def _synchronize_with_translation_recovery(
 ):
     current = synthesized
     attempts_by_segment: dict[int, int] = {}
+
+    def overflows():
+        """Find every rate overflow using the synchronizer's natural-gap rules."""
+        failures = []
+        for index, segment in enumerate(current.segments):
+            next_start = (
+                float(current.segments[index + 1].start)
+                if index + 1 < len(current.segments) else float(segment.end)
+            )
+            available_duration = next_start - float(segment.start)
+            required_rate = float(segment.audio_duration) / available_duration
+            tolerated_max_rate = options.timing_policy.max_playback_rate * (
+                1.0 + _MAX_PLAYBACK_RATE_RELATIVE_TOLERANCE
+            )
+            if required_rate > tolerated_max_rate:
+                failures.append((index, required_rate))
+        return failures
+
+    def regenerate(segment, shortened: str):
+        result = synthesize_segment(TTSRequest(
+            text=shortened,
+            language=synthesized.target_language,
+            output_file_stem=str(Path(segment.audio_file).with_suffix("")),
+            voice=options.tts_voice,
+            options=dict(options.tts_options),
+        ), tts_provider)
+        if (not isinstance(result, TTSResult)
+                or not isinstance(result.audio_file, str)
+                or not result.audio_file
+                or not Path(result.audio_file).is_file()
+                or not isinstance(result.audio_duration, (int, float))
+                or isinstance(result.audio_duration, bool)
+                or result.audio_duration <= 0
+                or not isinstance(result.provider, str)
+                or not result.provider.strip()):
+            raise ValueError("TTS provider returned an invalid recovery response")
+        replacement = replace(
+            segment, translated_text=shortened, audio_file=result.audio_file,
+            audio_duration=float(result.audio_duration), provider=result.provider,
+            voice=result.voice, provider_metadata=dict(result.metadata),
+        )
+        return replacement
+
+    # Respect provider concurrency while keeping undeclared/serial providers safe.
+    # EdgeTTSProvider declares max_concurrency=1 because parallel requests can
+    # trigger repeated NoAudioReceived/WebSocket failures.
+    declared_concurrency = getattr(tts_provider, "max_concurrency", None)
+    if (
+        isinstance(declared_concurrency, bool)
+        or not isinstance(declared_concurrency, int)
+        or declared_concurrency < 1
+    ):
+        recovery_tts_workers = 1
+    else:
+        recovery_tts_workers = min(declared_concurrency, 5)
+
     while True:
         try:
             return synchronize_for_localization(current, options.timing_policy)
         except TimingSynchronizationError as exc:
+            failures = overflows() if exc.segment_index is not None else []
             index = exc.segment_index
             shorten = getattr(translation_provider, "shorten_translation", None)
+            batch_shorten = getattr(translation_provider, "shorten_translations", None)
             attempts = attempts_by_segment.get(index, 0) if index is not None else 0
-            if (index is None or exc.required_rate is None
-                    or not callable(shorten)
-                    or attempts >= options.timing_recovery_attempts):
+            if (not failures or (not callable(batch_shorten) and not callable(shorten))
+                    or any(attempts_by_segment.get(item_index, 0) >= options.timing_recovery_attempts
+                           for item_index, _ in failures)):
                 detail = (
                     f" after {attempts} concise-translation retries"
-                    if callable(shorten) and index is not None else
+                    if (callable(batch_shorten) or callable(shorten)) and index is not None else
                     "; the active translation provider cannot shorten individual segments"
                 )
                 raise TimingSynchronizationError(
@@ -134,47 +194,54 @@ def _synchronize_with_translation_recovery(
                     max_playback_rate=exc.max_playback_rate,
                 ) from exc
 
-            segment = current.segments[index]
-            shortened = shorten(
-                source_text=segment.source_text,
-                translated_text=segment.translated_text,
-                source_language=current.source_language,
-                target_language=current.target_language,
-                required_rate=exc.required_rate,
-                max_playback_rate=options.timing_policy.max_playback_rate,
-            )
-            if not isinstance(shortened, str) or not shortened.strip():
-                raise ValueError("Translation provider returned an invalid shortened segment")
-            result = synthesize_segment(TTSRequest(
-                text=shortened.strip(),
-                language=current.target_language,
-                output_file_stem=str(Path(segment.audio_file).with_suffix("")),
-                voice=options.tts_voice,
-                options=dict(options.tts_options),
-            ), tts_provider)
-            if (not isinstance(result, TTSResult)
-                    or not isinstance(result.audio_file, str)
-                    or not result.audio_file
-                    or not Path(result.audio_file).is_file()
-                    or not isinstance(result.audio_duration, (int, float))
-                    or isinstance(result.audio_duration, bool)
-                    or result.audio_duration <= 0
-                    or not isinstance(result.provider, str)
-                    or not result.provider.strip()):
-                raise ValueError("TTS provider returned an invalid recovery response")
-            replacement = replace(
-                segment,
-                translated_text=shortened.strip(),
-                audio_file=result.audio_file,
-                audio_duration=float(result.audio_duration),
-                provider=result.provider,
-                voice=result.voice,
-                provider_metadata=dict(result.metadata),
-            )
-            segments = list(current.segments)
-            segments[index] = replacement
-            current = replace(current, segments=tuple(segments))
-            attempts_by_segment[index] = attempts + 1
+            for start in range(0, len(failures), 30):
+                batch = failures[start:start + 30]
+                if callable(batch_shorten):
+                    requests = [
+                        {"id": f"segment-{item_index:06d}",
+                         "source_text": current.segments[item_index].source_text,
+                         "translated_text": current.segments[item_index].translated_text,
+                         "required_rate": required_rate,
+                         "max_playback_rate": options.timing_policy.max_playback_rate}
+                        for item_index, required_rate in batch
+                    ]
+                    shortened_items = batch_shorten(
+                        segments=requests, source_language=current.source_language,
+                        target_language=current.target_language,
+                    )
+                    if not isinstance(shortened_items, (list, tuple)) or len(shortened_items) != len(batch):
+                        raise ValueError("Translation provider returned an invalid shortened batch")
+                else:
+                    shortened_items = [shorten(
+                        source_text=current.segments[item_index].source_text,
+                        translated_text=current.segments[item_index].translated_text,
+                        source_language=current.source_language,
+                        target_language=current.target_language,
+                        required_rate=required_rate,
+                        max_playback_rate=options.timing_policy.max_playback_rate,
+                    ) for item_index, required_rate in batch]
+                replacements = []
+                jobs = []
+                for (item_index, _), shortened in zip(batch, shortened_items):
+                    if not isinstance(shortened, str) or not shortened.strip():
+                        raise ValueError("Translation provider returned an invalid shortened segment")
+                    jobs.append((item_index, current.segments[item_index], shortened.strip()))
+
+                with ThreadPoolExecutor(max_workers=recovery_tts_workers) as executor:
+                    futures = [
+                        (item_index, executor.submit(regenerate, segment, shortened))
+                        for item_index, segment, shortened in jobs
+                    ]
+                    replacements = [
+                        (item_index, future.result())
+                        for item_index, future in futures
+                    ]
+
+                segments = list(current.segments)
+                for item_index, replacement in replacements:
+                    segments[item_index] = replacement
+                    attempts_by_segment[item_index] = attempts_by_segment.get(item_index, 0) + 1
+                current = replace(current, segments=tuple(segments))
 
 
 def _localize_single_video(

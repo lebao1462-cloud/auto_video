@@ -34,6 +34,16 @@ class ConciseTranslationProvider(Protocol):
         ...
 
 
+class BatchConciseTranslationProvider(Protocol):
+    """Optional capability for shortening several dubbing lines in one request."""
+
+    def shorten_translations(
+        self, *, segments, source_language: str, target_language: str,
+    ) -> list[str]:
+        """Return non-empty shortened text in the same order as ``segments``."""
+        ...
+
+
 @dataclass(frozen=True)
 class TranslatedLocalizationSegment:
     start: float

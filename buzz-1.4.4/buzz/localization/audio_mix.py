@@ -381,7 +381,13 @@ def mix_localized_audio(
                 f"Background audio file does not exist: {background_audio_file}"
             )
 
-    last_segment_end = max(float(segment.end) for segment in transcript.segments)
+    # slot_duration may intentionally extend beyond a subtitle end when timing
+    # borrowed the following silent gap.  Never trim that speech at either mix
+    # level.
+    last_segment_end = max(
+        max(float(segment.end), float(segment.start) + float(segment.slot_duration))
+        for segment in transcript.segments
+    )
     if target_duration is None:
         final_duration = last_segment_end
     else:
@@ -463,7 +469,10 @@ def mix_localized_audio(
             # Use millisecond-aligned batch origins so splitting the delay over
             # multiple stages cannot introduce an extra rounding millisecond.
             origin = min(round(float(segment.start) * 1000) for segment in batch) / 1000
-            end = max(float(segment.end) for segment in batch)
+            end = max(
+                max(float(segment.end), float(segment.start) + float(segment.slot_duration))
+                for segment in batch
+            )
             duration = end - origin
             filters: list[str] = []
             labels: list[str] = []

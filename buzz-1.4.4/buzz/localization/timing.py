@@ -33,8 +33,8 @@ class TimingSynchronizationError(ValueError):
 class TimingPolicy:
     """Limits for natural speech-rate adjustment during localization timing."""
 
-    min_playback_rate: float = 0.90
-    max_playback_rate: float = 1.25
+    min_playback_rate: float = 0.97
+    max_playback_rate: float = 1.10
 
     def __post_init__(self):
         if not 0 < self.min_playback_rate <= 1:
@@ -138,48 +138,69 @@ def synchronize_for_localization(
         raise TypeError("policy must be a TimingPolicy")
 
     previous_end = None
-    timed_segments = []
-
-    for index, segment in enumerate(transcript.segments):
+    for segment in transcript.segments:
         previous_end = _validate_segment(segment, previous_end)
 
-        slot_duration = float(segment.end - segment.start)
+    timed_segments = []
+    for index, segment in enumerate(transcript.segments):
+
+        source_slot_duration = float(segment.end - segment.start)
+        next_start = (
+            float(transcript.segments[index + 1].start)
+            if index + 1 < len(transcript.segments)
+            else float(segment.end)
+        )
+        # Borrow only the silent gap immediately following this subtitle.  The
+        # subtitle timestamps remain immutable; this is an audio-mix extent.
+        available_duration = next_start - float(segment.start)
+        slot_duration = source_slot_duration
         audio_duration = float(segment.audio_duration)
-        required_rate = audio_duration / slot_duration
+        required_rate = audio_duration / source_slot_duration
 
         if abs(required_rate - 1.0) < 1e-9:
             playback_rate = 1.0
-            adjusted_duration = slot_duration
+            adjusted_duration = source_slot_duration
             trailing_padding = 0.0
             action = "none"
         elif required_rate < 1.0:
             if required_rate >= timing_policy.min_playback_rate:
                 playback_rate = required_rate
-                adjusted_duration = slot_duration
+                adjusted_duration = source_slot_duration
                 trailing_padding = 0.0
                 action = "slow_down"
             else:
                 playback_rate = 1.0
                 adjusted_duration = audio_duration
-                trailing_padding = slot_duration - adjusted_duration
+                trailing_padding = source_slot_duration - adjusted_duration
                 action = "pad_silence"
         else:
-            tolerated_max_rate = timing_policy.max_playback_rate * (
-                1.0 + _MAX_PLAYBACK_RATE_RELATIVE_TOLERANCE
-            )
-            if required_rate > tolerated_max_rate:
-                raise TimingSynchronizationError(
-                    "Segment "
-                    f"{index} requires playback rate {required_rate:.3f}, "
-                    f"above maximum {timing_policy.max_playback_rate:.3f}",
-                    segment_index=index,
-                    required_rate=required_rate,
-                    max_playback_rate=timing_policy.max_playback_rate,
+            # Natural speech takes precedence: use the following silent gap at
+            # normal speed before applying any tempo adjustment.
+            if audio_duration <= available_duration:
+                playback_rate = 1.0
+                adjusted_duration = audio_duration
+                slot_duration = audio_duration
+                trailing_padding = 0.0
+                action = "borrow_gap"
+            else:
+                required_rate = audio_duration / available_duration
+                tolerated_max_rate = timing_policy.max_playback_rate * (
+                    1.0 + _MAX_PLAYBACK_RATE_RELATIVE_TOLERANCE
                 )
-            playback_rate = min(required_rate, timing_policy.max_playback_rate)
-            adjusted_duration = slot_duration
-            trailing_padding = 0.0
-            action = "speed_up"
+                if required_rate > tolerated_max_rate:
+                    raise TimingSynchronizationError(
+                        "Segment "
+                        f"{index} requires playback rate {required_rate:.3f}, "
+                        f"above maximum {timing_policy.max_playback_rate:.3f}",
+                        segment_index=index,
+                        required_rate=required_rate,
+                        max_playback_rate=timing_policy.max_playback_rate,
+                    )
+                playback_rate = min(required_rate, timing_policy.max_playback_rate)
+                slot_duration = available_duration
+                adjusted_duration = available_duration
+                trailing_padding = 0.0
+                action = "speed_up"
 
         timed_segments.append(
             TimedLocalizationSegment(

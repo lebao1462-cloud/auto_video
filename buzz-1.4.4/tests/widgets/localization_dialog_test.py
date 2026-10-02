@@ -2,6 +2,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 from buzz.store.keyring_store import Key
+from buzz.localization.timing import TimingPolicy
 from buzz.widgets.localization_dialog import LocalizationDialog, LocalizationWorker
 
 
@@ -21,6 +22,7 @@ def test_localization_dialog_has_expected_defaults(qtbot, monkeypatch, tmp_path)
     assert dialog.subtitle_mode_combo.itemData(2) == "none"
     assert dialog.language_combo.itemData(0) is None
     assert dialog.language_combo.itemData(1) == "zh"
+    assert dialog.translation_model_edit.text() == "gemini-3.5-flash-lite"
     assert dialog.asr_provider_label.text() == "Paraformer-zh - Chinese / Offline / Recommended"
     assert "Chinese only" in dialog.asr_provider_status.text()
 
@@ -152,7 +154,7 @@ def test_worker_always_uses_paraformer_timing_policy(monkeypatch):
     args, kwargs = calls[0]
     assert kwargs["asr_provider"] == "paraformer-zh"
     assert args[2] == ""
-    assert args[5].timing_policy.max_playback_rate == 2.0
+    assert args[5].timing_policy == TimingPolicy()
 
 
 def test_gemini_provider_shows_key_and_model_but_hides_base_url(qtbot, monkeypatch):

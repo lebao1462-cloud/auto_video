@@ -1,6 +1,7 @@
 from pathlib import Path
 import subprocess
 import threading
+import time
 import wave
 
 import pytest
@@ -94,10 +95,104 @@ class RecoveryTTSProvider:
         )
 
 
+class ConcurrentRecoveryTTSProvider:
+    max_concurrency = 3
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+        self.requests = []
+
+    def synthesize(self, request):
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.requests.append(request)
+        try:
+            time.sleep(0.1)
+            output = Path(request.output_file_stem + ".wav")
+            output.write_bytes(request.text.encode())
+            return TTSResult(
+                audio_file=str(output), audio_duration=1.05, provider="fake",
+                voice=request.voice, metadata={"text": request.text},
+            )
+        finally:
+            with self._lock:
+                self.active -= 1
+
+
+def test_timing_recovery_regenerates_batch_concurrently_and_applies_by_segment_index(tmp_path):
+    class BatchProvider:
+        def shorten_translations(self, **kwargs):
+            return [f"short-{item['id']}" for item in kwargs["segments"]]
+
+    tts = ConcurrentRecoveryTTSProvider()
+    timed = _synchronize_with_translation_recovery(
+        _synthesized_for_recovery(tmp_path, durations=(2.0, 2.0, 1.0)),
+        BatchProvider(), tts,
+        LocalizationWorkflowOptions(output_directory=str(tmp_path), timing_policy=TimingPolicy()),
+    )
+
+    assert tts.max_active > 1
+    assert [segment.translated_text for segment in timed.segments] == [
+        "short-segment-000000", "short-segment-000001", "translation 2",
+    ]
+    assert [segment.provider_metadata for segment in timed.segments[:2]] == [
+        {"text": "short-segment-000000"}, {"text": "short-segment-000001"},
+    ]
+
+
+def test_timing_recovery_tts_is_serial_without_declared_max_concurrency(tmp_path):
+    class BatchProvider:
+        def shorten_translations(self, **kwargs):
+            return [f"short-{item['id']}" for item in kwargs["segments"]]
+
+    class SerialRecoveryTTSProvider:
+        __init__ = ConcurrentRecoveryTTSProvider.__init__
+        synthesize = ConcurrentRecoveryTTSProvider.synthesize
+
+    tts = SerialRecoveryTTSProvider()
+    _synchronize_with_translation_recovery(
+        _synthesized_for_recovery(tmp_path, durations=(2.0, 2.0, 1.0)),
+        BatchProvider(), tts,
+        LocalizationWorkflowOptions(output_directory=str(tmp_path), timing_policy=TimingPolicy()),
+    )
+
+    assert tts.max_active == 1
+
+
+def test_timing_recovery_batches_current_failures_and_retries_only_remaining(tmp_path):
+    class BatchProvider:
+        def __init__(self):
+            self.calls = []
+
+        def shorten_translations(self, **kwargs):
+            self.calls.append(kwargs["segments"])
+            return [f"ngan {item['id']} lan {len(self.calls)}"
+                    for item in kwargs["segments"]]
+
+    provider = BatchProvider()
+    tts = RecoveryTTSProvider([1.05, 2.0, 1.05])
+    timed = _synchronize_with_translation_recovery(
+        _synthesized_for_recovery(tmp_path, durations=(2.0, 2.0, 1.0)), provider, tts,
+        LocalizationWorkflowOptions(output_directory=str(tmp_path), timing_policy=TimingPolicy()),
+    )
+
+    assert [[item["id"] for item in batch] for batch in provider.calls] == [
+        ["segment-000000", "segment-000001"], ["segment-000001"],
+    ]
+    assert [request.output_file_stem.rsplit("-", 1)[-1] for request in tts.requests] == [
+        "000000", "000001", "000001",
+    ]
+    assert timed.segments[2].translated_text == "translation 2"
+    assert max(segment.playback_rate for segment in timed.segments) <= 1.10
+
+
 def test_timing_recovery_shortens_and_regenerates_only_failing_segment(tmp_path):
     original = _synthesized_for_recovery(tmp_path)
     translator = ShorteningProvider()
-    tts = RecoveryTTSProvider([1.8])
+    tts = RecoveryTTSProvider([1.05])
     seed_provider = RecoveryTTSProvider([1.0])
     synthesize_segment(TTSRequest(
         text=original.segments[0].translated_text,
@@ -112,7 +207,7 @@ def test_timing_recovery_shortens_and_regenerates_only_failing_segment(tmp_path)
         original, translator, tts,
         LocalizationWorkflowOptions(
             output_directory=str(tmp_path),
-            timing_policy=TimingPolicy(max_playback_rate=2.0),
+            timing_policy=TimingPolicy(),
         ),
     )
 
@@ -123,7 +218,7 @@ def test_timing_recovery_shortens_and_regenerates_only_failing_segment(tmp_path)
     assert timed.segments[0].translated_text == "translation 0"
     assert timed.segments[0].audio_file == original.segments[0].audio_file
     assert timed.segments[1].translated_text == "bản dịch ngắn"
-    assert timed.segments[1].playback_rate == pytest.approx(1.8)
+    assert timed.segments[1].playback_rate == pytest.approx(1.05)
     assert unaffected_checkpoint.read_bytes() == unaffected_contents
     assert (tmp_path / "segment-000001.localization-tts.json").is_file()
 
@@ -145,7 +240,7 @@ def test_timing_recovery_is_bounded_and_reports_final_failure(tmp_path):
             _synthesized_for_recovery(tmp_path), translator, tts,
             LocalizationWorkflowOptions(
                 output_directory=str(tmp_path),
-                timing_policy=TimingPolicy(max_playback_rate=2.0),
+                timing_policy=TimingPolicy(),
                 timing_recovery_attempts=2,
             ),
         )
@@ -157,15 +252,15 @@ def test_timing_recovery_is_bounded_and_reports_final_failure(tmp_path):
 def test_timing_recovery_never_exceeds_hard_playback_rate_ceiling(tmp_path):
     timed = _synchronize_with_translation_recovery(
         _synthesized_for_recovery(tmp_path), ShorteningProvider(),
-        RecoveryTTSProvider([2.005]),
+        RecoveryTTSProvider([1.105]),
         LocalizationWorkflowOptions(
             output_directory=str(tmp_path),
-            timing_policy=TimingPolicy(max_playback_rate=2.0),
+            timing_policy=TimingPolicy(),
         ),
     )
 
-    assert timed.segments[1].playback_rate == 2.0
-    assert max(segment.playback_rate for segment in timed.segments) <= 2.0
+    assert timed.segments[1].playback_rate == 1.10
+    assert max(segment.playback_rate for segment in timed.segments) <= 1.10
 
 
 def create_test_video(path: Path, duration: int = 2):
@@ -701,3 +796,7 @@ def test_chunked_vtt_merges_with_absolute_offsets(tmp_path):
     assert _merge_subtitles([(first, 0), (second, 900)], final, "vtt") == 2
     text = final.read_text(encoding="utf-8")
     assert "00:15:00.200 --> 00:15:01.200" in text
+
+
+def test_natural_timing_defaults_to_four_recovery_attempts(tmp_path):
+    assert LocalizationWorkflowOptions(output_directory=str(tmp_path)).timing_recovery_attempts == 4

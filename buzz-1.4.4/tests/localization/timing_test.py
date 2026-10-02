@@ -54,14 +54,19 @@ def test_exact_duration_requires_no_adjustment():
     assert segment.trailing_padding == pytest.approx(0.0)
 
 
+def test_default_policy_uses_natural_speech_bounds():
+    assert TimingPolicy().min_playback_rate == pytest.approx(0.97)
+    assert TimingPolicy().max_playback_rate == pytest.approx(1.10)
+
+
 def test_slightly_short_audio_is_slowed_within_policy():
     result = synchronize_for_localization(
-        make_transcript([make_segment(end=2.0, audio_duration=1.9)])
+        make_transcript([make_segment(end=2.0, audio_duration=1.95)])
     )
 
     segment = result.segments[0]
     assert segment.timing_action == "slow_down"
-    assert segment.playback_rate == pytest.approx(0.95)
+    assert segment.playback_rate == pytest.approx(0.975)
     assert segment.adjusted_audio_duration == pytest.approx(2.0)
     assert segment.trailing_padding == pytest.approx(0.0)
 
@@ -79,22 +84,40 @@ def test_much_shorter_audio_uses_silence_padding():
     assert segment.leading_padding == pytest.approx(0.0)
 
 
-def test_slightly_long_audio_is_sped_up_within_policy():
-    result = synchronize_for_localization(
-        make_transcript([make_segment(end=2.0, audio_duration=2.4)])
-    )
+def test_long_audio_borrows_following_silent_gap_at_natural_rate():
+    result = synchronize_for_localization(make_transcript([
+        make_segment(start=0.0, end=2.0, audio_duration=2.4),
+        make_segment(start=3.0, end=4.0, audio_duration=1.0),
+    ]))
 
     segment = result.segments[0]
-    assert segment.timing_action == "speed_up"
-    assert segment.playback_rate == pytest.approx(1.2)
-    assert segment.adjusted_audio_duration == pytest.approx(2.0)
+    assert segment.timing_action == "borrow_gap"
+    assert segment.playback_rate == pytest.approx(1.0)
+    assert segment.slot_duration == pytest.approx(2.4)
+    assert segment.adjusted_audio_duration == pytest.approx(2.4)
+    assert segment.end == pytest.approx(2.0)
     assert segment.trailing_padding == pytest.approx(0.0)
 
 
-def test_much_longer_audio_is_rejected_instead_of_overcompressed():
+def test_long_audio_uses_smallest_speed_up_after_borrowing_gap():
+    result = synchronize_for_localization(make_transcript([
+        make_segment(start=0.0, end=2.0, audio_duration=3.2),
+        make_segment(start=3.0, end=4.0, audio_duration=1.0),
+    ]))
+
+    segment = result.segments[0]
+    assert segment.playback_rate == pytest.approx(3.2 / 3.0)
+    assert segment.slot_duration == pytest.approx(3.0)
+    assert segment.timing_action == "speed_up"
+
+
+def test_long_audio_exceeding_borrowed_gap_cap_is_rejected():
     with pytest.raises(TimingSynchronizationError, match="above maximum"):
         synchronize_for_localization(
-            make_transcript([make_segment(end=2.0, audio_duration=3.2)])
+            make_transcript([
+                make_segment(start=0.0, end=2.0, audio_duration=3.4),
+                make_segment(start=3.0, end=4.0, audio_duration=1.0),
+            ])
         )
 
 
