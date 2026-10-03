@@ -1,4 +1,8 @@
 from pathlib import Path
+import sys
+import threading
+import time
+from types import SimpleNamespace
 import unicodedata
 
 import pytest
@@ -9,6 +13,7 @@ from buzz.localization.paraformer import (
     _token_items,
     paraformer_model_is_cached,
     paraformer_model_paths,
+    reset_paraformer_model_cache,
 )
 
 
@@ -93,3 +98,58 @@ def test_cache_requires_punctuation_model(tmp_path: Path):
     expected.mkdir(parents=True)
     assert paraformer_model_is_cached(tmp_path)
     assert paraformer_model_paths(tmp_path)["punc"] == str(expected)
+
+
+def test_frozen_app_prefers_bundled_modelscope_cache(monkeypatch, tmp_path: Path):
+    from buzz.localization import paraformer
+
+    app_dir = tmp_path / "AutoVideo"
+    bundled = app_dir / "modelscope-cache"
+    (bundled / "models").mkdir(parents=True)
+    monkeypatch.delenv("MODELSCOPE_CACHE", raising=False)
+    monkeypatch.setattr(paraformer.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(paraformer.sys, "executable", str(app_dir / "AutoVideo.exe"))
+
+    assert paraformer.modelscope_cache_path() == bundled
+
+
+def test_shared_model_is_constructed_once_and_generate_is_serialized(monkeypatch, tmp_path: Path):
+    from buzz.localization import paraformer
+
+    reset_paraformer_model_cache()
+    calls = []
+    active = maximum = 0
+    lock = threading.Lock()
+
+    class FakeModel:
+        def generate(self, **kwargs):
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            try:
+                time.sleep(0.04)
+                return [{"raw_text": "你 好", "text": "你好", "timestamp": [[0, 200], [200, 400]]}]
+            finally:
+                with lock:
+                    active -= 1
+
+    def build(*args, **kwargs):
+        calls.append((args, kwargs))
+        return FakeModel()
+
+    monkeypatch.setitem(sys.modules, "funasr", SimpleNamespace(AutoModel=build))
+    monkeypatch.setattr(paraformer, "paraformer_runtime_available", lambda: True)
+    monkeypatch.setattr(paraformer, "configure_modelscope_cache", lambda: tmp_path)
+    monkeypatch.setattr(paraformer, "extract_audio_track", lambda source, output, **kwargs: Path(output).write_bytes(b"wav"))
+    videos = [tmp_path / f"video-{index}.mp4" for index in range(2)]
+    for video in videos:
+        video.write_bytes(b"video")
+    threads = [threading.Thread(target=paraformer.transcribe_with_paraformer, args=(str(video),)) for video in videos]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(calls) == 1
+    assert maximum == 1
+    reset_paraformer_model_cache()

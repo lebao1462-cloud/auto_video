@@ -1,4 +1,5 @@
 from pathlib import Path
+import asyncio
 from contextlib import nullcontext
 import json
 import sys
@@ -300,6 +301,26 @@ def test_edge_tts_rejects_empty_text(tmp_path):
         )
 
 
+@pytest.mark.parametrize("text", ["...", "??????", "???"])
+def test_edge_tts_rejects_non_speakable_text_before_calling_edge(monkeypatch, tmp_path, text):
+    calls, _, _ = _install_fake_edge_tts(monkeypatch)
+
+    with pytest.raises(ValueError, match="at least one letter or number"):
+        EdgeTTSProvider().synthesize(TTSRequest(text, "vi", str(tmp_path / "speech")))
+
+    assert calls == []
+
+
+def test_edge_tts_accepts_speakable_text_with_punctuation(monkeypatch, tmp_path):
+    calls, _, _ = _install_fake_edge_tts(monkeypatch)
+    monkeypatch.setattr("buzz.localization.providers._trim_edge_tts_silence", lambda path: None)
+    monkeypatch.setattr("buzz.localization.providers._probe_audio_duration", lambda path: 1.0)
+
+    EdgeTTSProvider().synthesize(TTSRequest("18 gi???", "vi", str(tmp_path / "speech")))
+
+    assert len(calls) == 1
+
+
 def _install_fake_edge_tts(monkeypatch, save_behavior=None):
     """Install a no-network Edge TTS module and return its save-call list."""
     calls = []
@@ -316,10 +337,13 @@ def _install_fake_edge_tts(monkeypatch, save_behavior=None):
             self.voice = voice
             self.options = options
 
-        def save_sync(self, output_file):
+        async def save(self, output_file):
             calls.append((self.text, self.voice, self.options, output_file))
             if save_behavior:
-                return save_behavior(output_file)
+                result = save_behavior(output_file)
+                if hasattr(result, "__await__"):
+                    return await result
+                return result
             Path(output_file).write_bytes(b"fake mp3")
 
     edge_module = ModuleType("edge_tts")
@@ -418,6 +442,110 @@ def test_edge_tts_transient_retries_are_extended_and_finite(monkeypatch, tmp_pat
     assert len(calls) == 8
     assert sleeps == [5, 10, 20, 40, 60, 90, 120]
     assert not (tmp_path / "segment.mp3").exists()
+
+
+def test_edge_tts_attempt_timeout_retries_then_succeeds(monkeypatch, tmp_path):
+    async def hang_then_succeed(output_file):
+        if len(calls) == 1:
+            Path(output_file).write_bytes(b"")
+            await asyncio.Event().wait()
+        Path(output_file).write_bytes(b"fake mp3")
+
+    calls, _, _ = _install_fake_edge_tts(monkeypatch, hang_then_succeed)
+    sleeps = []
+    monkeypatch.setattr("buzz.localization.providers.EDGE_TTS_ATTEMPT_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr("buzz.localization.providers.time.sleep", sleeps.append)
+    monkeypatch.setattr("buzz.localization.providers._trim_edge_tts_silence", lambda path: None)
+    monkeypatch.setattr("buzz.localization.providers._probe_audio_duration", lambda path: 1.0)
+
+    result = EdgeTTSProvider(retry_delays=(0,)).synthesize(
+        TTSRequest("Xin chao", "vi", str(tmp_path / "segment"))
+    )
+
+    assert len(calls) == 2
+    assert sleeps == [0]
+    assert calls[0][2]["connect_timeout"] == 10
+    assert calls[0][2]["receive_timeout"] == 60
+    assert Path(result.audio_file).is_file()
+    assert Path(result.audio_file).stat().st_size > 0
+
+
+def test_edge_tts_attempt_timeouts_fail_finitely_and_remove_partial_output(
+    monkeypatch, tmp_path, caplog
+):
+    async def hang(output_file):
+        Path(output_file).write_bytes(b"partial")
+        await asyncio.Event().wait()
+
+    calls, _, _ = _install_fake_edge_tts(monkeypatch, hang)
+    monkeypatch.setattr("buzz.localization.providers.EDGE_TTS_ATTEMPT_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr("buzz.localization.providers.time.sleep", lambda delay: None)
+
+    with pytest.raises(LocalizationProviderError, match="after 2 attempts: TimeoutError"):
+        EdgeTTSProvider(retry_delays=(0,)).synthesize(
+            TTSRequest("Xin chao", "vi", str(tmp_path / "segment"))
+        )
+
+    assert len(calls) == 2
+    assert "TimeoutError: Edge TTS synthesis exceeded 0.01 seconds" in caplog.text
+    assert not (tmp_path / "segment.mp3").exists()
+
+
+def test_edge_tts_no_audio_with_proxifier_fails_early_after_two_attempts(
+    monkeypatch, tmp_path
+):
+    def no_audio(output_file):
+        raise no_audio_exception("No audio")
+
+    calls, no_audio_exception, _ = _install_fake_edge_tts(monkeypatch, no_audio)
+    sleeps = []
+    monkeypatch.setattr("buzz.localization.providers.time.sleep", sleeps.append)
+    monkeypatch.setattr("buzz.localization.providers._is_proxifier_running", lambda: True)
+
+    with pytest.raises(LocalizationProviderError, match="Proxifier.*disable"):
+        EdgeTTSProvider().synthesize(TTSRequest("Xin chao", "vi", str(tmp_path / "segment")))
+
+    assert len(calls) == 2
+    assert sleeps == [5]
+
+
+def test_edge_tts_no_audio_without_proxifier_keeps_retry_schedule(monkeypatch, tmp_path):
+    def no_audio(output_file):
+        raise no_audio_exception("No audio")
+
+    calls, no_audio_exception, _ = _install_fake_edge_tts(monkeypatch, no_audio)
+    sleeps = []
+    monkeypatch.setattr("buzz.localization.providers.time.sleep", sleeps.append)
+    monkeypatch.setattr("buzz.localization.providers._is_proxifier_running", lambda: False)
+
+    with pytest.raises(LocalizationProviderError, match="after 8 attempts"):
+        EdgeTTSProvider().synthesize(TTSRequest("Xin chao", "vi", str(tmp_path / "segment")))
+
+    assert len(calls) == 8
+    assert sleeps == [5, 10, 20, 40, 60, 90, 120]
+
+
+def test_edge_tts_websocket_error_does_not_check_proxifier(monkeypatch, tmp_path):
+    def websocket_failure(output_file):
+        raise websocket_exception("Connection failed")
+
+    calls, _, websocket_exception = _install_fake_edge_tts(
+        monkeypatch, websocket_failure
+    )
+    monkeypatch.setattr("buzz.localization.providers.time.sleep", lambda delay: None)
+    proxifier_checks = []
+    monkeypatch.setattr(
+        "buzz.localization.providers._is_proxifier_running",
+        lambda: proxifier_checks.append(True) or True,
+    )
+
+    with pytest.raises(LocalizationProviderError, match="after 2 attempts"):
+        EdgeTTSProvider(retry_delays=(0,)).synthesize(TTSRequest(
+            "Xin chao", "vi", str(tmp_path / "segment")
+        ))
+
+    assert len(calls) == 2
+    assert proxifier_checks == []
 
 
 def test_edge_tts_logs_sanitized_diagnostics_and_final_failure(
@@ -741,6 +869,242 @@ def test_gemini_batch_shortens_in_one_json_request_and_validates_ids():
         provider.shorten_translations(
             segments=segments, source_language="en", target_language="vi"
         )
+
+
+def test_gemini_batch_shortening_retries_when_word_count_exceeds_hard_max():
+    import json
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    calls = []
+
+    def generate(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return SimpleNamespace(text='{"segments":[{"id":"a","shortened_text":"mot hai ba"}]}')
+        return SimpleNamespace(text='{"segments":[{"id":"a","shortened_text":"mot hai"}]}')
+
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider._generate_content_with_retry = generate
+    result = provider.shorten_translations(
+        segments=[{"id": "a", "source_text": "one", "translated_text": "mot hai ba bon",
+                   "required_rate": 2.0, "max_playback_rate": 1.1}],
+        source_language="en", target_language="vi",
+    )
+
+    assert result == ["mot hai"]
+    assert len(calls) == 2
+    assert "MUST have no more whitespace-separated words" in calls[1]["contents"]
+    payload = json.loads(calls[0]["contents"].split("Input JSON:\n", 1)[1])
+    assert payload["segments"][0]["target_word_count"] == 2
+
+
+def test_gemini_batch_shortening_uses_timing_proportional_budget_for_mild_overflow():
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    original = " ".join(f"tu{index}" for index in range(35))
+    candidate = " ".join(f"ngan{index}" for index in range(32))
+    calls = []
+
+    def generate(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(text=json.dumps({"segments": [{
+            "id": "segment-000000", "shortened_text": candidate,
+        }]}))
+
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider._generate_content_with_retry = generate
+
+    assert provider.shorten_translations(
+        segments=[{
+            "id": "segment-000000", "source_text": "source",
+            "translated_text": original, "required_rate": 1.193,
+            "max_playback_rate": 1.10,
+        }], source_language="en", target_language="vi",
+    ) == [candidate]
+
+    payload = json.loads(calls[0]["contents"].split("Input JSON:\n", 1)[1])
+    assert payload["segments"][0]["target_word_count"] == 32
+    assert len(calls) == 1
+
+
+def test_gemini_batch_shortening_retries_non_speakable_result():
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    calls = []
+
+    def generate(**kwargs):
+        calls.append(kwargs)
+        text = "..." if len(calls) == 1 else "cau ngan"
+        return SimpleNamespace(text=json.dumps({"segments": [
+            {"id": "a", "shortened_text": text},
+        ]}))
+
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider._generate_content_with_retry = generate
+
+    assert provider.shorten_translations(
+        segments=[{"id": "a", "source_text": "one", "translated_text": "mot hai ba bon",
+                   "required_rate": 2.0, "max_playback_rate": 1.1}],
+        source_language="en", target_language="vi",
+    ) == ["cau ngan"]
+    assert len(calls) == 2
+    assert "MUST have no more whitespace-separated words" in calls[1]["contents"]
+
+
+def test_gemini_singleton_shortening_retries_non_speakable_candidate():
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    calls = []
+
+    def generate(**kwargs):
+        calls.append(kwargs)
+        if len(calls) <= 2:
+            return SimpleNamespace(text='{"segments":[{"id":"a","shortened_text":"..."}]}')
+        return SimpleNamespace(text="mot hai")
+
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider._generate_content_with_retry = generate
+
+    assert provider.shorten_translations(
+        segments=[{"id": "a", "source_text": "one", "translated_text": "mot hai ba bon",
+                   "required_rate": 2.0, "max_playback_rate": 1.1}],
+        source_language="en", target_language="vi",
+    ) == ["mot hai"]
+    assert len(calls) == 3
+    assert "Never return punctuation-only text" in calls[2]["contents"]
+
+
+def test_gemini_singleton_shortening_uses_strict_retry_after_invalid_batch():
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    calls = []
+
+    def generate(**kwargs):
+        calls.append(kwargs)
+        if len(calls) <= 2:
+            return SimpleNamespace(text='{"segments":[{"id":"a","shortened_text":"mot hai ba"}]}')
+        return SimpleNamespace(text="mot hai")
+
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider._generate_content_with_retry = generate
+
+    assert provider.shorten_translations(
+        segments=[{"id": "a", "source_text": "one", "translated_text": "mot hai ba bon",
+                   "required_rate": 2.0, "max_playback_rate": 1.1}],
+        source_language="en", target_language="vi",
+    ) == ["mot hai"]
+    assert len(calls) == 3
+    assert "exact target_word_count of 2" in calls[2]["contents"]
+    assert "Preserve names, numbers, units, negation, and the core meaning" in calls[2]["contents"]
+
+
+def test_gemini_singleton_shortening_adapts_prompt_to_overlong_candidate():
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    calls = []
+
+    def generate(**kwargs):
+        calls.append(kwargs)
+        if len(calls) <= 2:
+            return SimpleNamespace(text='{"segments":[{"id":"a","shortened_text":"mot hai ba"}]}')
+        if len(calls) == 3:
+            return SimpleNamespace(text="mot hai ba")
+        return SimpleNamespace(text="mot hai")
+
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider._generate_content_with_retry = generate
+
+    assert provider.shorten_translations(
+        segments=[{"id": "a", "source_text": "one", "translated_text": "mot hai ba bon",
+                   "required_rate": 2.0, "max_playback_rate": 1.1}],
+        source_language="en", target_language="vi",
+    ) == ["mot hai"]
+    assert len(calls) == 4
+    assert "previous candidate below has 3 whitespace-separated words" in calls[3]["contents"]
+    assert "exact target_word_count of 2" in calls[3]["contents"]
+    assert "Previous candidate: mot hai ba" in calls[3]["contents"]
+
+
+def test_gemini_singleton_shortening_fails_after_strict_retries_exceed_hard_max():
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    calls = []
+
+    def generate(**kwargs):
+        calls.append(kwargs)
+        if len(calls) <= 2:
+            return SimpleNamespace(text='{"segments":[{"id":"a","shortened_text":"mot hai ba"}]}')
+        return SimpleNamespace(text="mot hai ba")
+
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider._generate_content_with_retry = generate
+
+    with pytest.raises(
+        LocalizationProviderError,
+        match="Gemini batch translation shortening failed: shortened translation exceeds target word count",
+    ):
+        provider.shorten_translations(
+            segments=[{"id": "a", "source_text": "one", "translated_text": "mot hai ba bon",
+                       "required_rate": 2.0, "max_playback_rate": 1.1}],
+            source_language="en", target_language="vi",
+        )
+    assert len(calls) == 6
+    assert "Previous candidate: mot hai ba" in calls[-1]["contents"]
+
+
+def test_gemini_singleton_shortening_rejects_structured_output_after_id_errors():
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    calls = []
+
+    def generate(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(text='{"segments":[{"id":"wrong","shortened_text":"mot hai"}]}')
+
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider._generate_content_with_retry = generate
+
+    with pytest.raises(
+        LocalizationProviderError,
+        match="segment ID",
+    ):
+        provider.shorten_translations(
+            segments=[{"id": "a", "source_text": "one", "translated_text": "mot hai ba bon",
+                       "required_rate": 2.0, "max_playback_rate": 1.1}],
+            source_language="en", target_language="vi",
+        )
+    assert len(calls) == 2
+
+
+def test_gemini_singleton_shortening_does_not_fallback_after_json_errors():
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    calls = []
+
+    def generate(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(text="not valid JSON")
+
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider._generate_content_with_retry = generate
+
+    with pytest.raises(LocalizationProviderError, match="Expecting value"):
+        provider.shorten_translations(
+            segments=[{"id": "a", "source_text": "one", "translated_text": "mot hai ba bon",
+                       "required_rate": 2.0, "max_playback_rate": 1.1}],
+            source_language="en", target_language="vi",
+        )
+    assert len(calls) == 2
+    assert all("exact target_word_count" not in call["contents"] for call in calls)
 
 
 def test_gemini_provider_requires_key_and_model():

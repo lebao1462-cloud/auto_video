@@ -4,7 +4,9 @@ import gc
 import importlib.util
 import os
 from pathlib import Path
+import sys
 import tempfile
+import threading
 from typing import Any
 import unicodedata
 
@@ -19,11 +21,67 @@ _MODEL_DIRECTORIES = {
 }
 
 
+class _SharedParaformerModel:
+    """Lazy, retryable process-wide FunASR model cache.
+
+    Loading Paraformer also loads its VAD and punctuation models, which is too
+    expensive to repeat for every dashboard row.  The inference lock remains
+    separate from construction so a failed initial load is never cached.
+    """
+
+    def __init__(self) -> None:
+        self._model: Any | None = None
+        self._load_lock = threading.Lock()
+        self.inference_lock = threading.Lock()
+
+    def get(self) -> Any:
+        if self._model is not None:
+            return self._model
+        with self._load_lock:
+            if self._model is not None:
+                return self._model
+            from funasr import AutoModel
+
+            local_models = paraformer_model_paths()
+            # Assign only after a complete successful construction; callers
+            # can retry after a transient/corrupt-cache failure.
+            model = AutoModel(
+                model=(local_models or {}).get("model", PARAFORMER_ENGINE),
+                vad_model=(local_models or {}).get("vad", "fsmn-vad"),
+                punc_model=(local_models or {}).get("punc", "ct-punc-c"),
+                vad_kwargs={"max_single_segment_time": 30000},
+                device="cpu",
+                ncpu=min(4, max(1, os.cpu_count() or 1)),
+                disable_update=True,
+                disable_pbar=True,
+            )
+            self._model = model
+            return model
+
+    def reset(self) -> None:
+        """Release the cached model (primarily for tests and app shutdown)."""
+        with self._load_lock:
+            self._model = None
+        gc.collect()
+
+
+_SHARED_MODEL = _SharedParaformerModel()
+
+
+def reset_paraformer_model_cache() -> None:
+    """Clear the process-wide Paraformer model cache."""
+    _SHARED_MODEL.reset()
+
+
 def modelscope_cache_path() -> Path:
     """Return the cache location without importing ModelScope/FunASR."""
     configured = os.getenv("MODELSCOPE_CACHE")
     if configured:
         return Path(configured)
+    if getattr(sys, "frozen", False):
+        bundled = Path(sys.executable).resolve().parent / "modelscope-cache"
+        if (bundled / "models").is_dir():
+            return bundled
     if os.name == "nt" and Path("D:/").exists():
         return Path("D:/Dev/modelscope-cache")
     return Path.home() / ".cache" / "modelscope"
@@ -205,29 +263,16 @@ def transcribe_with_paraformer(video_path: str) -> LocalizationTranscript:
     configure_modelscope_cache()  # must precede the lazy FunASR import
     temp_dir = _temporary_directory()
     wav = temp_dir / f"autovideo-paraformer-{next(tempfile._get_candidate_names())}.wav"
-    model = None
     try:
         extract_audio_track(source, wav, sample_rate=16000, channels=1)
-        from funasr import AutoModel
-
-        # Passing the actual snapshots avoids ModelScope lookups when the
-        # requested models are present. Aliases retain FunASR's one-time
-        # download behavior on a fresh installation.
-        local_models = paraformer_model_paths()
-        model = AutoModel(
-            model=(local_models or {}).get("model", PARAFORMER_ENGINE),
-            vad_model=(local_models or {}).get("vad", "fsmn-vad"),
-            punc_model=(local_models or {}).get("punc", "ct-punc-c"),
-            vad_kwargs={"max_single_segment_time": 30000},
-            device="cpu",
-            ncpu=min(4, max(1, os.cpu_count() or 1)),
-            disable_update=True,
-            disable_pbar=True,
-        )
-        generated = model.generate(
-            input=str(wav), sentence_timestamp=True, return_raw_text=True,
-            batch_size_s=60, batch_size_threshold_s=30,
-        )
+        model = _SHARED_MODEL.get()
+        # Workflow's CPU-heavy gate serializes jobs; retain this lock for
+        # direct API users so shared-model generate() is never concurrent.
+        with _SHARED_MODEL.inference_lock:
+            generated = model.generate(
+                input=str(wav), sentence_timestamp=True, return_raw_text=True,
+                batch_size_s=60, batch_size_threshold_s=30,
+            )
         result = generated[0] if isinstance(generated, list) and generated else generated
         if not isinstance(result, dict):
             raise RuntimeError("FunASR returned an invalid transcription result.")
@@ -241,5 +286,3 @@ def transcribe_with_paraformer(video_path: str) -> LocalizationTranscript:
         raise RuntimeError(f"Unable to load or run Paraformer. Check its cached models and runtime: {exc}") from exc
     finally:
         wav.unlink(missing_ok=True)
-        del model
-        gc.collect()

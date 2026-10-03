@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 import subprocess
 import threading
@@ -8,7 +9,12 @@ import pytest
 
 from buzz.localization.audio_mix import probe_media_duration
 from buzz.localization.transcript import LocalizationSegment, LocalizationTranscript
-from buzz.localization.translation import TranslationProvider, _segment_id
+from buzz.localization.translation import (
+    TranslatedLocalizationSegment,
+    TranslatedLocalizationTranscript,
+    TranslationProvider,
+    _segment_id,
+)
 from buzz.localization.tts import TTSRequest, TTSResult
 from buzz.localization.tts import (
     SynthesizedLocalizationSegment,
@@ -22,7 +28,11 @@ from buzz.localization.workflow import (
     LocalizationWorkflowOptions,
     cleanup_localization_workspace,
     localize_video,
+    _coalesce_trailing_tiny_translation,
+    _load_timing_recovery_checkpoint,
+    _persist_timing_recovery_checkpoint,
     _synchronize_with_translation_recovery,
+    _timing_recovery_fingerprint,
 )
 from buzz.localization.final_render import FinalRenderOptions
 from buzz.transcriber.transcriber import Task, TranscriptionOptions
@@ -52,6 +62,62 @@ class FakeTTSProvider:
             provider="fake",
             voice=request.voice or "vi-test",
         )
+
+
+def _translated_for_boundary(source_language="zh", *, final_end=10.0):
+    return TranslatedLocalizationTranscript(
+        source_language=source_language, target_language="vi", source_file="source.mp4",
+        segments=(
+            TranslatedLocalizationSegment(7.0, 9.2, "previous", "truoc"),
+            TranslatedLocalizationSegment(9.3, final_end, "final", "sau"),
+        ),
+    )
+
+
+def test_coalesces_tiny_trailing_chinese_translation():
+    transcript = _translated_for_boundary()
+
+    result = _coalesce_trailing_tiny_translation(transcript, 10.15)
+
+    assert len(result.segments) == 1
+    assert result.segments[0].start == 7.0
+    assert result.segments[0].end == 10.0
+    assert result.segments[0].source_text == "previousfinal"
+    assert result.segments[0].translated_text == "truoc sau"
+
+
+def test_coalesces_tiny_trailing_english_translation_with_space():
+    transcript = _translated_for_boundary("en")
+
+    result = _coalesce_trailing_tiny_translation(transcript, 10.15)
+
+    assert result.segments[0].source_text == "previous final"
+    assert result.segments[0].translated_text == "truoc sau"
+
+
+@pytest.mark.parametrize("final_end, media_end", [
+    (10.31, 10.4),  # final duration is not tiny
+    (10.0, 10.26),  # too much media tail
+])
+def test_does_not_coalesce_trailing_translation_outside_boundary_limits(final_end, media_end):
+    transcript = _translated_for_boundary(final_end=final_end)
+
+    result = _coalesce_trailing_tiny_translation(transcript, media_end)
+
+    assert result is transcript
+
+
+def test_does_not_coalesce_when_gap_or_combined_span_is_too_large():
+    transcript = _translated_for_boundary()
+    excessive_gap = replace(
+        transcript, segments=(replace(transcript.segments[0], end=8.8), transcript.segments[1])
+    )
+    excessive_span = replace(
+        transcript, segments=(replace(transcript.segments[0], start=-0.1), transcript.segments[1])
+    )
+
+    assert _coalesce_trailing_tiny_translation(excessive_gap, 10.15) is excessive_gap
+    assert _coalesce_trailing_tiny_translation(excessive_span, 10.15) is excessive_span
 
 
 def _synthesized_for_recovery(tmp_path, durations=(1.0, 2.083)):
@@ -122,7 +188,7 @@ class ConcurrentRecoveryTTSProvider:
                 self.active -= 1
 
 
-def test_timing_recovery_regenerates_batch_concurrently_and_applies_by_segment_index(tmp_path):
+def test_timing_recovery_serializes_tts_and_applies_by_segment_index(tmp_path):
     class BatchProvider:
         def shorten_translations(self, **kwargs):
             return [f"short-{item['id']}" for item in kwargs["segments"]]
@@ -134,7 +200,7 @@ def test_timing_recovery_regenerates_batch_concurrently_and_applies_by_segment_i
         LocalizationWorkflowOptions(output_directory=str(tmp_path), timing_policy=TimingPolicy()),
     )
 
-    assert tts.max_active > 1
+    assert tts.max_active == 1
     assert [segment.translated_text for segment in timed.segments] == [
         "short-segment-000000", "short-segment-000001", "translation 2",
     ]
@@ -162,6 +228,100 @@ def test_timing_recovery_tts_is_serial_without_declared_max_concurrency(tmp_path
     assert tts.max_active == 1
 
 
+def test_timing_recovery_stops_before_later_tts_after_exception(tmp_path):
+    class BatchProvider:
+        def shorten_translations(self, **kwargs):
+            return ["first", "second"]
+
+    class FailingTTS:
+        def __init__(self):
+            self.requests = []
+
+        def synthesize(self, request):
+            self.requests.append(request)
+            raise RuntimeError("Edge unavailable")
+
+    tts = FailingTTS()
+    with pytest.raises(RuntimeError, match="Edge unavailable"):
+        _synchronize_with_translation_recovery(
+            _synthesized_for_recovery(tmp_path, durations=(2.0, 2.0)), BatchProvider(), tts,
+            LocalizationWorkflowOptions(output_directory=str(tmp_path), timing_policy=TimingPolicy()),
+        )
+    assert [request.text for request in tts.requests] == ["first"]
+
+
+def test_timing_recovery_checkpoint_saves_each_success_before_later_failure(tmp_path):
+    class BatchProvider:
+        def shorten_translations(self, **kwargs):
+            return ["first", "second"]
+
+    class FailsSecond(RecoveryTTSProvider):
+        def synthesize(self, request):
+            if request.text == "second":
+                self.requests.append(request)
+                raise RuntimeError("second failed")
+            return super().synthesize(request)
+
+    path = tmp_path / "timing-recovery-checkpoint.json"
+    with pytest.raises(RuntimeError, match="second failed"):
+        _synchronize_with_translation_recovery(
+            _synthesized_for_recovery(tmp_path, durations=(2.0, 2.0)), BatchProvider(),
+            FailsSecond([1.0]), LocalizationWorkflowOptions(output_directory=str(tmp_path)),
+            checkpoint_path=path, checkpoint_fingerprint="fingerprint",
+        )
+    assert __import__("json").loads(path.read_text(encoding="utf-8"))["shortened_text"] == {"0": "first"}
+
+
+def test_timing_recovery_checkpoint_applies_saved_text_before_tts_and_reuses_cache(tmp_path):
+    translated = TranslatedLocalizationTranscript(
+        source_language="en", target_language="vi", source_file="source.mp4",
+        segments=(TranslatedLocalizationSegment(0, 1, "source", "original"),),
+    )
+    options = LocalizationWorkflowOptions(output_directory=str(tmp_path))
+    fingerprint = _timing_recovery_fingerprint(translated, options, 1.0)
+    path = tmp_path / "timing-recovery-checkpoint.json"
+    _persist_timing_recovery_checkpoint(path, fingerprint, translated.segments, 0, "shortened")
+    restored = _load_timing_recovery_checkpoint(path, fingerprint, translated)
+    provider = RecoveryTTSProvider([1.0])
+    from buzz.localization.tts import synthesize_for_localization
+    synthesize_for_localization(restored, provider, tmp_path / "tts")
+    synthesize_for_localization(restored, provider, tmp_path / "tts")
+    assert restored.segments[0].translated_text == "shortened"
+    assert [request.text for request in provider.requests] == ["shortened"]
+
+
+def test_timing_recovery_fingerprint_includes_source_file(tmp_path):
+    options = LocalizationWorkflowOptions(output_directory=str(tmp_path))
+    first = TranslatedLocalizationTranscript("en", "vi", "first.mp4", (
+        TranslatedLocalizationSegment(0, 1, "source", "translation"),
+    ))
+    second = replace(first, source_file="second.mp4")
+
+    assert _timing_recovery_fingerprint(first, options, 1.0) != _timing_recovery_fingerprint(
+        second, options, 1.0,
+    )
+
+
+@pytest.mark.parametrize("contents", ["not json", '{"fingerprint":"wrong","segment_count":1,"segment_bounds":[[0,1]],"shortened_text":{"0":"short"}}',
+    '{"fingerprint":"match","segment_count":1,"segment_bounds":[[0,1]],"shortened_text":{"9":"short"}}',
+    '{"fingerprint":"match","segment_count":1,"segment_bounds":[[0,1]],"shortened_text":{"0":"!!!"}}'])
+def test_timing_recovery_ignores_invalid_checkpoint_safely(tmp_path, contents):
+    translated = TranslatedLocalizationTranscript("en", "vi", "source.mp4", (
+        TranslatedLocalizationSegment(0, 1, "source", "original"),
+    ))
+    path = tmp_path / "timing-recovery-checkpoint.json"
+    path.write_text(contents, encoding="utf-8")
+    assert _load_timing_recovery_checkpoint(path, "match", translated) is translated
+
+
+def test_timing_recovery_checkpoint_replaces_later_shortening(tmp_path):
+    path = tmp_path / "timing-recovery-checkpoint.json"
+    segments = _synthesized_for_recovery(tmp_path, durations=(1.0, 1.0)).segments
+    _persist_timing_recovery_checkpoint(path, "fingerprint", segments, 1, "first short")
+    _persist_timing_recovery_checkpoint(path, "fingerprint", segments, 1, "shorter")
+    assert __import__("json").loads(path.read_text(encoding="utf-8"))["shortened_text"] == {"1": "shorter"}
+
+
 def test_timing_recovery_batches_current_failures_and_retries_only_remaining(tmp_path):
     class BatchProvider:
         def __init__(self):
@@ -187,6 +347,43 @@ def test_timing_recovery_batches_current_failures_and_retries_only_remaining(tmp
     ]
     assert timed.segments[2].translated_text == "translation 2"
     assert max(segment.playback_rate for segment in timed.segments) <= 1.10
+
+
+def test_timing_recovery_retries_after_timing_proportional_shortening_is_still_long(tmp_path):
+    class BatchProvider:
+        def __init__(self):
+            self.calls = []
+
+        def shorten_translations(self, **kwargs):
+            self.calls.append(kwargs["segments"])
+            return [["lan dau ngan"], ["lan hai ngan"]][len(self.calls) - 1]
+
+    available_duration = 9.734958 / 1.193
+    audio = tmp_path / "segment-000000.wav"
+    audio.write_bytes(b"audio")
+    original = " ".join(f"tu{index}" for index in range(35))
+    synthesized = SynthesizedLocalizationTranscript(
+        source_language="en", target_language="vi", source_file="source.mp4",
+        segments=(SynthesizedLocalizationSegment(
+            start=0.0, end=available_duration, source_text="source",
+            translated_text=original, audio_file=str(audio), audio_duration=9.734958,
+            provider="fake", voice="vi-test",
+        ),),
+    )
+    provider = BatchProvider()
+    tts = RecoveryTTSProvider([9.2, 8.8])
+
+    timed = _synchronize_with_translation_recovery(
+        synthesized, provider, tts,
+        LocalizationWorkflowOptions(output_directory=str(tmp_path), timing_policy=TimingPolicy()),
+    )
+
+    assert provider.calls[0][0]["required_rate"] == pytest.approx(1.193)
+    assert [batch[0]["translated_text"] for batch in provider.calls] == [
+        original, "lan dau ngan",
+    ]
+    assert [request.text for request in tts.requests] == ["lan dau ngan", "lan hai ngan"]
+    assert timed.segments[0].playback_rate < 1.10
 
 
 def test_timing_recovery_shortens_and_regenerates_only_failing_segment(tmp_path):
@@ -261,6 +458,23 @@ def test_timing_recovery_never_exceeds_hard_playback_rate_ceiling(tmp_path):
 
     assert timed.segments[1].playback_rate == 1.10
     assert max(segment.playback_rate for segment in timed.segments) <= 1.10
+
+
+def test_timing_recovery_does_not_shorten_final_segment_that_fits_media_tail(tmp_path):
+    translator = ShorteningProvider()
+    tts = RecoveryTTSProvider([])
+
+    timed = _synchronize_with_translation_recovery(
+        _synthesized_for_recovery(tmp_path, durations=(1.0, 1.8)),
+        translator,
+        tts,
+        LocalizationWorkflowOptions(output_directory=str(tmp_path), timing_policy=TimingPolicy()),
+        media_end=3.0,
+    )
+
+    assert not translator.calls
+    assert not tts.requests
+    assert timed.segments[-1].timing_action == "borrow_gap"
 
 
 def create_test_video(path: Path, duration: int = 2):
@@ -381,6 +595,50 @@ def test_end_to_end_workflow_creates_final_mp4_and_subtitle(tmp_path):
         text=True,
     )
     assert float(duration_probe.stdout.strip()) == pytest.approx(2.0, abs=0.1)
+
+
+def test_workflow_loads_matching_recovery_checkpoint_before_initial_tts(tmp_path):
+    source = tmp_path / "source.mp4"
+    output_dir = tmp_path / "output"
+    create_test_video(source)
+    duration = probe_media_duration(source)
+    options = LocalizationWorkflowOptions(output_directory=str(output_dir))
+    translation_provider = FakeTranslationProvider()
+    translated_text = translation_provider.translate("Hello everyone", "en", "vi")
+    translated = TranslatedLocalizationTranscript(
+        source_language="en", target_language="vi", source_file=str(source),
+        segments=(TranslatedLocalizationSegment(
+            0.25, 1.50, "Hello everyone", translated_text,
+        ),),
+    )
+    workspace = output_dir / "source_localization_work"
+    recovery_checkpoint = workspace / "timing-recovery-checkpoint.json"
+    fingerprint = _timing_recovery_fingerprint(translated, options, duration)
+    _persist_timing_recovery_checkpoint(
+        recovery_checkpoint, fingerprint, translated.segments, 0, "shortened",
+    )
+
+    class CountingTTS(FakeTTSProvider):
+        def __init__(self):
+            self.requests = []
+
+        def synthesize(self, request):
+            self.requests.append(request.text)
+            return super().synthesize(request)
+
+    provider = CountingTTS()
+    from buzz.localization.tts import synthesize_for_localization
+    recovered = _load_timing_recovery_checkpoint(recovery_checkpoint, fingerprint, translated)
+    synthesize_for_localization(recovered, provider, workspace / "tts")
+    assert provider.requests == ["shortened"]
+
+    localize_video(
+        str(source), TranscriptionOptions(language="en", task=Task.TRANSCRIBE),
+        "unused-model-path", translation_provider, provider, options,
+        transcribe_func=fake_transcribe,
+    )
+
+    assert provider.requests == ["shortened"]
 
 
 def test_workflow_can_be_cancelled_before_start(tmp_path):

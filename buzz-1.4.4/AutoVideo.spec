@@ -19,7 +19,7 @@ def safe_copy_metadata(package_name):
 datas = []
 localization_binaries = []
 localization_hiddenimports = []
-for optional_package in ("edge_tts", "argostranslate"):
+for optional_package in ("edge_tts", "argostranslate", "funasr"):
     try:
         package_datas, package_binaries, package_hiddenimports = collect_all(
             optional_package

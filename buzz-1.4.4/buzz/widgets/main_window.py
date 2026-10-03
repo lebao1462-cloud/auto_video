@@ -42,7 +42,7 @@ from buzz.transcriber.transcriber import (
 from buzz.widgets.icon import APP_ICON_PATH
 from buzz.widgets.import_url_dialog import ImportURLDialog
 from buzz.widgets.main_window_toolbar import MainWindowToolbar
-from buzz.widgets.localization_dialog import LocalizationDialog
+from buzz.widgets.localization_dashboard import LocalizationDashboard
 from buzz.widgets.menu_bar import MenuBar
 from buzz.widgets.preferences_dialog.models.preferences import Preferences
 from buzz.widgets.transcriber.file_transcriber_widget import FileTranscriberWidget
@@ -170,11 +170,14 @@ class MainWindow(QMainWindow):
         self.folder_watcher.find_tasks()
 
         self.transcription_viewer_widget = None
-        self.localization_dialog = None
+        self.localization_dashboard = self.centralWidget()
 
         # No upstream update checks; releases are managed by this project.
 
     def create_home_widget(self):
+        return LocalizationDashboard(self)
+
+    def create_legacy_home_widget(self):
         home = QWidget(self)
         layout = QVBoxLayout(home)
         layout.setContentsMargins(32, 32, 32, 32)
@@ -318,17 +321,7 @@ class MainWindow(QMainWindow):
             self.open_file_transcriber_widget(url=url)
 
     def on_localize_video_action_triggered(self):
-        if self.localization_dialog is None:
-            self.localization_dialog = LocalizationDialog(parent=self)
-            self.localization_dialog.finished.connect(
-                self.on_localization_dialog_finished
-            )
-        self.localization_dialog.show()
-        self.localization_dialog.raise_()
-        self.localization_dialog.activateWindow()
-
-    def on_localization_dialog_finished(self):
-        self.localization_dialog = None
+        self.localization_dashboard.browse_videos()
 
     def on_import_folder_action_triggered(self):
         folder = QFileDialog.getExistingDirectory(self, _("Select folder"))
@@ -505,6 +498,7 @@ class MainWindow(QMainWindow):
         self.save_geometry()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self.localization_dashboard.shutdown()
         self.save_geometry()
         self.settings.settings.sync()
 

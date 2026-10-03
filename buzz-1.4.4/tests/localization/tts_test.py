@@ -1,6 +1,9 @@
 import json
+from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+import threading
+import time
 
 import pytest
 
@@ -375,3 +378,84 @@ def test_provider_failure_never_writes_completion_checkpoint(tmp_path):
     retry = FakeTTSProvider()
     synthesize_for_localization(make_transcript(), retry, tmp_path)
     assert len(retry.calls) == 1
+
+
+def test_segment_context_is_released_between_sequential_segments(tmp_path):
+    transcript = make_transcript(segments=[
+        TranslatedLocalizationSegment(0, 1, "one", "một"),
+        TranslatedLocalizationSegment(1, 2, "two", "hai"),
+    ])
+    events = []
+
+    @contextmanager
+    def segment_context(index, total):
+        events.append(("enter", index, total))
+        yield
+        events.append(("exit", index, total))
+
+    progress = []
+    synthesize_for_localization(
+        transcript, FakeTTSProvider(), tmp_path,
+        segment_context=segment_context,
+        progress_callback=lambda completed, total: progress.append((completed, total)),
+    )
+
+    assert events == [
+        ("enter", 0, 2), ("exit", 0, 2),
+        ("enter", 1, 2), ("exit", 1, 2),
+    ]
+    assert progress == [(1, 2), (2, 2)]
+
+
+def test_two_jobs_overlap_globally_but_each_job_tts_is_serial(tmp_path):
+    from buzz.localization.resources import LocalizationResourceScheduler
+
+    transcript = make_transcript(segments=[
+        TranslatedLocalizationSegment(0, 1, "one", "một"),
+        TranslatedLocalizationSegment(1, 2, "two", "hai"),
+    ])
+    scheduler = LocalizationResourceScheduler()
+    lock = threading.Lock()
+    active = maximum = 0
+    per_job_active = {"one": 0, "two": 0}
+    per_job_maximum = {"one": 0, "two": 0}
+
+    class SlowProvider(FakeTTSProvider):
+        def __init__(self, job):
+            super().__init__()
+            self.job = job
+
+        def synthesize(self, request):
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+                per_job_active[self.job] += 1
+                per_job_maximum[self.job] = max(
+                    per_job_maximum[self.job], per_job_active[self.job])
+            try:
+                time.sleep(0.04)
+                return super().synthesize(request)
+            finally:
+                with lock:
+                    active -= 1
+                    per_job_active[self.job] -= 1
+
+    start = threading.Barrier(3)
+
+    def run(job):
+        start.wait()
+        synthesize_for_localization(
+            transcript, SlowProvider(job), tmp_path / job,
+            segment_context=lambda _index, _total: scheduler.acquire("tts"),
+        )
+
+    threads = [threading.Thread(target=run, args=(job,)) for job in ("one", "two")]
+    for thread in threads:
+        thread.start()
+    start.wait()
+    for thread in threads:
+        thread.join()
+
+    assert maximum == 2
+    assert per_job_maximum == {"one": 1, "two": 1}

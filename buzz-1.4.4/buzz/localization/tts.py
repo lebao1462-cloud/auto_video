@@ -1,10 +1,11 @@
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 import hashlib
 import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Mapping, Protocol
+from typing import Callable, ContextManager, Mapping, Protocol
 
 from buzz.localization.translation import TranslatedLocalizationTranscript
 
@@ -231,8 +232,15 @@ def synthesize_for_localization(
     output_directory: str | Path,
     voice: str | None = None,
     options: Mapping[str, object] | None = None,
+    segment_context: Callable[[int, int], ContextManager[None]] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> SynthesizedLocalizationTranscript:
-    """Synthesize one Vietnamese audio asset for every translated segment."""
+    """Synthesize one Vietnamese audio asset for every translated segment.
+
+    ``segment_context`` is provider-neutral and wraps one segment only, so a
+    caller can share global capacity between jobs without parallelizing a
+    single job's segment requests.
+    """
     if not isinstance(transcript, TranslatedLocalizationTranscript):
         raise TypeError("A Phase 2 TranslatedLocalizationTranscript is required")
     if not transcript.source_file:
@@ -258,17 +266,21 @@ def synthesize_for_localization(
     provider_options = {} if options is None else dict(options)
     synthesized_segments = []
 
+    segment_count = len(transcript.segments)
     for index, segment in enumerate(transcript.segments):
-        result = synthesize_segment(
-            TTSRequest(
-                text=segment.translated_text,
-                language=transcript.target_language,
-                output_file_stem=str(asset_directory / f"segment-{index:06d}"),
-                voice=voice,
-                options=provider_options,
-            ),
-            provider,
-        )
+        context = (segment_context(index, segment_count)
+                   if segment_context is not None else nullcontext())
+        with context:
+            result = synthesize_segment(
+                TTSRequest(
+                    text=segment.translated_text,
+                    language=transcript.target_language,
+                    output_file_stem=str(asset_directory / f"segment-{index:06d}"),
+                    voice=voice,
+                    options=provider_options,
+                ),
+                provider,
+            )
 
         synthesized_segments.append(
             SynthesizedLocalizationSegment(
@@ -283,6 +295,8 @@ def synthesize_for_localization(
                 provider_metadata=dict(result.metadata),
             )
         )
+        if progress_callback is not None:
+            progress_callback(index + 1, segment_count)
 
     return SynthesizedLocalizationTranscript(
         source_file=transcript.source_file,

@@ -139,8 +139,8 @@ class LocalizationWorker(QObject):
 class LocalizationDialog(QDialog):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self.setWindowTitle("Localize Video to Vietnamese")
-        self.resize(720, 520)
+        self.setWindowTitle("Dịch & lồng tiếng video")
+        self.resize(640, 360)
         self.worker_thread: QThread | None = None
         self.worker: LocalizationWorker | None = None
 
@@ -168,13 +168,9 @@ class LocalizationDialog(QDialog):
         self.translation_provider_combo.addItem(
             "OpenAI-compatible - Advanced", "openai-compatible"
         )
-        saved_provider = self.settings.value(
-            Settings.Key.LOCALIZATION_TRANSLATION_PROVIDER,
-            "nllb",
-        )
-        saved_index = self.translation_provider_combo.findData(saved_provider)
+        # Simple product UI: Gemini is the fixed translation provider.
         self.translation_provider_combo.setCurrentIndex(
-            saved_index if saved_index >= 0 else 0
+            self.translation_provider_combo.findData("gemini")
         )
         self.translation_provider_status = QLabel()
 
@@ -206,9 +202,7 @@ class LocalizationDialog(QDialog):
         self.api_key_edit.editingFinished.connect(
             self._save_current_api_key
         )
-        self.translation_model_edit = QLineEdit(
-            os.getenv("BUZZ_TRANSLATION_MODEL", "gemini-3.5-flash-lite")
-        )
+        self.translation_model_edit = QLineEdit("gemini-3.5-flash-lite")
         self.translation_model_edit.editingFinished.connect(
             self._normalize_translation_model
         )
@@ -225,16 +219,16 @@ class LocalizationDialog(QDialog):
         self.subtitle_mode_combo.addItem("Soft subtitle", "soft")
         self.subtitle_mode_combo.addItem("Burn subtitle into video", "burn")
         self.subtitle_mode_combo.addItem("No subtitle in MP4", "none")
+        self.subtitle_mode_combo.setCurrentIndex(
+            self.subtitle_mode_combo.findData("burn")
+        )
 
         self.cover_original_subtitles_checkbox = QCheckBox(
             "Blur original subtitles area (bottom 18%)"
         )
-        self.cover_original_subtitles_checkbox.setChecked(
-            self.settings.value(
-                Settings.Key.LOCALIZATION_COVER_ORIGINAL_SUBTITLES,
-                True,
-            )
-        )
+        # Product default: always hide hardcoded source subtitles before
+        # burning Vietnamese subtitles on top.
+        self.cover_original_subtitles_checkbox.setChecked(True)
         self.cover_original_subtitles_checkbox.setToolTip(
             "Blurs the lower 18% of the video, adds a light dark overlay, then burns Vietnamese subtitles on top."
         )
@@ -245,33 +239,28 @@ class LocalizationDialog(QDialog):
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
-        self.status_label = QLabel("Ready")
+        self.status_label = QLabel("Sẵn sàng")
 
-        self.start_button = QPushButton("Start Localization")
-        self.cancel_button = QPushButton("Cancel")
+        self.start_button = QPushButton("Bắt đầu")
+        self.cancel_button = QPushButton("Hủy")
         self.cancel_button.setEnabled(False)
 
         source_row = self._path_row(self.source_edit, self._browse_source)
-        output_row = self._path_row(self.output_edit, self._browse_output)
 
         form = QFormLayout()
-        form.addRow("Input video:", source_row)
-        form.addRow("Output folder:", output_row)
-        form.addRow("ASR engine:", self.asr_provider_label)
-        form.addRow("", self.asr_provider_status)
-        form.addRow("Source language:", self.language_combo)
-        form.addRow("Translation provider:", self.translation_provider_combo)
-        form.addRow("", self.translation_provider_status)
+        form.addRow("Video:", source_row)
         self.base_url_label = QLabel("Translation API base URL:")
-        self.api_key_label = QLabel("Translation API key:")
+        self.api_key_label = QLabel("Gemini API key:")
         self.translation_model_label = QLabel("Translation model:")
-        form.addRow(self.base_url_label, self.base_url_edit)
+        self.api_key_edit.setPlaceholderText("Nhập Gemini API key")
         form.addRow(self.api_key_label, self.api_key_edit)
-        form.addRow(self.translation_model_label, self.translation_model_edit)
-        form.addRow("Vietnamese voice:", self.voice_combo)
-        form.addRow("Subtitle mode:", self.subtitle_mode_combo)
-        form.addRow("", self.cover_original_subtitles_checkbox)
-        form.addRow("", self.background_checkbox)
+        form.addRow("Giọng Việt:", self.voice_combo)
+
+        pipeline_label = QLabel(
+            "Tự động: Paraformer-zh → Gemini → Edge TTS → phụ đề Việt"
+        )
+        pipeline_label.setWordWrap(True)
+        form.addRow("", pipeline_label)
 
         buttons = QHBoxLayout()
         buttons.addStretch()

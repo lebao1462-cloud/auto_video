@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import math
 from typing import Mapping
 
 from buzz.localization.tts import (
@@ -126,6 +127,7 @@ def _validate_segment(
 def synchronize_for_localization(
     transcript: SynthesizedLocalizationTranscript,
     policy: TimingPolicy | None = None,
+    media_end: float | None = None,
 ) -> TimedLocalizationTranscript:
     """Create a deterministic timing plan without modifying audio waveforms."""
     if not isinstance(transcript, SynthesizedLocalizationTranscript):
@@ -137,9 +139,24 @@ def synchronize_for_localization(
     if not isinstance(timing_policy, TimingPolicy):
         raise TypeError("policy must be a TimingPolicy")
 
+    if media_end is not None:
+        if (
+            not isinstance(media_end, (int, float))
+            or isinstance(media_end, bool)
+            or not math.isfinite(media_end)
+            or media_end < 0
+        ):
+            raise TimingSynchronizationError("Media end must be a non-negative finite number")
+        media_end = float(media_end)
+
     previous_end = None
     for segment in transcript.segments:
         previous_end = _validate_segment(segment, previous_end)
+
+    if media_end is not None and media_end < float(transcript.segments[-1].end):
+        raise TimingSynchronizationError(
+            "Media end must be at or after the final segment end"
+        )
 
     timed_segments = []
     for index, segment in enumerate(transcript.segments):
@@ -148,7 +165,7 @@ def synchronize_for_localization(
         next_start = (
             float(transcript.segments[index + 1].start)
             if index + 1 < len(transcript.segments)
-            else float(segment.end)
+            else media_end if media_end is not None else float(segment.end)
         )
         # Borrow only the silent gap immediately following this subtitle.  The
         # subtitle timestamps remain immutable; this is an audio-mix extent.

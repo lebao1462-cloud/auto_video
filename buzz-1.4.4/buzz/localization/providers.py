@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import asyncio
 import hashlib
 import json
 import logging
@@ -19,6 +20,19 @@ from buzz.localization.tts import TTSRequest, TTSResult
 
 
 logger = logging.getLogger(__name__)
+
+
+EDGE_TTS_CONNECT_TIMEOUT_SECONDS = 10
+EDGE_TTS_RECEIVE_TIMEOUT_SECONDS = 60
+EDGE_TTS_ATTEMPT_TIMEOUT_SECONDS = 45
+
+
+def _has_speakable_tts_text(text: str) -> bool:
+    """Return whether text contains content that a TTS provider can speak."""
+    return isinstance(text, str) and bool(text.strip()) and any(
+        character.isalnum() for character in text
+    )
+
 
 GEMINI_MODEL_IDS = frozenset({
     "gemini-2.5-flash-lite",
@@ -45,6 +59,29 @@ DEFAULT_GEMINI_FALLBACK_MODELS = (
 
 class LocalizationProviderError(RuntimeError):
     """Raised when a concrete localization provider fails."""
+
+
+def _is_proxifier_running() -> bool:
+    """Return whether Proxifier is running, treating probe failures as absent."""
+    if os.name != "nt":
+        return False
+    try:
+        kwargs = {
+            "capture_output": True,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "timeout": 2,
+        }
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq Proxifier.exe", "/NH", "/FO", "CSV"],
+            **kwargs,
+        )
+        return result.returncode == 0 and "proxifier.exe" in result.stdout.lower()
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 NLLB_MODEL_ID = "facebook/nllb-200-distilled-600M"
@@ -746,6 +783,7 @@ class GeminiTranslationProvider:
             return []
         payload_segments = []
         expected_ids = []
+        target_word_counts = {}
         for item in segments:
             identifier = item["id"]
             if not isinstance(identifier, str) or not identifier or identifier in expected_ids:
@@ -761,6 +799,15 @@ class GeminiTranslationProvider:
                     or max_playback_rate <= 0):
                 raise ValueError("Batch shortening received an invalid segment")
             expected_ids.append(identifier)
+            # Word count is only an estimate of synthesized duration.  Use the
+            # timing ratio itself (rounded to a practical whole-word budget),
+            # then let measured TTS duration drive the bounded recovery loop.
+            # An additional arbitrary compression factor makes mild overflows
+            # needlessly hard to satisfy and can discard meaning before TTS.
+            target_word_count = max(2, int(
+                len(translated_text.split()) * (max_playback_rate / required_rate) + 0.5
+            ))
+            target_word_counts[identifier] = target_word_count
             payload_segments.append({
                 "id": identifier,
                 "source_text": source_text.strip(),
@@ -768,14 +815,14 @@ class GeminiTranslationProvider:
                 "required_rate": required_rate,
                 "max_playback_rate": max_playback_rate,
                 "target_length_ratio": max_playback_rate / required_rate,
-                "target_word_count": max(3, int(len(translated_text.split()) * (max_playback_rate / required_rate) * 0.72)),
+                "target_word_count": target_word_count,
             })
         prompt = (
             "Rewrite each Vietnamese dubbing line to fit its timing target. Preserve "
             "the complete meaning, names, numbers, units, negation, and key details. "
             "Use concise natural spoken Vietnamese; do not add commentary or drop, "
             "combine, reorder, or split entries. Respect each entry target_word_count "
-            "as a hard maximum whenever possible. Return JSON only: an object with a "
+            "as a hard maximum. Return JSON only: an object with a "
             "'segments' array, each containing its unchanged 'id' and non-empty "
             "'shortened_text'. Input JSON:\n"
             + json.dumps({"source_language": source_language, "segments": payload_segments},
@@ -787,7 +834,8 @@ class GeminiTranslationProvider:
             if validation_attempt:
                 request_prompt += (
                     "\nSTRICT RETRY: Copy every input id exactly once. Do not invent, "
-                    "omit, duplicate, rename, reorder, or alter any id."
+                    "omit, duplicate, rename, reorder, or alter any id. Each shortened_text "
+                    "MUST have no more whitespace-separated words than its target_word_count."
                 )
             try:
                 response = self._generate_content_with_retry(
@@ -810,7 +858,12 @@ class GeminiTranslationProvider:
                         raise ValueError("duplicate or invalid segment ID")
                     if not isinstance(shortened, str) or not shortened.strip():
                         raise ValueError("empty shortened translation")
-                    by_id[identifier] = shortened.strip()
+                    shortened = shortened.strip()
+                    if not _has_speakable_tts_text(shortened):
+                        raise ValueError("shortened translation has no speakable content")
+                    if len(shortened.split()) > target_word_counts[identifier]:
+                        raise ValueError("shortened translation exceeds target word count")
+                    by_id[identifier] = shortened
                 if set(by_id) != set(expected_ids):
                     raise ValueError("missing or unexpected segment ID")
                 return [by_id[identifier] for identifier in expected_ids]
@@ -839,6 +892,81 @@ class GeminiTranslationProvider:
                     target_language=target_language,
                 )
             )
+
+        if str(validation_error) not in {
+            "shortened translation exceeds target word count",
+            "shortened translation has no speakable content",
+        }:
+            raise LocalizationProviderError(
+                f"Gemini batch translation shortening failed: {validation_error}"
+            ) from validation_error
+
+        singleton = payload_segments[0]
+        target_word_count = target_word_counts[singleton["id"]]
+        strict_prompt = (
+            "Rewrite this one Vietnamese dubbing line with an exact target_word_count of "
+            f"{target_word_count}: it MUST contain no more than {target_word_count} "
+            "whitespace-separated Vietnamese words. This is a HARD "
+            "maximum: count the words before responding. Preserve names, numbers, units, "
+            "negation, and the core meaning. Use concise natural spoken Vietnamese. "
+            "Your output MUST contain speakable Vietnamese content: at least one letter or "
+            "number. Never return punctuation-only text. "
+            "Return only the rewritten Vietnamese line, with no JSON, labels, or commentary.\n"
+            f"Source ({source_language}): {singleton['source_text']}\n"
+            f"Current Vietnamese: {singleton['current_vietnamese']}"
+        )
+        previous_candidate = None
+        # The batch retries above already protect the structured protocol.  A
+        # singleton gets a few more chances because its response can be
+        # directed at the concrete overlong line rather than the original.
+        for strict_attempt in range(4):
+            request_prompt = strict_prompt
+            if previous_candidate is not None:
+                request_prompt += (
+                    "\nYour previous candidate below has "
+                    f"{len(previous_candidate.split())} whitespace-separated words, "
+                    f"which exceeds the exact target_word_count of {target_word_count}. "
+                    "Compress THAT candidate further. Preserve its core meaning, names, "
+                    "numbers, units, and negation. Return only the replacement Vietnamese "
+                    "line, with no JSON, labels, or commentary.\n"
+                    f"Previous candidate: {previous_candidate}"
+                )
+            try:
+                response = self._generate_content_with_retry(contents=request_prompt)
+                shortened = getattr(response, "text", None)
+                if not isinstance(shortened, str) or not shortened.strip():
+                    raise ValueError("empty shortened translation")
+                shortened = shortened.strip()
+                try:
+                    json.loads(shortened)
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    raise ValueError("invalid singleton shortened translation")
+                if shortened.startswith("```") or re.match(
+                    r"^(?:shortened_text|translation|vietnamese(?: translation)?|"
+                    r"bản dịch|câu trả lời|kết quả)\s*[:：]",
+                    shortened,
+                    re.IGNORECASE,
+                ):
+                    raise ValueError("invalid singleton shortened translation")
+                if not _has_speakable_tts_text(shortened):
+                    raise ValueError("shortened translation has no speakable content")
+                if len(shortened.split()) > target_word_count:
+                    previous_candidate = shortened
+                    raise ValueError("shortened translation exceeds target word count")
+                return [shortened]
+            except ValueError as exc:
+                validation_error = exc
+                if strict_attempt < 3:
+                    logger.warning(
+                        "Gemini singleton shortening returned invalid output; retrying (%d/3)",
+                        strict_attempt + 1,
+                    )
+            except Exception as exc:
+                raise LocalizationProviderError(
+                    f"Gemini batch translation shortening failed: {exc}"
+                ) from exc
         raise LocalizationProviderError(
             f"Gemini batch translation shortening failed: {validation_error}"
         ) from validation_error
@@ -855,6 +983,22 @@ class EdgeTTSProvider:
     # dropped connection.  This remains finite, while allowing more than three
     # minutes for Edge to become available again.
     transient_retry_delays = (5, 10, 20, 40, 60, 90, 120)
+
+    @staticmethod
+    def _save_with_attempt_timeout(communicate: object, output_file: str) -> None:
+        """Save one segment with a finite wall-clock limit."""
+        try:
+            asyncio.run(
+                asyncio.wait_for(
+                    communicate.save(output_file),
+                    timeout=EDGE_TTS_ATTEMPT_TIMEOUT_SECONDS,
+                )
+            )
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                "Edge TTS synthesis exceeded "
+                f"{EDGE_TTS_ATTEMPT_TIMEOUT_SECONDS} seconds"
+            ) from exc
 
     def __post_init__(self) -> None:
         if isinstance(self.max_concurrency, bool) or self.max_concurrency < 1:
@@ -1026,6 +1170,8 @@ class EdgeTTSProvider:
             raise ValueError("EdgeTTSProvider requires Vietnamese ('vi')")
         if not request.text.strip():
             raise ValueError("TTS text cannot be empty")
+        if not _has_speakable_tts_text(request.text):
+            raise ValueError("TTS text must contain at least one letter or number")
 
         try:
             import edge_tts
@@ -1061,6 +1207,7 @@ class EdgeTTSProvider:
         checkpoint_path.unlink(missing_ok=True)
         retry_delays = self.retry_delays
         max_attempts = len(retry_delays) + 1
+        consecutive_no_audio = 0
         with self._synthesis_slots:
             for attempt in range(1, max_attempts + 1):
                 output_path.unlink(missing_ok=True)
@@ -1071,14 +1218,27 @@ class EdgeTTSProvider:
                         rate=rate,
                         volume=volume,
                         pitch=pitch,
+                        connect_timeout=EDGE_TTS_CONNECT_TIMEOUT_SECONDS,
+                        receive_timeout=EDGE_TTS_RECEIVE_TIMEOUT_SECONDS,
                     )
-                    communicate.save_sync(output_file)
+                    self._save_with_attempt_timeout(communicate, output_file)
                     if output_path.is_file() and output_path.stat().st_size > 0:
                         break
                     raise NoAudioReceived(
                         "Edge TTS returned no audio data."
                     )
-                except (NoAudioReceived, WebSocketError) as exc:
+                except (NoAudioReceived, WebSocketError, TimeoutError) as exc:
+                    output_path.unlink(missing_ok=True)
+                    if isinstance(exc, NoAudioReceived):
+                        consecutive_no_audio += 1
+                        if consecutive_no_audio >= 2 and _is_proxifier_running():
+                            raise LocalizationProviderError(
+                                "Edge TTS received no audio repeatedly while Proxifier is "
+                                "running. Proxifier or its VPN proxy can block Edge TTS; "
+                                "disable Proxifier and try again."
+                            ) from exc
+                    else:
+                        consecutive_no_audio = 0
                     details = self._safe_exception_details(exc)
                     if attempt >= max_attempts:
                         output_path.unlink(missing_ok=True)

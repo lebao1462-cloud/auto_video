@@ -55,6 +55,7 @@ class Settings:
         LOCALIZATION_COVER_ORIGINAL_SUBTITLES = (
             "localization/cover-original-subtitles"
         )
+        LOCALIZATION_OUTPUT_DIRECTORY = "localization/output-directory"
         CUSTOM_FASTER_WHISPER_ID = "transcriber/custom-faster-whisper-id"
         HUGGINGFACE_MODEL_ID = "transcriber/huggingface-model-id"
 

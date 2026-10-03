@@ -99,6 +99,49 @@ def test_long_audio_borrows_following_silent_gap_at_natural_rate():
     assert segment.trailing_padding == pytest.approx(0.0)
 
 
+def test_final_segment_borrows_trailing_media_tail():
+    result = synchronize_for_localization(
+        make_transcript([make_segment(start=8.0, end=9.0, audio_duration=1.8)]),
+        media_end=10.0,
+    )
+
+    segment = result.segments[0]
+    assert segment.timing_action == "borrow_gap"
+    assert segment.playback_rate == pytest.approx(1.0)
+    assert segment.slot_duration == pytest.approx(1.8)
+
+
+def test_media_end_does_not_change_non_final_segment_boundary():
+    result = synchronize_for_localization(
+        make_transcript([
+            make_segment(start=0.0, end=1.0, audio_duration=2.1),
+            make_segment(start=2.0, end=3.0, audio_duration=1.0),
+        ]),
+        media_end=10.0,
+    )
+
+    assert result.segments[0].timing_action == "speed_up"
+    assert result.segments[0].slot_duration == pytest.approx(2.0)
+
+
+def test_omitted_media_end_preserves_final_segment_boundary():
+    with pytest.raises(TimingSynchronizationError, match="above maximum"):
+        synchronize_for_localization(
+            make_transcript([make_segment(end=1.0, audio_duration=1.5)])
+        )
+
+
+@pytest.mark.parametrize("media_end", [-1, "2.0", True, float("nan"), float("inf")])
+def test_rejects_invalid_media_end(media_end):
+    with pytest.raises(TimingSynchronizationError, match="Media end"):
+        synchronize_for_localization(make_transcript(), media_end=media_end)
+
+
+def test_rejects_media_end_before_final_segment_end():
+    with pytest.raises(TimingSynchronizationError, match="final segment end"):
+        synchronize_for_localization(make_transcript(), media_end=1.0)
+
+
 def test_long_audio_uses_smallest_speed_up_after_borrowing_gap():
     result = synchronize_for_localization(make_transcript([
         make_segment(start=0.0, end=2.0, audio_duration=3.2),
