@@ -15,6 +15,10 @@ class AudioMixingError(RuntimeError):
     """Raised when localized audio processing or mixing fails."""
 
 
+class AudioMixingCancelled(RuntimeError):
+    """Raised when localized audio processing is cancelled."""
+
+
 # Keep ample headroom below Windows' 32,767-character CreateProcess limit for
 # input/output paths and the rest of the FFmpeg arguments.
 _FILTER_COMPLEX_SCRIPT_THRESHOLD = 8192
@@ -60,9 +64,10 @@ def _ffmpeg_env() -> dict:
     return env
 
 
-def _run_ffmpeg(command: list[str]) -> None:
+def _run_ffmpeg(command: list[str], *, cancel_event=None) -> None:
     kwargs = {
-        "capture_output": True,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
         "text": True,
         "encoding": "utf-8",
         "errors": "replace",
@@ -75,9 +80,31 @@ def _run_ffmpeg(command: list[str]) -> None:
         kwargs["startupinfo"] = startupinfo
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-    result = subprocess.run(command, **kwargs)
-    if result.returncode != 0:
-        message = (result.stderr or result.stdout or "unknown ffmpeg error").strip()
+    if cancel_event is not None and cancel_event.is_set():
+        raise AudioMixingCancelled("Audio processing was cancelled")
+    process = subprocess.Popen(command, **kwargs)
+    cancelled = False
+    while process.poll() is None:
+        if cancel_event is not None and cancel_event.is_set():
+            cancelled = True
+            process.terminate()
+            try:
+                stdout, stderr = process.communicate(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate()
+            break
+        try:
+            stdout, stderr = process.communicate(timeout=0.05)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    else:
+        stdout, stderr = process.communicate()
+    if cancelled:
+        raise AudioMixingCancelled("Audio processing was cancelled")
+    if process.returncode != 0:
+        message = (stderr or stdout or "unknown ffmpeg error").strip()
         raise AudioMixingError(f"FFmpeg failed: {message}")
 
 
@@ -136,6 +163,7 @@ def extract_audio_track(
     sample_rate: int = 48000,
     channels: int = 2,
     ffmpeg_runner: Callable[[list[str]], None] = _run_ffmpeg,
+    cancel_event=None,
 ) -> str:
     """Extract a PCM WAV audio track from a source video/audio file."""
     source_path = Path(source_media_file)
@@ -163,7 +191,10 @@ def extract_audio_track(
         "pcm_s16le",
         str(output_path),
     ]
-    ffmpeg_runner(command)
+    if ffmpeg_runner is _run_ffmpeg:
+        ffmpeg_runner(command, cancel_event=cancel_event)
+    else:
+        ffmpeg_runner(command)
     if not output_path.is_file():
         raise AudioMixingError("FFmpeg did not create the extracted audio file")
     return str(output_path)
@@ -420,7 +451,7 @@ def mix_localized_audio(
             if mix_options.speech_gain_db:
                 chain.append(f"volume={mix_options.speech_gain_db}dB")
             chain.extend([
-                f"adelay={round(float(segment.start) * 1000)}:all=1",
+                f"adelay={round((float(segment.start) - float(segment.audio_start_advance)) * 1000)}:all=1",
                 f"apad=whole_dur={final_duration:.6f}", "asetpts=N/SR/TB",
                 f"atrim=0:{final_duration:.6f}",
             ])
@@ -468,7 +499,7 @@ def mix_localized_audio(
             batch = segments[offset:offset + _MAX_MIX_INPUTS]
             # Use millisecond-aligned batch origins so splitting the delay over
             # multiple stages cannot introduce an extra rounding millisecond.
-            origin = min(round(float(segment.start) * 1000) for segment in batch) / 1000
+            origin = min(round((float(segment.start) - float(segment.audio_start_advance)) * 1000) for segment in batch) / 1000
             end = max(
                 max(float(segment.end), float(segment.start) + float(segment.slot_duration))
                 for segment in batch
@@ -485,7 +516,7 @@ def mix_localized_audio(
                 if mix_options.speech_gain_db:
                     chain.append(f"volume={mix_options.speech_gain_db}dB")
                 chain.extend([
-                    f"adelay={round((float(segment.start) - origin) * 1000)}:all=1",
+                    f"adelay={round((float(segment.start) - float(segment.audio_start_advance) - origin) * 1000)}:all=1",
                     f"apad=whole_dur={duration:.6f}", "asetpts=N/SR/TB",
                     f"atrim=0:{duration:.6f}",
                 ])

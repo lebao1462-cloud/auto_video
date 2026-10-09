@@ -9,6 +9,8 @@ from buzz.localization.final_render import (
     FinalRenderError,
     FinalRenderOptions,
     FinalRenderResult,
+    blur_bilibili_watermark_video,
+    build_bilibili_watermark_filter_graph,
     render_localized_mp4,
 )
 
@@ -89,9 +91,11 @@ def test_burn_subtitle_command_reencodes_video(tmp_path):
     assert command[command.index("-c:v") + 1] == "libx264"
     assert command[command.index("-crf") + 1] == "20"
     assert command[command.index("-preset") + 1] == "fast"
+    assert command[command.index("-threads") + 1] == "4"
     vf = command[command.index("-vf") + 1]
     assert vf.startswith("subtitles='")
     assert "viet.srt" in vf
+    assert "force_style='WrapStyle=2'" in vf
 
 
 def test_no_subtitle_mode_does_not_require_subtitle(tmp_path):
@@ -421,6 +425,7 @@ def test_burn_subtitle_can_blur_original_subtitle_area(tmp_path):
     assert "[base][blurred]overlay=0:H-h[covered]" in fc
     assert "color=black@0.22:t=fill" in fc
     assert "subtitles='" in fc
+    assert "force_style='WrapStyle=2'" in fc
     assert command[command.index("-map") + 1] == "[vout]"
 
 def test_cover_options_are_validated():
@@ -434,3 +439,121 @@ def test_cover_options_are_validated():
         FinalRenderOptions(cover_dark_opacity=-0.1)
     with pytest.raises(ValueError, match="cover_dark_opacity"):
         FinalRenderOptions(cover_dark_opacity=1.1)
+
+
+def test_bilibili_watermark_graph_composes_with_bottom_cover_and_subtitles(tmp_path):
+    video, audio, subtitle = create_inputs(tmp_path)
+    runner = FakeRunner()
+    render_localized_mp4(
+        video, audio, tmp_path / "final.mp4", subtitle_file=subtitle,
+        options=FinalRenderOptions(subtitle_mode="burn", cover_original_subtitles=True,
+                                   blur_bilibili_watermark=True), ffmpeg_runner=runner,
+    )
+    graph = runner.commands[0][runner.commands[0].index("-filter_complex") + 1]
+    assert "crop=iw*0.2400:ih*0.1500:iw*0.7600:ih*0.0000" in graph
+    assert "boxblur=luma_radius=24:luma_power=2" in graph
+    assert "drawbox=x=iw*0.7600:y=ih*0.0000:w=iw*0.2400:h=ih*0.1500:color=black@0.18:t=fill" in graph
+    assert "crop=iw:ih*0.1800:0:ih*0.8200" in graph
+    assert "subtitles='" in graph
+
+
+def test_ben_review_logo_composes_after_watermark_cover_and_subtitles(tmp_path):
+    video, audio, subtitle = create_inputs(tmp_path)
+    runner = FakeRunner()
+    render_localized_mp4(
+        video, audio, tmp_path / "final.mp4", subtitle_file=subtitle,
+        options=FinalRenderOptions(
+            subtitle_mode="burn", cover_original_subtitles=True,
+            blur_bilibili_watermark=True, overlay_ben_review_logo=True,
+        ), ffmpeg_runner=runner,
+    )
+    command = runner.commands[0]
+    graph = command[command.index("-filter_complex") + 1]
+    assert command.count("-filter_complex") == 1
+    assert "[2:v]format=rgba[ben_review_logo_rgba]" in graph
+    assert "[ben_review_logo_rgba][subtitle_burned]scale2ref=w=oh*main_w/main_h:h=ih*0.115" in graph
+    assert "overlay=x=W-w-W*0.01:y=H*0.01:shortest=1:repeatlast=0[vout]" in graph
+    assert graph.index("watermark_covered") < graph.index("subtitles=") < graph.index("[ben_review_base][ben_review_logo]overlay")
+
+
+@pytest.mark.parametrize("mode", ["soft", "none"])
+def test_ben_review_logo_reencodes_and_uses_correct_inputs(tmp_path, mode):
+    video, audio, subtitle = create_inputs(tmp_path)
+    runner = FakeRunner()
+    render_localized_mp4(
+        video, audio, tmp_path / "final.mp4",
+        subtitle_file=subtitle if mode == "soft" else None,
+        options=FinalRenderOptions(subtitle_mode=mode, overlay_ben_review_logo=True),
+        ffmpeg_runner=runner,
+    )
+    command = runner.commands[0]
+    assert command[command.index("-c:v") + 1] == "libx264"
+    assert "[ben_review_logo_rgba][0:v]scale2ref" in command[command.index("-filter_complex") + 1]
+    if mode == "soft":
+        assert "3:0" in command
+
+
+def test_enabled_ben_review_logo_requires_existing_file(tmp_path):
+    video, audio, subtitle = create_inputs(tmp_path)
+    with pytest.raises(FinalRenderError, match="Ben review logo file does not exist"):
+        render_localized_mp4(
+            video, audio, tmp_path / "final.mp4", subtitle_file=subtitle,
+            options=FinalRenderOptions(
+                overlay_ben_review_logo=True,
+                ben_review_logo_path=tmp_path / "missing.png",
+            ), ffmpeg_runner=FakeRunner(),
+        )
+
+
+def test_real_ffmpeg_ben_review_logo_is_1080p_and_keeps_audio(tmp_path):
+    video, audio, _ = create_inputs(tmp_path)
+    output = tmp_path / "logo.mp4"
+    _run_raw_ffmpeg([
+        "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=black:s=1920x1080:d=1",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video),
+    ])
+    _make_wav(audio)
+    render_localized_mp4(
+        video, audio, output,
+        options=FinalRenderOptions(subtitle_mode="none", overlay_ben_review_logo=True, preset="ultrafast"),
+    )
+    probe = subprocess.run([
+        "ffprobe", "-v", "error", "-show_entries", "stream=codec_type,width,height",
+        "-of", "default=noprint_wrappers=1", str(output),
+    ], check=True, capture_output=True, text=True)
+    assert "width=1920" in probe.stdout and "height=1080" in probe.stdout
+    assert "codec_type=audio" in probe.stdout
+    frame = tmp_path / "logo.png"
+    _run_raw_ffmpeg(["ffmpeg", "-y", "-i", str(output), "-frames:v", "1", str(frame)])
+    from PIL import Image
+    # The 11.5%-high logo occupies the upper-right; this pixel is inside it.
+    assert Image.open(frame).convert("RGB").getpixel((1810, 70)) != (0, 0, 0)
+
+
+@pytest.mark.parametrize("mode", ["soft", "none"])
+def test_bilibili_watermark_reencodes_video_outside_burn_mode(tmp_path, mode):
+    video, audio, subtitle = create_inputs(tmp_path)
+    runner = FakeRunner()
+    render_localized_mp4(
+        video, audio, tmp_path / "final.mp4",
+        subtitle_file=subtitle if mode == "soft" else None,
+        options=FinalRenderOptions(subtitle_mode=mode, blur_bilibili_watermark=True),
+        ffmpeg_runner=runner,
+    )
+    command = runner.commands[0]
+    assert command[command.index("-c:v") + 1] == "libx264"
+    assert "[vout]" in command
+
+
+def test_bilibili_watermark_options_and_standalone_command(tmp_path):
+    with pytest.raises(ValueError, match="fit within the frame width"):
+        FinalRenderOptions(bilibili_watermark_x_ratio=.8, bilibili_watermark_width_ratio=.3)
+    with pytest.raises(ValueError, match="bilibili_watermark_blur_radius"):
+        FinalRenderOptions(bilibili_watermark_blur_radius=0)
+    options = FinalRenderOptions(blur_bilibili_watermark=True)
+    assert "[0:v]split=2" in build_bilibili_watermark_filter_graph(options)
+    video, _, _ = create_inputs(tmp_path)
+    runner = FakeRunner()
+    blur_bilibili_watermark_video(video, tmp_path / "blurred.mp4", options=options, ffmpeg_runner=runner)
+    assert "-c:a" in runner.commands[0]
+    assert runner.commands[0][runner.commands[0].index("-c:a") + 1] == "copy"

@@ -24,6 +24,8 @@ def test_simple_ui_uses_fixed_pipeline_defaults(qtbot, monkeypatch):
     assert dialog.subtitle_mode_combo.currentData() == "burn"
     assert dialog.cover_original_subtitles_checkbox.isChecked() is True
     assert dialog.cover_original_subtitles_checkbox.isEnabled() is True
+    assert dialog.blur_bilibili_watermark_checkbox.isChecked() is True
+    assert dialog.overlay_ben_review_logo_checkbox.isChecked() is True
     assert dialog.background_checkbox.isChecked() is False
     assert dialog.start_button.text() == "Bắt đầu"
     assert dialog.cancel_button.text() == "Hủy"
@@ -40,6 +42,8 @@ def test_simple_ui_only_exposes_video_key_and_voice(qtbot, monkeypatch):
     assert dialog.translation_model_edit.parent() is None
     assert dialog.subtitle_mode_combo.parent() is None
     assert dialog.cover_original_subtitles_checkbox.parent() is None
+    assert dialog.blur_bilibili_watermark_checkbox.parent() is not None
+    assert dialog.overlay_ben_review_logo_checkbox.parent() is not None
     assert dialog.background_checkbox.parent() is None
 
 
@@ -114,6 +118,8 @@ def test_worker_uses_gemini_paraformer_and_timing_policy(monkeypatch):
         tts_voice="vi-VN-HoaiMyNeural",
         subtitle_mode="burn",
         cover_original_subtitles=True,
+        blur_bilibili_watermark=True,
+        overlay_ben_review_logo=True,
         use_background_separation=False,
     )
     worker.run()
@@ -126,4 +132,6 @@ def test_worker_uses_gemini_paraformer_and_timing_policy(monkeypatch):
     assert args[5].timing_policy == TimingPolicy()
     assert args[5].render_options.subtitle_mode == "burn"
     assert args[5].render_options.cover_original_subtitles is True
+    assert args[5].render_options.blur_bilibili_watermark is True
+    assert args[5].render_options.overlay_ben_review_logo is True
     assert args[5].use_background_separation is False

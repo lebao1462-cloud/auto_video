@@ -11,6 +11,10 @@ from buzz.localization.tts import (
 # Durations from timestamp and encoded-audio probes can differ by a few frames.
 # Accept at most a 0.5% rate overrun, but render at the configured maximum.
 _MAX_PLAYBACK_RATE_RELATIVE_TOLERANCE = 0.005
+# Audio may start slightly before its subtitle when the immediately preceding
+# *source* gap is silent. This is deliberately not a general timeline shift.
+_MAX_PRECEDING_GAP_BORROW_SECONDS = 0.25
+_PRECEDING_GAP_SAFETY_MARGIN_SECONDS = 0.005
 
 
 class TimingSynchronizationError(ValueError):
@@ -60,6 +64,7 @@ class TimedLocalizationSegment:
     adjusted_audio_duration: float = 0.0
     leading_padding: float = 0.0
     trailing_padding: float = 0.0
+    audio_start_advance: float = 0.0
     timing_action: str = "none"
 
     def to_dict(self) -> dict:
@@ -78,6 +83,7 @@ class TimedLocalizationSegment:
             "adjusted_audio_duration": self.adjusted_audio_duration,
             "leading_padding": self.leading_padding,
             "trailing_padding": self.trailing_padding,
+            "audio_start_advance": self.audio_start_advance,
             "timing_action": self.timing_action,
         }
 
@@ -89,6 +95,9 @@ class TimedLocalizationTranscript:
     target_language: str
     timing_policy: TimingPolicy
     segments: tuple[TimedLocalizationSegment, ...]
+    # Kept structurally loose to avoid a dependency cycle with the experimental
+    # renderer.  Values are StillFrameExtensionEvent instances when present.
+    video_extensions: tuple = ()
 
     def to_dict(self) -> dict:
         return {
@@ -100,6 +109,7 @@ class TimedLocalizationTranscript:
                 "max_playback_rate": self.timing_policy.max_playback_rate,
             },
             "segments": [segment.to_dict() for segment in self.segments],
+            "video_extensions": [event.to_dict() for event in self.video_extensions],
         }
 
 
@@ -154,9 +164,15 @@ def synchronize_for_localization(
         previous_end = _validate_segment(segment, previous_end)
 
     if media_end is not None and media_end < float(transcript.segments[-1].end):
-        raise TimingSynchronizationError(
-            "Media end must be at or after the final segment end"
-        )
+        # ASR timestamps are rounded independently of container durations.
+        # Permit sub-frame rounding at the end without truncating the transcript.
+        overrun = float(transcript.segments[-1].end) - media_end
+        if overrun <= 0.05:
+            media_end = float(transcript.segments[-1].end)
+        else:
+            raise TimingSynchronizationError(
+                "Media end must be at or after the final segment end"
+            )
 
     timed_segments = []
     for index, segment in enumerate(transcript.segments):
@@ -172,6 +188,7 @@ def synchronize_for_localization(
         available_duration = next_start - float(segment.start)
         slot_duration = source_slot_duration
         audio_duration = float(segment.audio_duration)
+        audio_start_advance = 0.0
         required_rate = audio_duration / source_slot_duration
 
         if abs(required_rate - 1.0) < 1e-9:
@@ -204,6 +221,27 @@ def synchronize_for_localization(
                 tolerated_max_rate = timing_policy.max_playback_rate * (
                     1.0 + _MAX_PLAYBACK_RATE_RELATIVE_TOLERANCE
                 )
+                if required_rate > tolerated_max_rate and timed_segments:
+                    # Borrow only the physical source gap immediately before
+                    # this subtitle, and only after prior synthesized speech
+                    # has ended. Subtitle timestamps remain immutable.
+                    prior = timed_segments[-1]
+                    prior_audio_end = (
+                        prior.start - prior.audio_start_advance
+                        + prior.adjusted_audio_duration
+                    )
+                    physical_gap = max(0.0, float(segment.start) - prior.end)
+                    free_gap = min(
+                        _MAX_PRECEDING_GAP_BORROW_SECONDS,
+                        physical_gap,
+                        max(0.0, float(segment.start) - prior_audio_end),
+                    )
+                    free_gap = max(0.0, free_gap - _PRECEDING_GAP_SAFETY_MARGIN_SECONDS)
+                    needed = audio_duration / timing_policy.max_playback_rate - available_duration
+                    if 0.0 < needed <= free_gap:
+                        audio_start_advance = min(free_gap, needed + 0.002)
+                        available_duration += audio_start_advance
+                        required_rate = audio_duration / available_duration
                 if required_rate > tolerated_max_rate:
                     raise TimingSynchronizationError(
                         "Segment "
@@ -215,7 +253,7 @@ def synchronize_for_localization(
                     )
                 playback_rate = min(required_rate, timing_policy.max_playback_rate)
                 slot_duration = available_duration
-                adjusted_duration = available_duration
+                adjusted_duration = (audio_duration / playback_rate if audio_start_advance else available_duration)
                 trailing_padding = 0.0
                 action = "speed_up"
 
@@ -235,6 +273,7 @@ def synchronize_for_localization(
                 adjusted_audio_duration=float(adjusted_duration),
                 leading_padding=0.0,
                 trailing_padding=float(max(0.0, trailing_padding)),
+                audio_start_advance=float(audio_start_advance),
                 timing_action=action,
             )
         )

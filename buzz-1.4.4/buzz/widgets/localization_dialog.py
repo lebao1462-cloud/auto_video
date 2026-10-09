@@ -28,6 +28,7 @@ from buzz.localization.preflight import (
 from buzz.localization.providers import (
     ArgosTranslationProvider,
     EdgeTTSProvider,
+    VieNeuTTSProvider,
     GeminiTranslationProvider,
     NLLBTranslationProvider,
     OpenAICompatibleTranslationProvider,
@@ -39,6 +40,7 @@ from buzz.localization.workflow import (
     LocalizationWorkflowOptions,
     localize_video,
 )
+from buzz.localization.voices import TTS_VOICE_CHOICES, parse_tts_voice
 from buzz.settings.settings import Settings
 from buzz.store.keyring_store import Key, get_password, set_password
 from buzz.transcriber.transcriber import Task, TranscriptionOptions
@@ -64,7 +66,9 @@ class LocalizationWorker(QObject):
         tts_voice: str,
         subtitle_mode: str,
         cover_original_subtitles: bool,
-        use_background_separation: bool,
+        blur_bilibili_watermark: bool,
+        overlay_ben_review_logo: bool = True,
+        use_background_separation: bool = False,
     ):
         super().__init__()
         self.source_video = source_video
@@ -77,6 +81,8 @@ class LocalizationWorker(QObject):
         self.tts_voice = tts_voice
         self.subtitle_mode = subtitle_mode
         self.cover_original_subtitles = cover_original_subtitles
+        self.blur_bilibili_watermark = blur_bilibili_watermark
+        self.overlay_ben_review_logo = overlay_ben_review_logo
         self.use_background_separation = use_background_separation
         self.cancel_event = threading.Event()
 
@@ -87,6 +93,7 @@ class LocalizationWorker(QObject):
         self.progress.emit(round(progress.fraction * 100), progress.message)
 
     def run(self):
+        tts_provider = None
         try:
             if self.translation_provider_name == "argos":
                 translation_provider = ArgosTranslationProvider()
@@ -103,7 +110,10 @@ class LocalizationWorker(QObject):
                     model=self.translation_model,
                     base_url=self.translation_base_url,
                 )
-            tts_provider = EdgeTTSProvider(default_voice=self.tts_voice)
+            tts_provider_name, tts_voice = parse_tts_voice(self.tts_voice)
+            tts_provider = (VieNeuTTSProvider(default_voice=tts_voice)
+                            if tts_provider_name == "vieneu" else EdgeTTSProvider(
+                                default_voice=tts_voice, batch_enabled=False))
             result = localize_video(
                 self.source_video,
                 TranscriptionOptions(
@@ -116,11 +126,13 @@ class LocalizationWorker(QObject):
                 LocalizationWorkflowOptions(
                     output_directory=self.output_directory,
                     use_background_separation=self.use_background_separation,
-                    tts_voice=self.tts_voice,
+                    tts_voice=tts_voice,
                     timing_policy=TimingPolicy(),
                     render_options=FinalRenderOptions(
                         subtitle_mode=self.subtitle_mode,
                         cover_original_subtitles=self.cover_original_subtitles,
+                        blur_bilibili_watermark=self.blur_bilibili_watermark,
+                        overlay_ben_review_logo=self.overlay_ben_review_logo,
                     ),
                 ),
                 progress_callback=self._on_progress,
@@ -133,6 +145,9 @@ class LocalizationWorker(QObject):
         except Exception as exc:
             self.failed.emit(str(exc))
         finally:
+            close_tts = getattr(tts_provider, "close", None)
+            if callable(close_tts):
+                close_tts()
             self.finished.emit()
 
 
@@ -212,8 +227,8 @@ class LocalizationDialog(QDialog):
         self.language_combo.addItem("Chinese", "zh")
 
         self.voice_combo = QComboBox()
-        self.voice_combo.addItem("Hoai My - Female", "vi-VN-HoaiMyNeural")
-        self.voice_combo.addItem("Nam Minh - Male", "vi-VN-NamMinhNeural")
+        for label, value in TTS_VOICE_CHOICES:
+            self.voice_combo.addItem(label, value)
 
         self.subtitle_mode_combo = QComboBox()
         self.subtitle_mode_combo.addItem("Soft subtitle", "soft")
@@ -231,6 +246,19 @@ class LocalizationDialog(QDialog):
         self.cover_original_subtitles_checkbox.setChecked(True)
         self.cover_original_subtitles_checkbox.setToolTip(
             "Blurs the lower 18% of the video, adds a light dark overlay, then burns Vietnamese subtitles on top."
+        )
+        self.blur_bilibili_watermark_checkbox = QCheckBox(
+            "Làm mờ logo Bilibili (góc phải trên)"
+        )
+        self.blur_bilibili_watermark_checkbox.setChecked(True)
+        self.blur_bilibili_watermark_checkbox.setToolTip(
+            "Blurs and lightly darkens the upper-right 24% × 15% watermark region."
+        )
+
+        self.overlay_ben_review_logo_checkbox = QCheckBox("Chèn logo Ben review")
+        self.overlay_ben_review_logo_checkbox.setChecked(True)
+        self.overlay_ben_review_logo_checkbox.setToolTip(
+            "Adds the approved Ben review logo at the upper-right of the output video."
         )
 
         self.background_checkbox = QCheckBox(
@@ -255,9 +283,11 @@ class LocalizationDialog(QDialog):
         self.api_key_edit.setPlaceholderText("Nhập Gemini API key")
         form.addRow(self.api_key_label, self.api_key_edit)
         form.addRow("Giọng Việt:", self.voice_combo)
+        form.addRow("", self.blur_bilibili_watermark_checkbox)
+        form.addRow("", self.overlay_ben_review_logo_checkbox)
 
         pipeline_label = QLabel(
-            "Tự động: Paraformer-zh → Gemini → Edge TTS → phụ đề Việt"
+            "Tự động: Paraformer-zh → Gemini → Edge / VieNeu TTS → phụ đề Việt"
         )
         pipeline_label.setWordWrap(True)
         form.addRow("", pipeline_label)
@@ -481,6 +511,8 @@ class LocalizationDialog(QDialog):
                 self.cover_original_subtitles_checkbox.isChecked()
                 and self.subtitle_mode_combo.currentData() == "burn"
             ),
+            blur_bilibili_watermark=self.blur_bilibili_watermark_checkbox.isChecked(),
+            overlay_ben_review_logo=self.overlay_ben_review_logo_checkbox.isChecked(),
             use_background_separation=self.background_checkbox.isChecked(),
         )
         self.worker.moveToThread(self.worker_thread)

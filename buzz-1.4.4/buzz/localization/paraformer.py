@@ -2,16 +2,20 @@
 
 import gc
 import importlib.util
+import multiprocessing
 import os
 from pathlib import Path
+import queue
 import sys
 import tempfile
 import threading
 from typing import Any
 import unicodedata
 
-from buzz.localization.audio_mix import extract_audio_track
-from buzz.localization.transcript import LocalizationSegment, LocalizationTranscript
+from buzz.localization.audio_mix import AudioMixingCancelled, extract_audio_track
+from buzz.localization.transcript import (
+    LocalizationSegment, LocalizationTranscript, LocalizationTranscriptionCancelled,
+)
 
 PARAFORMER_ENGINE = "paraformer-zh"
 _MODEL_DIRECTORIES = {
@@ -21,56 +25,115 @@ _MODEL_DIRECTORIES = {
 }
 
 
-class _SharedParaformerModel:
-    """Lazy, retryable process-wide FunASR model cache.
+def _paraformer_worker(requests, responses) -> None:
+    """Spawn-safe worker target.  The model deliberately never enters the GUI process."""
+    model = None
+    while True:
+        request = requests.get()
+        if request is None:
+            return
+        request_id, wav = request
+        try:
+            if model is None:
+                from funasr import AutoModel
+                local_models = paraformer_model_paths()
+                model = AutoModel(
+                    model=(local_models or {}).get("model", PARAFORMER_ENGINE),
+                    vad_model=(local_models or {}).get("vad", "fsmn-vad"),
+                    punc_model=(local_models or {}).get("punc", "ct-punc-c"),
+                    vad_kwargs={"max_single_segment_time": 30000}, device="cpu",
+                    ncpu=min(4, max(1, os.cpu_count() or 1)),
+                    disable_update=True, disable_pbar=True,
+                )
+            responses.put((request_id, True, model.generate(
+                input=wav, sentence_timestamp=True, return_raw_text=True,
+                batch_size_s=60, batch_size_threshold_s=30,
+            )))
+        except Exception as exc:
+            responses.put((request_id, False, f"{type(exc).__name__}: {exc}"))
 
-    Loading Paraformer also loads its VAD and punctuation models, which is too
-    expensive to repeat for every dashboard row.  The inference lock remains
-    separate from construction so a failed initial load is never cached.
-    """
 
-    def __init__(self) -> None:
-        self._model: Any | None = None
-        self._load_lock = threading.Lock()
-        self.inference_lock = threading.Lock()
+class _ParaformerWorkerService:
+    """One spawned model host, reused until cancellation, failure, or shutdown."""
 
-    def get(self) -> Any:
-        if self._model is not None:
-            return self._model
-        with self._load_lock:
-            if self._model is not None:
-                return self._model
-            from funasr import AutoModel
+    def __init__(self, target=_paraformer_worker) -> None:
+        self._target = target
+        self._process = self._requests = self._responses = None
+        self._lifecycle_lock = threading.Lock()
+        self._request_lock = threading.Lock()
+        self._next_request = 0
 
-            local_models = paraformer_model_paths()
-            # Assign only after a complete successful construction; callers
-            # can retry after a transient/corrupt-cache failure.
-            model = AutoModel(
-                model=(local_models or {}).get("model", PARAFORMER_ENGINE),
-                vad_model=(local_models or {}).get("vad", "fsmn-vad"),
-                punc_model=(local_models or {}).get("punc", "ct-punc-c"),
-                vad_kwargs={"max_single_segment_time": 30000},
-                device="cpu",
-                ncpu=min(4, max(1, os.cpu_count() or 1)),
-                disable_update=True,
-                disable_pbar=True,
-            )
-            self._model = model
-            return model
+    def _start(self) -> None:
+        if self._process is not None and self._process.is_alive():
+            return
+        self._close_locked()
+        context = multiprocessing.get_context("spawn")
+        self._requests, self._responses = context.Queue(), context.Queue()
+        self._process = context.Process(target=self._target, args=(self._requests, self._responses))
+        self._process.start()
 
-    def reset(self) -> None:
-        """Release the cached model (primarily for tests and app shutdown)."""
-        with self._load_lock:
-            self._model = None
+    def _close_locked(self) -> None:
+        process, requests, responses = self._process, self._requests, self._responses
+        self._process = self._requests = self._responses = None
+        if process is not None:
+            if process.is_alive():
+                try:
+                    requests.put_nowait(None)
+                    process.join(0.5)
+                except (OSError, ValueError):
+                    pass
+            if process.is_alive():
+                process.terminate()
+                process.join(1)
+            if process.is_alive() and hasattr(process, "kill"):
+                process.kill()
+                process.join(1)
+            if not process.is_alive():
+                process.join()
+                process.close()
+        for channel in (requests, responses):
+            if channel is not None:
+                # A terminated worker cannot drain a pipe; never let cleanup
+                # delay cancellation while a queue feeder is flushing.
+                channel.cancel_join_thread()
+                channel.close()
+
+    def shutdown(self) -> None:
+        with self._lifecycle_lock:
+            self._close_locked()
         gc.collect()
 
+    def generate(self, wav: str, cancel_event=None) -> Any:
+        with self._request_lock:
+            with self._lifecycle_lock:
+                self._start()
+                self._next_request += 1
+                request_id = self._next_request
+                self._requests.put((request_id, wav))
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    self.shutdown()
+                    raise LocalizationTranscriptionCancelled("Localization was cancelled during Paraformer transcription")
+                try:
+                    response_id, ok, value = self._responses.get(timeout=0.05)
+                except queue.Empty:
+                    with self._lifecycle_lock:
+                        if self._process is None or not self._process.is_alive():
+                            self._close_locked()
+                            raise RuntimeError("Paraformer worker exited unexpectedly")
+                    continue
+                if response_id == request_id:
+                    if not ok:
+                        raise RuntimeError(value)
+                    return value
 
-_SHARED_MODEL = _SharedParaformerModel()
+
+_PARAFORMER_WORKER = _ParaformerWorkerService()
 
 
 def reset_paraformer_model_cache() -> None:
-    """Clear the process-wide Paraformer model cache."""
-    _SHARED_MODEL.reset()
+    """Stop the worker and release its cached model."""
+    _PARAFORMER_WORKER.shutdown()
 
 
 def modelscope_cache_path() -> Path:
@@ -254,25 +317,24 @@ def _segments_from_tokens(result: dict[str, Any]) -> list[LocalizationSegment]:
     return segments
 
 
-def transcribe_with_paraformer(video_path: str) -> LocalizationTranscript:
+def transcribe_with_paraformer(video_path: str, *, cancel_event=None) -> LocalizationTranscript:
     source = Path(video_path)
     if not source.is_file():
         raise ValueError(f"Input media file does not exist: {video_path}")
     if not paraformer_runtime_available():
         raise RuntimeError("FunASR runtime is missing. Install funasr==1.4.16 or choose Whisper.")
+    if cancel_event is not None and cancel_event.is_set():
+        raise LocalizationTranscriptionCancelled("Localization was cancelled during Paraformer transcription")
     configure_modelscope_cache()  # must precede the lazy FunASR import
     temp_dir = _temporary_directory()
     wav = temp_dir / f"autovideo-paraformer-{next(tempfile._get_candidate_names())}.wav"
     try:
-        extract_audio_track(source, wav, sample_rate=16000, channels=1)
-        model = _SHARED_MODEL.get()
-        # Workflow's CPU-heavy gate serializes jobs; retain this lock for
-        # direct API users so shared-model generate() is never concurrent.
-        with _SHARED_MODEL.inference_lock:
-            generated = model.generate(
-                input=str(wav), sentence_timestamp=True, return_raw_text=True,
-                batch_size_s=60, batch_size_threshold_s=30,
-            )
+        extract_audio_track(
+            source, wav, sample_rate=16000, channels=1, cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            raise LocalizationTranscriptionCancelled("Localization was cancelled during Paraformer transcription")
+        generated = _PARAFORMER_WORKER.generate(str(wav), cancel_event=cancel_event)
         result = generated[0] if isinstance(generated, list) and generated else generated
         if not isinstance(result, dict):
             raise RuntimeError("FunASR returned an invalid transcription result.")
@@ -280,6 +342,12 @@ def transcribe_with_paraformer(video_path: str) -> LocalizationTranscript:
         if not segments or any(not s.text or s.end < s.start for s in segments):
             raise RuntimeError("Paraformer produced no usable timestamped Chinese transcript.")
         return LocalizationTranscript("zh", str(source), tuple(segments))
+    except LocalizationTranscriptionCancelled:
+        raise
+    except AudioMixingCancelled as exc:
+        raise LocalizationTranscriptionCancelled(
+            "Localization was cancelled during Paraformer transcription"
+        ) from exc
     except RuntimeError:
         raise
     except Exception as exc:

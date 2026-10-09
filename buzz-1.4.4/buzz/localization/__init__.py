@@ -7,6 +7,7 @@ from buzz.localization.transcript import (
 from buzz.localization.translation import (
     TranslatedLocalizationSegment,
     TranslatedLocalizationTranscript,
+    RegisterReviewTranslationProvider,
     TranslationProvider,
     translate_for_localization,
 )
@@ -31,6 +32,8 @@ from buzz.localization.final_render import (
     FinalRenderError,
     FinalRenderOptions,
     FinalRenderResult,
+    blur_bilibili_watermark_video,
+    build_bilibili_watermark_filter_graph,
     render_localized_mp4,
 )
 from buzz.localization.subtitles import (
@@ -56,6 +59,7 @@ __all__ = [
     "transcribe_for_localization",
     "TranslatedLocalizationSegment",
     "TranslatedLocalizationTranscript",
+    "RegisterReviewTranslationProvider",
     "TranslationProvider",
     "translate_for_localization",
     "SynthesizedLocalizationSegment",
@@ -85,11 +89,14 @@ __all__ = [
     "FinalRenderError",
     "FinalRenderOptions",
     "FinalRenderResult",
+    "blur_bilibili_watermark_video",
+    "build_bilibili_watermark_filter_graph",
     "render_localized_mp4",
     "ArgosTranslationProvider",
     "NLLBTranslationProvider",
     "GeminiTranslationProvider",
     "EdgeTTSProvider",
+    "VieNeuTTSProvider",
     "LocalizationProviderError",
     "OpenAICompatibleTranslationProvider",
     "argos_route_available",
@@ -121,6 +128,7 @@ from buzz.localization.providers import (
     NLLBTranslationProvider,
     GeminiTranslationProvider,
     EdgeTTSProvider,
+    VieNeuTTSProvider,
     LocalizationProviderError,
     OpenAICompatibleTranslationProvider,
     argos_route_available,

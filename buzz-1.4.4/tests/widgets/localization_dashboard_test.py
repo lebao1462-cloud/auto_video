@@ -1,4 +1,6 @@
 from types import SimpleNamespace
+from pathlib import Path
+import os
 
 import pytest
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -6,7 +8,7 @@ from PyQt6.QtWidgets import QApplication
 
 from buzz.settings.settings import Settings as RealSettings
 from buzz.widgets.localization_dashboard import (
-    CANCELLED, COMPLETED, PROCESSING, WAITING, LocalizationDashboard,
+    CANCELLED, COMPLETED, FAILED, PROCESSING, WAITING, LocalizationDashboard, LocalizationJob,
 )
 
 
@@ -87,6 +89,24 @@ def test_initial_five_empty_slots(qtbot, tmp_path):
 def test_dashboard_uses_fake_settings_only(qtbot, tmp_path):
     dashboard(qtbot, tmp_path)
     assert len(FakeSettings.instances) == 1
+
+
+def test_non_persistent_dashboard_never_reads_or_writes_keyring(qtbot, monkeypatch):
+    reads, writes = [], []
+    monkeypatch.setattr(
+        "buzz.widgets.localization_dashboard.get_password",
+        lambda key: reads.append(key) or "real-secret-must-not-be-read",
+    )
+    monkeypatch.setattr(
+        "buzz.widgets.localization_dashboard.set_password",
+        lambda key, value: writes.append((key, value)),
+    )
+    view = LocalizationDashboard(worker_factory=FakeWorker, persist_api_key=False)
+    qtbot.add_widget(view)
+    view.api_key_edit.setText("scheduler-test-dummy-key")
+    view.save_api_key()
+    assert reads == []
+    assert writes == []
 
 
 def test_invalid_configured_output_directory_falls_back_to_default(qtbot, tmp_path, monkeypatch):
@@ -191,6 +211,8 @@ def test_completed_row_can_open_then_clear_a_slot(qtbot, tmp_path, monkeypatch):
     assert first.worker.kwargs["tts_voice"] == "vi-VN-NamMinhNeural"
     assert first.worker.kwargs["subtitle_mode"] == "burn"
     assert first.worker.kwargs["cover_original_subtitles"] is True
+    assert first.worker.kwargs["blur_bilibili_watermark"] is True
+    assert first.worker.kwargs["overlay_ben_review_logo"] is True
     first.worker.completed.emit(SimpleNamespace(final_video=SimpleNamespace(video_file="D:/final.mp4")))
     finish(qtbot, first.worker, first)
     opened = []
@@ -204,6 +226,16 @@ def test_completed_row_can_open_then_clear_a_slot(qtbot, tmp_path, monkeypatch):
     view.shutdown()
     active_job = view.active_jobs[0]
     finish(qtbot, active_job.worker, active_job)
+
+
+def test_logo_choice_is_snapshotted_when_a_job_is_added(qtbot, tmp_path):
+    view = dashboard(qtbot, tmp_path)
+    view.overlay_ben_review_logo_checkbox.setChecked(False)
+    job = view.add_videos([str(tmp_path / "one.mp4")])[0]
+    assert job.overlay_ben_review_logo is False
+    assert job.worker.kwargs["overlay_ben_review_logo"] is False
+    view.shutdown()
+    finish(qtbot, job.worker, job)
 
 
 def test_paraformer_cache_resets_only_after_final_active_thread(qtbot, tmp_path, monkeypatch):
@@ -220,3 +252,228 @@ def test_paraformer_cache_resets_only_after_final_active_thread(qtbot, tmp_path,
     second.worker.cancelled.emit()
     finish(qtbot, second.worker, second)
     assert resets == ["reset"]
+
+
+def test_thread_cleanup_waits_for_native_thread_before_releasing_refs(qtbot, tmp_path):
+    view = dashboard(qtbot, tmp_path)
+
+    class ThreadStillStopping:
+        def __init__(self):
+            self.wait_results = [False, True]
+            self.deleted = 0
+
+        def wait(self, timeout):
+            assert timeout == 0
+            return self.wait_results.pop(0)
+
+        def deleteLater(self):
+            self.deleted += 1
+
+    thread = ThreadStillStopping()
+    job = LocalizationJob("p01.mp4", str(tmp_path), status=FAILED, worker=object(), thread=thread)
+    view.jobs[0] = job
+    view.active_jobs.append(job)
+
+    view.on_thread_finished(job)
+
+    assert job.thread is thread and job.worker is not None
+    assert job in view.active_jobs
+    qtbot.waitUntil(lambda: job.thread is None, timeout=1000)
+
+    assert job.thread is None and job.worker is None
+    assert job not in view.active_jobs
+    assert thread.deleted == 1
+
+
+def test_output_directory_prefers_highest_generation_over_newer_empty_checkpoint(qtbot, tmp_path):
+    view = dashboard(qtbot, tmp_path)
+    root = tmp_path / "output"
+    checkpoint, empty_newer_attempt = root / "p01-3", root / "p01"
+    for directory in (checkpoint, empty_newer_attempt):
+        (directory / "p01_localization_work").mkdir(parents=True)
+    (checkpoint / "p01_localization_work" / "tts-167.cache").touch()
+    os.utime(checkpoint, (1, 1))
+    os.utime(empty_newer_attempt, (2, 2))
+
+    assert view._job_output_directory(root, Path("p01.mp4")) == checkpoint
+
+
+def test_output_directory_prefers_highest_generation_regardless_of_mtime_or_file_count(qtbot, tmp_path):
+    view = dashboard(qtbot, tmp_path)
+    root = tmp_path / "output"
+    older_generation, current_generation = root / "p02-3", root / "p02-4"
+    for directory in (older_generation, current_generation):
+        (directory / "p02_localization_work").mkdir(parents=True)
+    for index in range(20):
+        (older_generation / "p02_localization_work" / f"dummy-{index}").touch()
+    os.utime(older_generation, (2, 2))
+    os.utime(current_generation, (1, 1))
+
+    assert view._job_output_directory(root, Path("p02.mp4")) == current_generation
+
+
+def test_output_directory_skips_completed_and_similarly_named_directories(qtbot, tmp_path):
+    view = dashboard(qtbot, tmp_path)
+    root = tmp_path / "output"
+    completed = root / "p01"
+    (completed / "p01_localization_work").mkdir(parents=True)
+    (completed / "p01.vi.mp4").touch()
+    for name in ("p01-extra", "p010", "p01-foo"):
+        (root / name / "p01_localization_work").mkdir(parents=True)
+
+    assert view._job_output_directory(root, Path("p01.mp4")) == root / "p01-2"
+
+
+def test_output_directory_skips_completed_highest_generation(qtbot, tmp_path):
+    view = dashboard(qtbot, tmp_path)
+    root = tmp_path / "output"
+    incomplete, completed = root / "p04-2", root / "p04-3"
+    for directory in (incomplete, completed):
+        (directory / "p04_localization_work").mkdir(parents=True)
+    (completed / "p04.vi.mp4").touch()
+
+    assert view._job_output_directory(root, Path("p04.mp4")) == incomplete
+
+
+def test_output_directory_skips_checkpoint_assigned_to_current_job(qtbot, tmp_path):
+    view = dashboard(qtbot, tmp_path)
+    root = tmp_path / "output"
+    checkpoint = root / "p01-2"
+    (checkpoint / "p01_localization_work").mkdir(parents=True)
+    view.jobs[0] = SimpleNamespace(output_directory=str(checkpoint))
+
+    assert view._job_output_directory(root, Path("p01.mp4")) == root / "p01"
+
+
+def test_adding_failed_source_retries_same_job_and_directory(qtbot, tmp_path):
+    view = dashboard(qtbot, tmp_path)
+    source = str(tmp_path / "p01.mp4")
+    job = view.add_videos([source])[0]
+    directory = job.output_directory
+    job.worker.failed.emit("network")
+    finish(qtbot, job.worker, job)
+    view.start_next_job = lambda: None
+
+    assert view.add_videos([source]) == [job]
+    assert job.output_directory == directory
+    assert job.status == WAITING and job.progress == 0
+    assert "Tiếp tục từ checkpoint hiện có" in job.detail
+
+
+def test_retry_uses_changed_api_key_and_same_job_directory_and_slot(qtbot, tmp_path, monkeypatch):
+    view = dashboard(qtbot, tmp_path)
+    source = str(tmp_path / "p01.mp4")
+    job = view.add_videos([source])[0]
+    directory, first_worker = job.output_directory, job.worker
+    first_worker.failed.emit("bad key")
+    finish(qtbot, first_worker, job)
+
+    view.api_key_edit.setText("replacement-key")
+    saved_keys = []
+    monkeypatch.setattr(
+        "buzz.widgets.localization_dashboard.set_password",
+        lambda key, value: saved_keys.append((key, value)),
+    )
+    view.rows[0].retry_button.click()
+
+    assert view.jobs[0] is job
+    assert job.output_directory == directory
+    assert job.status == PROCESSING
+    assert job.worker is not first_worker
+    assert job.worker.kwargs["source_video"] == source
+    assert job.worker.kwargs["output_directory"] == directory
+    assert job.worker.kwargs["translation_api_key"] == "replacement-key"
+    assert saved_keys and saved_keys[0][1] == "replacement-key"
+    view.shutdown()
+    finish(qtbot, job.worker, job)
+
+
+def test_retry_is_disabled_until_thread_cleanup(qtbot, tmp_path):
+    view = dashboard(qtbot, tmp_path)
+    job = view.add_videos([str(tmp_path / "p01.mp4")])[0]
+    worker = job.worker
+    worker.failed.emit("network")
+
+    assert not view.rows[0].retry_button.isHidden()
+    assert not view.rows[0].retry_button.isEnabled()
+    view.rows[0].retry_button.click()
+    assert job.worker is worker
+
+    finish(qtbot, worker, job)
+    assert view.rows[0].retry_button.isEnabled()
+
+
+def test_retry_without_key_preserves_cancelled_job(qtbot, tmp_path, monkeypatch):
+    view = dashboard(qtbot, tmp_path)
+    job = view.add_videos([str(tmp_path / "p01.mp4")])[0]
+    worker = job.worker
+    worker.cancelled.emit()
+    finish(qtbot, worker, job)
+    view.api_key_edit.clear()
+    warnings = []
+    monkeypatch.setattr(
+        "buzz.widgets.localization_dashboard.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    view.rows[0].retry_button.click()
+
+    assert job.status == CANCELLED
+    assert job.worker is None and job.thread is None
+    assert warnings and "Gemini API key" in warnings[0][1]
+
+
+def test_completed_rows_do_not_show_retry(qtbot, tmp_path):
+    view = dashboard(qtbot, tmp_path)
+    job = view.add_videos([str(tmp_path / "p01.mp4")])[0]
+    worker = job.worker
+    worker.completed.emit(SimpleNamespace(final_video=SimpleNamespace(video_file="D:/final.mp4")))
+    finish(qtbot, worker, job)
+
+    assert job.status == COMPLETED
+    assert view.rows[0].retry_button.isHidden()
+
+
+
+def test_failed_job_cannot_be_removed_until_thread_finishes(qtbot, tmp_path):
+    view = dashboard(qtbot, tmp_path)
+    job = view.add_videos([str(tmp_path / "p01.mp4")])[0]
+    worker = job.worker
+    worker.failed.emit("network")
+
+    assert not view.rows[0].action_button.isEnabled()
+    view.on_row_action(0)
+    assert view.jobs[0] is job
+
+    finish(qtbot, worker, job)
+    assert view.rows[0].action_button.isEnabled()
+
+
+def test_retry_missing_checkpoint_directory_does_not_start_over(qtbot, tmp_path, monkeypatch):
+    view = dashboard(qtbot, tmp_path)
+    job = view.add_videos([str(tmp_path / "p01.mp4")])[0]
+    worker = job.worker
+    worker.failed.emit("network")
+    finish(qtbot, worker, job)
+    directory = Path(job.output_directory)
+    directory.rmdir()
+    errors = []
+    monkeypatch.setattr(
+        "buzz.widgets.localization_dashboard.QMessageBox.critical",
+        lambda *args: errors.append(args),
+    )
+    view.on_retry(0)
+
+    assert job.status == FAILED
+    assert job.worker is None
+    assert not directory.exists()
+    assert errors
+
+
+def test_output_directory_without_checkpoint_allocates_unique_new_directory(qtbot, tmp_path):
+    view = dashboard(qtbot, tmp_path)
+    root = tmp_path / "output"
+    root.mkdir()
+    (root / "p01").mkdir()
+
+    assert view._job_output_directory(root, Path("p01.mp4")) == root / "p01-2"

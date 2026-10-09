@@ -13,8 +13,10 @@ from buzz.localization.translation import (
 )
 from buzz.localization.tts import (
     SynthesizedLocalizationSegment,
+    TTSBatchFallbackRequired,
     TTSRequest,
     TTSResult,
+    TTSServiceTemporarilyUnavailable,
     synthesize_for_localization,
 )
 
@@ -37,6 +39,24 @@ class FakeTTSProvider:
             voice=request.voice or self.voice,
             metadata={"format": "wav"},
         )
+
+
+class FakeBatchTTSProvider(FakeTTSProvider):
+    batch_size = 4
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.batch_calls = []
+
+    def synthesize_batch(self, requests):
+        self.batch_calls.append(list(requests))
+        results = []
+        for request in requests:
+            audio_file = request.output_file_stem + ".wav"
+            Path(audio_file).write_bytes(b"batched audio")
+            results.append(TTSResult(audio_file, 1.25, self.provider,
+                                     request.voice or self.voice, {"format": "wav"}))
+        return results
 
 
 def make_transcript(segments=None, target_language="vi"):
@@ -107,6 +127,75 @@ def test_preserves_segment_order_and_audio_mapping(tmp_path):
         str(tmp_path / "segment-000001.wav"),
     ]
     assert [segment.audio_duration for segment in result.segments] == [0.8, 1.1]
+
+
+def test_optional_batch_provider_reduces_calls_and_keeps_progress(tmp_path):
+    transcript = make_transcript([
+        TranslatedLocalizationSegment(index, index + 1, str(index), f"text {index}")
+        for index in range(5)
+    ])
+    provider = FakeBatchTTSProvider()
+    progress = []
+
+    synthesize_for_localization(transcript, provider, tmp_path,
+                                progress_callback=lambda done, total: progress.append((done, total)))
+
+    assert [len(batch) for batch in provider.batch_calls] == [4]
+    assert len(provider.calls) == 1  # final singleton remains a normal request
+    assert progress == [(1, 5), (2, 5), (3, 5), (4, 5), (5, 5)]
+
+
+def test_batch_cache_hits_are_not_sent_to_provider(tmp_path):
+    transcript = make_transcript([
+        TranslatedLocalizationSegment(index, index + 1, str(index), f"text {index}")
+        for index in range(4)
+    ])
+    synthesize_for_localization(transcript, FakeBatchTTSProvider(), tmp_path)
+    resumed = FakeBatchTTSProvider()
+    synthesize_for_localization(transcript, resumed, tmp_path)
+
+    assert resumed.batch_calls == []
+    assert resumed.calls == []
+
+
+def test_batch_partial_localization_cache_only_regenerates_miss(tmp_path):
+    transcript = make_transcript([
+        TranslatedLocalizationSegment(index, index + 1, str(index), f"text {index}")
+        for index in range(4)
+    ])
+    synthesize_for_localization(transcript, FakeBatchTTSProvider(), tmp_path)
+    (tmp_path / "segment-000002.localization-tts.json").unlink()
+
+    resumed = FakeBatchTTSProvider()
+    synthesize_for_localization(transcript, resumed, tmp_path)
+
+    assert resumed.batch_calls == []
+    assert [request.text for request in resumed.calls] == ["text 2"]
+
+
+def test_generic_provider_keeps_one_segment_context_per_segment(tmp_path):
+    transcript = make_transcript([
+        TranslatedLocalizationSegment(index, index + 1, str(index), f"text {index}")
+        for index in range(3)
+    ])
+    entries = []
+
+    @contextmanager
+    def context(index, total):
+        entries.append(("enter", index, total))
+        try:
+            yield
+        finally:
+            entries.append(("exit", index, total))
+
+    synthesize_for_localization(
+        transcript, FakeTTSProvider(), tmp_path, segment_context=context
+    )
+    assert entries == [
+        ("enter", 0, 3), ("exit", 0, 3),
+        ("enter", 1, 3), ("exit", 1, 3),
+        ("enter", 2, 3), ("exit", 2, 3),
+    ]
 
 
 def test_preserves_unicode_and_provider_metadata(tmp_path):
@@ -407,7 +496,7 @@ def test_segment_context_is_released_between_sequential_segments(tmp_path):
     assert progress == [(1, 2), (2, 2)]
 
 
-def test_two_jobs_overlap_globally_but_each_job_tts_is_serial(tmp_path):
+def test_two_jobs_are_globally_serialized_for_tts(tmp_path):
     from buzz.localization.resources import LocalizationResourceScheduler
 
     transcript = make_transcript(segments=[
@@ -450,6 +539,7 @@ def test_two_jobs_overlap_globally_but_each_job_tts_is_serial(tmp_path):
             segment_context=lambda _index, _total: scheduler.acquire("tts"),
         )
 
+
     threads = [threading.Thread(target=run, args=(job,)) for job in ("one", "two")]
     for thread in threads:
         thread.start()
@@ -457,5 +547,120 @@ def test_two_jobs_overlap_globally_but_each_job_tts_is_serial(tmp_path):
     for thread in threads:
         thread.join()
 
-    assert maximum == 2
+    assert maximum == 1
     assert per_job_maximum == {"one": 1, "two": 1}
+
+
+def test_temporary_unavailability_releases_context_and_retries_missing_segment(tmp_path):
+    transcript = make_transcript()
+    events = []
+
+    class FlakyProvider(FakeTTSProvider):
+        def synthesize(self, request):
+            self.calls.append(request)
+            if len(self.calls) == 1:
+                raise TTSServiceTemporarilyUnavailable(1)
+            return super().synthesize(request)
+
+    @contextmanager
+    def context(index, _total):
+        events.append(("enter", index))
+        try:
+            yield
+        finally:
+            events.append(("exit", index))
+
+    provider = FlakyProvider()
+    synthesize_for_localization(
+        transcript, provider, tmp_path, segment_context=context,
+        temporary_unavailable_callback=lambda exc: events.append(("wait", exc.retry_after_seconds)),
+    )
+    assert events == [("enter", 0), ("exit", 0), ("wait", 1.0), ("enter", 0), ("exit", 0)]
+    assert len(provider.calls) == 3  # failed call plus FakeTTSProvider's successful recording
+
+
+def test_batch_temporary_unavailability_retries_only_missing_batch_after_releasing_context(tmp_path):
+    transcript = make_transcript([
+        TranslatedLocalizationSegment(index, index + 1, f"source {index}", f"text {index}")
+        for index in range(3)
+    ])
+    events = []
+
+    class FlakyBatchProvider(FakeBatchTTSProvider):
+        def __init__(self):
+            super().__init__()
+            self.fail_next_batch = False
+
+        def synthesize_batch(self, requests):
+            self.batch_calls.append(list(requests))
+            if self.fail_next_batch:
+                self.fail_next_batch = False
+                raise TTSServiceTemporarilyUnavailable(1)
+            results = []
+            for request in requests:
+                audio_file = request.output_file_stem + ".wav"
+                Path(audio_file).write_bytes(b"batched audio")
+                results.append(TTSResult(audio_file, 1.25, self.provider,
+                                         request.voice or self.voice, {"format": "wav"}))
+            return results
+
+    @contextmanager
+    def context(index, _total):
+        events.append(("enter", index))
+        try:
+            yield
+        finally:
+            events.append(("exit", index))
+
+    provider = FlakyBatchProvider()
+    synthesize_for_localization(transcript, provider, tmp_path)
+    for index in (1, 2):
+        (tmp_path / f"segment-{index:06d}.localization-tts.json").unlink()
+    provider.batch_calls.clear()
+    provider.fail_next_batch = True
+    synthesize_for_localization(
+        transcript, provider, tmp_path, segment_context=context,
+        temporary_unavailable_callback=lambda exc: events.append(("wait", exc.retry_after_seconds)),
+    )
+
+    assert [[request.text for request in batch] for batch in provider.batch_calls] == [
+        ["text 1", "text 2"], ["text 1", "text 2"],
+    ]
+    assert events == [("enter", 0), ("exit", 0), ("wait", 1.0), ("enter", 0), ("exit", 0)]
+
+def test_batch_fallback_releases_context_and_reacquires_per_single(tmp_path):
+    transcript = make_transcript([
+        TranslatedLocalizationSegment(index, index + 1, f"source {index}", f"text {index}")
+        for index in range(3)
+    ])
+    events = []
+
+    class FallbackBatchProvider(FakeBatchTTSProvider):
+        def synthesize_batch(self, requests):
+            self.batch_calls.append(list(requests))
+            raise TTSBatchFallbackRequired("retry singles")
+
+    @contextmanager
+    def context(index, _total):
+        events.append(("enter", index))
+        try:
+            yield
+        finally:
+            events.append(("exit", index))
+
+    provider = FallbackBatchProvider()
+    result = synthesize_for_localization(
+        transcript, provider, tmp_path, segment_context=context,
+    )
+
+    assert len(result.segments) == 3
+    assert len(provider.batch_calls) == 1
+    assert [request.text for request in provider.calls] == [
+        "text 0", "text 1", "text 2",
+    ]
+    assert events == [
+        ("enter", 0), ("exit", 0),
+        ("enter", 0), ("exit", 0),
+        ("enter", 1), ("exit", 1),
+        ("enter", 2), ("exit", 2),
+    ]

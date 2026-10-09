@@ -124,6 +124,22 @@ def test_wraps_long_text_without_breaking_unicode_words():
     assert all(len(line) > 0 for line in subtitle_text)
 
 
+def test_rebalances_very_long_vietnamese_text_across_two_lines():
+    text = (
+        "\u0110\u00e2y l\u00e0 m\u1ed9t c\u00e2u ph\u1ee5 \u0111\u1ec1 ti\u1ebfng Vi\u1ec7t r\u1ea5t d\u00e0i c\u1ea7n \u0111\u01b0\u1ee3c c\u00e2n b\u1eb1ng \u0111\u1ec1u "
+        "gi\u1eefa hai d\u00f2ng \u0111\u1ec3 kh\u00f4ng t\u1ea1o th\u00e0nh d\u00f2ng cu\u1ed1i qu\u00e1 d\u00e0i"
+    )
+    content = render_srt(
+        make_transcript([make_segment(text=text)]),
+        SubtitleOptions(max_line_length=30, max_lines=2),
+    )
+
+    subtitle_text = content.splitlines()[2:]
+    assert 1 <= len(subtitle_text) <= 2
+    assert " ".join(subtitle_text) == text
+    assert max(map(len, subtitle_text)) - min(map(len, subtitle_text)) <= 8
+
+
 def test_can_disable_line_wrapping():
     text = "Đây là một câu dài nhưng không được tự động xuống dòng"
     content = render_srt(

@@ -5,9 +5,21 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Callable, ContextManager, Mapping, Protocol
+from typing import Callable, ContextManager, Mapping, Protocol, Sequence
 
 from buzz.localization.translation import TranslatedLocalizationTranscript
+
+
+class TTSServiceTemporarilyUnavailable(RuntimeError):
+    """A provider is temporarily unavailable; callers may retry after a delay."""
+
+    def __init__(self, retry_after_seconds: float = 60.0, message: str | None = None):
+        self.retry_after_seconds = min(300.0, max(1.0, float(retry_after_seconds)))
+        super().__init__(message or "TTS service is temporarily unavailable")
+
+
+class TTSBatchFallbackRequired(RuntimeError):
+    """A failed batch should be retried as individually gated requests."""
 
 
 @dataclass(frozen=True)
@@ -36,6 +48,13 @@ class TTSProvider(Protocol):
     """Provider-neutral interface for synthesizing one speech asset."""
 
     def synthesize(self, request: TTSRequest) -> TTSResult:
+        ...
+
+
+class BatchTTSProvider(TTSProvider, Protocol):
+    """Optional capability for providers that can synthesize several assets at once."""
+
+    def synthesize_batch(self, requests: Sequence[TTSRequest]) -> list[TTSResult]:
         ...
 
 
@@ -184,6 +203,39 @@ def synthesize_segment(request: TTSRequest, provider: TTSProvider) -> TTSResult:
     return result
 
 
+def _synthesize_batch_with_checkpoints(
+    requests: Sequence[TTSRequest], provider: TTSProvider,
+) -> list[TTSResult]:
+    """Reuse individual checkpoints, then ask an opt-in provider for remaining work."""
+    results: list[TTSResult | None] = [None] * len(requests)
+    missing: list[tuple[int, TTSRequest, Path, str]] = []
+    for index, request in enumerate(requests):
+        checkpoint = _checkpoint_path(request)
+        fingerprint = _request_fingerprint(request, provider)
+        cached = _read_checkpoint(checkpoint, fingerprint)
+        if cached is not None:
+            results[index] = cached
+        else:
+            checkpoint.unlink(missing_ok=True)
+            missing.append((index, request, checkpoint, fingerprint))
+
+    batch = getattr(provider, "synthesize_batch", None)
+    if len(missing) > 1 and callable(batch):
+        generated = batch([item[1] for item in missing])
+        if len(generated) != len(missing):
+            raise ValueError("TTS batch provider returned an invalid response count")
+        for (index, _, checkpoint, fingerprint), result in zip(missing, generated):
+            result = _valid_result(result)
+            _write_checkpoint(checkpoint, fingerprint, result)
+            results[index] = result
+    else:
+        for index, request, checkpoint, fingerprint in missing:
+            result = _valid_result(provider.synthesize(request))
+            _write_checkpoint(checkpoint, fingerprint, result)
+            results[index] = result
+    return [result for result in results if result is not None]
+
+
 @dataclass(frozen=True)
 class SynthesizedLocalizationSegment:
     start: float
@@ -234,6 +286,7 @@ def synthesize_for_localization(
     options: Mapping[str, object] | None = None,
     segment_context: Callable[[int, int], ContextManager[None]] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
+    temporary_unavailable_callback: Callable[[TTSServiceTemporarilyUnavailable], None] | None = None,
 ) -> SynthesizedLocalizationTranscript:
     """Synthesize one Vietnamese audio asset for every translated segment.
 
@@ -267,23 +320,43 @@ def synthesize_for_localization(
     synthesized_segments = []
 
     segment_count = len(transcript.segments)
-    for index, segment in enumerate(transcript.segments):
-        context = (segment_context(index, segment_count)
-                   if segment_context is not None else nullcontext())
-        with context:
-            result = synthesize_segment(
-                TTSRequest(
-                    text=segment.translated_text,
-                    language=transcript.target_language,
-                    output_file_stem=str(asset_directory / f"segment-{index:06d}"),
-                    voice=voice,
-                    options=provider_options,
-                ),
-                provider,
-            )
+    requests = [TTSRequest(
+        text=segment.translated_text,
+        language=transcript.target_language,
+        output_file_stem=str(asset_directory / f"segment-{index:06d}"),
+        voice=voice,
+        options=provider_options,
+    ) for index, segment in enumerate(transcript.segments)]
 
-        synthesized_segments.append(
-            SynthesizedLocalizationSegment(
+    def synthesize_one_request(index: int) -> TTSResult:
+        while True:
+            context = (segment_context(index, segment_count)
+                       if segment_context is not None else nullcontext())
+            try:
+                with context:
+                    return synthesize_segment(requests[index], provider)
+            except TTSServiceTemporarilyUnavailable as exc:
+                if temporary_unavailable_callback is None:
+                    raise
+                temporary_unavailable_callback(exc)
+
+    batch = getattr(provider, "synthesize_batch", None)
+    if not callable(batch):
+        # Preserve the original provider-neutral behavior exactly: one resource
+        # context and one checkpointed provider request per source segment.
+        for index, (segment, request) in enumerate(zip(transcript.segments, requests)):
+            while True:
+                context = (segment_context(index, segment_count)
+                           if segment_context is not None else nullcontext())
+                try:
+                    with context:
+                        result = synthesize_segment(request, provider)
+                    break
+                except TTSServiceTemporarilyUnavailable as exc:
+                    if temporary_unavailable_callback is None:
+                        raise
+                    temporary_unavailable_callback(exc)
+            synthesized_segments.append(SynthesizedLocalizationSegment(
                 start=segment.start,
                 end=segment.end,
                 source_text=segment.source_text,
@@ -293,10 +366,49 @@ def synthesize_for_localization(
                 provider=result.provider,
                 voice=result.voice,
                 provider_metadata=dict(result.metadata),
-            )
-        )
-        if progress_callback is not None:
-            progress_callback(index + 1, segment_count)
+            ))
+            if progress_callback is not None:
+                progress_callback(index + 1, segment_count)
+    else:
+        batch_size = min(5, max(2, int(getattr(provider, "batch_size", 4))))
+        for first in range(0, segment_count, batch_size):
+            indices = list(range(first, min(first + batch_size, segment_count)))
+            # One actual Edge batch is one global TTS resource use.
+            while True:
+                context = (segment_context(first, segment_count)
+                           if segment_context is not None else nullcontext())
+                try:
+                    with context:
+                        results = _synthesize_batch_with_checkpoints(
+                            [requests[index] for index in indices], provider)
+                    break
+                except TTSBatchFallbackRequired:
+                    # The failed batch context is already released here. Reacquire
+                    # global TTS capacity separately for each singleton so other
+                    # jobs can run between requests.
+                    results = [synthesize_one_request(index) for index in indices]
+                    break
+                except TTSServiceTemporarilyUnavailable as exc:
+                    if temporary_unavailable_callback is None:
+                        raise
+                    temporary_unavailable_callback(exc)
+            if len(results) != len(indices):
+                raise ValueError("TTS batch provider returned an invalid response count")
+            for index, result in zip(indices, results):
+                segment = transcript.segments[index]
+                synthesized_segments.append(SynthesizedLocalizationSegment(
+                    start=segment.start,
+                    end=segment.end,
+                    source_text=segment.source_text,
+                    translated_text=segment.translated_text,
+                    audio_file=result.audio_file,
+                    audio_duration=float(result.audio_duration),
+                    provider=result.provider,
+                    voice=result.voice,
+                    provider_metadata=dict(result.metadata),
+                ))
+                if progress_callback is not None:
+                    progress_callback(index + 1, segment_count)
 
     return SynthesizedLocalizationTranscript(
         source_file=transcript.source_file,

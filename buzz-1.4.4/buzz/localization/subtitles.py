@@ -61,9 +61,44 @@ def _wrap_text(text: str, options: SubtitleOptions) -> str:
     if len(lines) <= options.max_lines:
         return "\n".join(lines)
 
-    head = lines[: options.max_lines - 1]
-    tail = " ".join(lines[options.max_lines - 1 :])
-    return "\n".join([*head, tail])
+    words = normalized.split()
+    line_count = min(options.max_lines, len(words))
+    word_lengths = [len(word) for word in words]
+    prefix_lengths = [0]
+    for length in word_lengths:
+        prefix_lengths.append(prefix_lengths[-1] + length)
+
+    def line_length(start: int, end: int) -> int:
+        return prefix_lengths[end] - prefix_lengths[start] + (end - start - 1)
+
+    # Partition all words across the permitted lines, minimizing the longest
+    # line. This preserves every word without leaving an oversized final line.
+    costs: list[list[int | None]] = [
+        [None] * (len(words) + 1) for _ in range(line_count + 1)
+    ]
+    splits: list[list[int | None]] = [
+        [None] * (len(words) + 1) for _ in range(line_count + 1)
+    ]
+    costs[0][0] = 0
+    for current_line in range(1, line_count + 1):
+        for end in range(current_line, len(words) + 1):
+            for start in range(current_line - 1, end):
+                previous_cost = costs[current_line - 1][start]
+                if previous_cost is None:
+                    continue
+                cost = max(previous_cost, line_length(start, end))
+                if costs[current_line][end] is None or cost < costs[current_line][end]:
+                    costs[current_line][end] = cost
+                    splits[current_line][end] = start
+
+    balanced_lines = []
+    end = len(words)
+    for current_line in range(line_count, 0, -1):
+        start = splits[current_line][end]
+        assert start is not None
+        balanced_lines.append(" ".join(words[start:end]))
+        end = start
+    return "\n".join(reversed(balanced_lines))
 
 
 def _validate_transcript(transcript: TimedLocalizationTranscript) -> None:

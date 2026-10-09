@@ -312,3 +312,56 @@ def test_returns_expected_timed_segment_type():
     result = synchronize_for_localization(make_transcript())
 
     assert isinstance(result.segments[0], TimedLocalizationSegment)
+
+def test_tiny_preceding_silent_gap_avoids_exceeding_hard_rate_limit():
+    transcript = make_transcript([
+        make_segment(start=184.59, end=187.63, audio_duration=2.08),
+        make_segment(start=187.69, end=190.15, audio_duration=2.72),
+        make_segment(start=190.15, end=191.23, audio_duration=1.0),
+    ])
+    plan = synchronize_for_localization(transcript)
+    previous, affected, following = plan.segments
+    assert previous.audio_start_advance == 0.0
+    assert affected.audio_start_advance > 0.0127
+    assert affected.audio_start_advance <= 0.25
+    assert affected.playback_rate <= 1.10
+    assert affected.start == pytest.approx(187.69)  # subtitle unchanged
+    assert following.start == pytest.approx(190.15)
+    assert previous.start + previous.adjusted_audio_duration <= (
+        affected.start - affected.audio_start_advance
+    )
+    assert affected.start - affected.audio_start_advance + affected.adjusted_audio_duration <= 190.151
+
+
+def test_no_previous_silent_gap_remains_a_hard_failure():
+    transcript = make_transcript([
+        make_segment(start=0.0, end=2.0, audio_duration=2.75),
+        make_segment(start=2.5, end=3.5, audio_duration=1.20),
+        make_segment(start=3.5, end=5.0, audio_duration=1.0),
+    ])
+    with pytest.raises(TimingSynchronizationError, match="above maximum"):
+        synchronize_for_localization(transcript)
+
+
+def test_p01_part10_geometry_borrows_the_real_preceding_source_gap():
+    """2.56 s needs 0.1273 s beyond the 2.20 s subtitle slot at 1.10x."""
+    plan = synchronize_for_localization(make_transcript([
+        make_segment(start=574.0, end=576.88, audio_duration=2.0),
+        make_segment(start=577.04, end=579.24, audio_duration=2.56),
+        make_segment(start=579.24, end=580.0, audio_duration=0.5),
+    ]))
+    prior, affected, _ = plan.segments
+    assert affected.start == pytest.approx(577.04)  # subtitle timing is unchanged
+    assert affected.audio_start_advance >= 0.1243
+    assert affected.playback_rate <= 1.10
+    assert prior.start - prior.audio_start_advance + prior.adjusted_audio_duration <= (
+        affected.start - affected.audio_start_advance
+    )
+
+
+def test_preceding_gap_never_moves_audio_before_zero():
+    plan = synchronize_for_localization(make_transcript([
+        make_segment(start=0.0, end=0.1, audio_duration=0.05),
+        make_segment(start=0.15, end=1.15, audio_duration=1.14),
+    ]))
+    assert plan.segments[0].start - plan.segments[0].audio_start_advance >= 0

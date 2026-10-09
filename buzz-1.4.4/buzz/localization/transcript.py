@@ -11,6 +11,10 @@ from buzz.transcriber.transcriber import (
     TranscriptionOptions,
 )
 
+
+class LocalizationTranscriptionCancelled(RuntimeError):
+    """Raised by an ASR adapter when an in-flight transcription is cancelled."""
+
 SUPPORTED_SOURCE_LANGUAGES = {"en", "zh"}
 SOURCE_LANGUAGE_ALIASES = {
     "chinese": "zh",
@@ -85,6 +89,7 @@ def transcribe_for_localization(
     transcriber_factory: (
         Callable[[FileTranscriptionTask], FileTranscriber] | None
     ) = None,
+    cancel_event=None,
 ) -> LocalizationTranscript:
     """Transcribe media through Buzz and return a Phase 1 normalized transcript."""
     source_path = Path(video_path)
@@ -110,7 +115,9 @@ def transcribe_for_localization(
         if transcription_options.language == "en":
             raise ValueError("Paraformer-zh is Chinese optimized. Choose Whisper for explicit English transcription.")
         from buzz.localization.paraformer import transcribe_with_paraformer
-        return transcribe_with_paraformer(str(source_path))
+        if cancel_event is None:
+            return transcribe_with_paraformer(str(source_path))
+        return transcribe_with_paraformer(str(source_path), cancel_event=cancel_event)
 
     task = FileTranscriptionTask(
         file_path=str(source_path),

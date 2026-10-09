@@ -4,12 +4,15 @@ from pathlib import Path
 import struct
 import subprocess
 import sys
+import threading
+import time
 import wave
 
 import pytest
 
 from buzz.localization.audio_mix import (
     AudioMixingError,
+    AudioMixingCancelled,
     AudioMixingOptions,
     LocalizedAudioResult,
     _run_ffmpeg,
@@ -39,6 +42,7 @@ def make_segment(
     playback_rate=1.0,
     timing_action="none",
     slot_duration=None,
+    audio_start_advance=0.0,
 ):
     slot_duration = end - start if slot_duration is None else slot_duration
     return TimedLocalizationSegment(
@@ -56,6 +60,7 @@ def make_segment(
         adjusted_audio_duration=(end - start),
         leading_padding=0.0,
         trailing_padding=0.0,
+        audio_start_advance=audio_start_advance,
         timing_action=timing_action,
     )
 
@@ -88,6 +93,28 @@ def test_ffmpeg_output_decoding_handles_utf8_bytes_invalid_in_cp1252():
         "-c",
         "import sys; sys.stderr.buffer.write('处理营业视频.mp4'.encode('utf-8'))",
     ])
+
+
+def test_ffmpeg_cancellation_stops_a_blocked_process_promptly():
+    cancelled = threading.Event()
+    outcome = []
+
+    def run():
+        try:
+            _run_ffmpeg([sys.executable, "-c", "import time; time.sleep(30)"], cancel_event=cancelled)
+        except Exception as exc:
+            outcome.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    time.sleep(0.1)
+    started = time.monotonic()
+    cancelled.set()
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert time.monotonic() - started < 2
+    assert isinstance(outcome[0], AudioMixingCancelled)
 
 
 def test_ffprobe_uses_explicit_robust_utf8_decoding(monkeypatch):
@@ -150,6 +177,21 @@ def test_applies_phase4_playback_rate_and_start_delay(tmp_path):
     assert "atempo=1.20000000" in filter_complex
     assert "atrim=0:2.000000" in filter_complex
     assert "adelay=1250:all=1" in filter_complex
+
+
+def test_mixer_positions_preceding_gap_borrow_at_advanced_audio_start(tmp_path):
+    speech = tmp_path / "speech.wav"
+    make_wav(speech)
+    runner = FakeRunner()
+    mix_localized_audio(
+        make_transcript([make_segment(
+            speech, start=577.04, end=579.24, playback_rate=1.10,
+            slot_duration=2.329, audio_start_advance=0.129,
+        )]),
+        tmp_path / "localized.wav", ffmpeg_runner=runner,
+    )
+    filter_complex = runner.commands[0][runner.commands[0].index("-filter_complex") + 1]
+    assert "adelay=576911:all=1" in filter_complex
 
 
 def test_clamped_max_rate_is_valid_for_ffmpeg_and_trimmed_to_slot(tmp_path):

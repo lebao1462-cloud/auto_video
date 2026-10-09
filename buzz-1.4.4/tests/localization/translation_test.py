@@ -7,6 +7,8 @@ import pytest
 from buzz.localization.transcript import LocalizationSegment, LocalizationTranscript
 from buzz.localization.translation import (
     TranslatedLocalizationSegment,
+    _checkpoint_fingerprint,
+    _valid_reviewed_text,
     translate_for_localization,
 )
 
@@ -153,7 +155,9 @@ def test_propagates_provider_exception():
         translate_for_localization(make_transcript(), FailingProvider())
 
 
-@pytest.mark.parametrize("response", ["", "   ", None, {"text": "Xin ch\u00e0o"}])
+@pytest.mark.parametrize(
+    "response", ["", "   ", "...", None, {"text": "Xin ch\u00e0o"}]
+)
 def test_rejects_malformed_provider_response(response):
     provider = FakeTranslationProvider({"Hello everyone": response})
 
@@ -215,11 +219,56 @@ def test_batch_translation_keeps_timestamps_and_corrected_chinese():
         segments=[LocalizationSegment(float(i), float(i + 1), f"文本{i}") for i in range(31)],
     )
     result = translate_for_localization(transcript, provider)
-    assert provider.calls == [(30, 0), (1, 5)]
+    assert provider.calls == [(30, 0), (1, 8)]
     assert result.segments[30].start == 30
     assert result.segments[30].end == 31
     assert result.segments[30].source_text == "修正0"
     assert result.segments[30].translated_text == "Dịch 0"
+
+
+def test_batch_translation_passes_completed_vietnamese_context_across_boundary():
+    class BatchProvider:
+        def __init__(self):
+            self.contexts = []
+
+        def translate_segments(self, segments, source_language, target_language, *, context):
+            self.contexts.append(tuple(context))
+            return [(f"corrected {item.text}", f"Vietnamese {item.text}")
+                    for item in segments]
+
+    provider = BatchProvider()
+    transcript = make_transcript(segments=[
+        LocalizationSegment(float(index), float(index + 1), f"line {index}")
+        for index in range(31)
+    ])
+
+    translate_for_localization(transcript, provider)
+
+    context = provider.contexts[1]
+    assert len(context) == 8
+    assert [item.text for item in context] == [
+        f"corrected line {index}" for index in range(22, 30)
+    ]
+    assert [item.translated_text for item in context] == [
+        f"Vietnamese line {index}" for index in range(22, 30)
+    ]
+
+
+def test_translation_checkpoint_fingerprint_uses_policy_not_secret_or_fallback_order():
+    class Provider:
+        model = "model-a"
+        api_key = "first-secret"
+        rate_limit_fallback_models = ("model-b", "model-c")
+        translation_policy_version = "policy-one"
+
+    transcript = make_transcript()
+    provider = Provider()
+    baseline = _checkpoint_fingerprint(transcript, provider, "vi")
+    provider.api_key = "second-secret"
+    provider.rate_limit_fallback_models = ("model-c", "model-b")
+    assert _checkpoint_fingerprint(transcript, provider, "vi") == baseline
+    provider.translation_policy_version = "policy-two"
+    assert _checkpoint_fingerprint(transcript, provider, "vi") != baseline
 
 
 def test_batch_wrong_count_retries_then_recursively_splits():
@@ -286,3 +335,167 @@ def test_translation_checkpoint_resumes_by_source_provider_and_model():
         assert changed_model.calls == 1
     finally:
         checkpoint.unlink(missing_ok=True)
+
+
+def test_checkpoint_retranslates_only_punctuation_entry_and_rewrites_it():
+    class CheckpointProvider:
+        def __init__(self):
+            self.calls = []
+
+        def translate_segments(self, segments, source_language, target_language, *, context):
+            self.calls.append([item.text for item in segments])
+            return [(item.text, f"Dich {item.text}") for item in segments]
+
+    transcript = make_transcript(segments=[
+        LocalizationSegment(0, 1, "good"),
+        LocalizationSegment(1, 2, "retry"),
+    ])
+    checkpoint = Path("translation-checkpoint-invalid-entry-test.json").resolve()
+    checkpoint.unlink(missing_ok=True)
+    try:
+        translate_for_localization(transcript, CheckpointProvider(), checkpoint_path=checkpoint)
+        saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+        retry_id = next(key for key, value in saved["segments"].items()
+                        if value["source_text"] == "retry")
+        saved["segments"][retry_id]["translated_text"] = "..."
+        checkpoint.write_text(json.dumps(saved), encoding="utf-8")
+
+        resumed = CheckpointProvider()
+        result = translate_for_localization(transcript, resumed, checkpoint_path=checkpoint)
+
+        assert resumed.calls == [["retry"]]
+        assert [item.translated_text for item in result.segments] == ["Dich good", "Dich retry"]
+        rewritten = json.loads(checkpoint.read_text(encoding="utf-8"))
+        assert rewritten["segments"][retry_id]["translated_text"] == "Dich retry"
+    finally:
+        checkpoint.unlink(missing_ok=True)
+
+
+def test_batch_rejects_punctuation_only_response():
+    class BatchProvider:
+        def translate_segments(self, segments, source_language, target_language, *, context):
+            return [(item.text, "...") for item in segments]
+
+    with pytest.raises(ValueError, match="invalid response"):
+        translate_for_localization(make_transcript(), BatchProvider())
+
+
+def test_singleton_batch_uses_plain_translation_after_invalid_structured_attempts():
+    class BatchProvider:
+        def __init__(self):
+            self.batch_calls = 0
+            self.translate_calls = []
+
+        def translate_segments(self, segments, source_language, target_language, *, context):
+            self.batch_calls += 1
+            return [(item.text, "...") for item in segments]
+
+        def translate(self, text, source_language, target_language):
+            self.translate_calls.append((text, source_language, target_language))
+            return "Ban dich du phong"
+
+    provider = BatchProvider()
+    result = translate_for_localization(make_transcript(), provider)
+
+    assert provider.batch_calls == 2
+    assert provider.translate_calls == [("Hello everyone", "en", "vi")]
+    assert result.segments[0].source_text == "Hello everyone"
+    assert result.segments[0].translated_text == "Ban dich du phong"
+
+
+def test_register_review_runs_after_raw_translation_and_uses_reviewed_batches(tmp_path):
+    class Provider:
+        model = "test"
+        translation_policy_version = "vi-dialogue-register-v3"
+
+        def __init__(self):
+            self.contexts = []
+
+        def translate_segments(self, segments, source_language, target_language, *, context):
+            return [(item.text, f"raw {item.text}") for item in segments]
+
+        def review_translation_register(self, segments, source_language, target_language, *, context):
+            self.contexts.append(tuple(context))
+            return [(item.segment_id, f"reviewed {item.translated_text}") for item in segments]
+
+    transcript = make_transcript(segments=[
+        LocalizationSegment(index, index + 1, f"line {index}") for index in range(121)
+    ])
+    provider = Provider()
+    result = translate_for_localization(
+        transcript, provider, checkpoint_path=tmp_path / "translation-checkpoint.json"
+    )
+    assert result.segments[0].translated_text == "reviewed raw line 0"
+    assert len(provider.contexts) == 2
+    assert len(provider.contexts[1]) == 12
+    assert [item.translated_text for item in provider.contexts[1]] == [
+        f"reviewed raw line {index}" for index in range(108, 120)
+    ]
+
+    resumed = Provider()
+    translate_for_localization(
+        transcript, resumed, checkpoint_path=tmp_path / "translation-checkpoint.json"
+    )
+    assert resumed.contexts == []
+
+
+def test_register_review_checkpoint_is_bound_to_raw_content(tmp_path):
+    class Provider:
+        model = "test"
+        translation_policy_version = "vi-dialogue-register-v3"
+
+        def __init__(self, raw):
+            self.raw, self.review_calls = raw, 0
+
+        def translate_segments(self, segments, source_language, target_language, *, context):
+            return [(item.text, self.raw) for item in segments]
+
+        def review_translation_register(self, segments, source_language, target_language, *, context):
+            self.review_calls += 1
+            return [(item.segment_id, f"reviewed {item.translated_text}") for item in segments]
+
+    checkpoint = tmp_path / "translation-checkpoint.json"
+    transcript = make_transcript()
+    first = Provider("raw one")
+    translate_for_localization(transcript, first, checkpoint_path=checkpoint)
+    # Mimic nondeterministic refreshed raw translation under a valid raw checkpoint identity.
+    data = json.loads(checkpoint.read_text(encoding="utf-8"))
+    next(iter(data["segments"].values()))["translated_text"] = "raw two"
+    checkpoint.write_text(json.dumps(data), encoding="utf-8")
+    second = Provider("unused")
+    result = translate_for_localization(transcript, second, checkpoint_path=checkpoint)
+    assert second.review_calls == 1
+    assert result.segments[0].translated_text == "reviewed raw two"
+
+
+def test_malformed_register_review_retries_then_splits_without_losing_entries():
+    class Provider:
+        def __init__(self):
+            self.calls = []
+
+        def translate_segments(self, segments, source_language, target_language, *, context):
+            return [(item.text, f"raw {item.text}") for item in segments]
+
+        def review_translation_register(self, segments, source_language, target_language, *, context):
+            self.calls.append(tuple(item.segment_id for item in segments))
+            if len(segments) > 1:
+                return []
+            item = segments[0]
+            return [(item.segment_id, f"reviewed {item.translated_text}")]
+
+    provider = Provider()
+    result = translate_for_localization(make_transcript(segments=[
+        LocalizationSegment(0, 1, "one"), LocalizationSegment(1, 2, "two"),
+    ]), provider)
+    assert [item.translated_text for item in result.segments] == [
+        "reviewed raw one", "reviewed raw two",
+    ]
+    assert len(provider.calls) == 4
+
+
+@pytest.mark.parametrize("text, valid", [
+    ("tao sẽ giết người", False), ("HỐ CHA thật", False),
+    ("ta sẽ giết người", True), ("tao sẽ giết mày", True), ("Bình thường", True),
+])
+def test_review_validator(text, valid):
+    assert _valid_reviewed_text(text) is valid
