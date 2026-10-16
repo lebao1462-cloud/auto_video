@@ -7,3 +7,5 @@ google-genai==2.25.0
 funasr==1.4.16
 modelscope==1.40.1
 modelscope-hub==0.4.5
+# Required to create one-line portrait ASS subtitles and measure font widths.
+Pillow==12.0.0

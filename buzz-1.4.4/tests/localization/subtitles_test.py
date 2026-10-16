@@ -10,6 +10,7 @@ from buzz.localization.subtitles import (
     SubtitleResult,
     render_srt,
     render_vtt,
+    split_portrait_cue,
     write_subtitles,
 )
 from buzz.localization.timing import (
@@ -150,6 +151,91 @@ def test_can_disable_line_wrapping():
     assert text in content
 
 
+def test_portrait_two_second_cue_is_two_readable_sequential_lines():
+    text = "\u0110\u00e2y l\u00e0 c\u00e2u \u0111\u1ea7u \u0111\u1ee7 d\u00e0i. \u0110\u00e2y l\u00e0 c\u00e2u sau \u0111\u1ee7 d\u00e0i."
+    cues = split_portrait_cue(text, 0.0, 2.0)
+
+    assert 1 <= len(cues) <= 2
+    assert cues[0][0] == 0.0 and cues[-1][1] == 2.0
+    assert " ".join(cue[2] for cue in cues) == text
+    assert all("\n" not in cue[2] for cue in cues)
+
+
+def test_portrait_default_width_uses_dialogue_mask_not_legacy_narrow_column():
+    from PIL import ImageFont
+    text = "Day la mot dong phu de tieng Viet du dai de can duoc hien thi ro rang tren man hinh doc."
+    cues = split_portrait_cue(text, 0.0, 3.0)
+    font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 10)
+
+    assert " ".join(cue[2] for cue in cues) == text
+    assert all(font.getlength(cue[2]) <= 320 for cue in cues)
+    assert len(cues) < len(split_portrait_cue(text, 0.0, 3.0, max_width=140))
+
+
+def test_actual_part1_srt_uses_readable_320px_portrait_lines_when_available():
+    from PIL import ImageFont
+    source = Path("D:/AutoVideoOutput/new/1/1_localization_work/part_0001/source.vi.srt")
+    if not source.is_file():
+        pytest.skip("User part_0001 subtitle file is not mounted in this test environment")
+    font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 10)
+    blocks = source.read_text(encoding="utf-8-sig").replace("\r\n", "\n").strip().split("\n\n")
+    original_cues = 0
+    refreshed_cues = []
+    for block in blocks:
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if len(lines) < 3 or " --> " not in lines[1]:
+            continue
+        start, end = [value.replace(",", ".") for value in lines[1].split(" --> ")]
+        def seconds(value):
+            h, m, s = value.split(":")
+            return int(h) * 3600 + int(m) * 60 + float(s)
+        text = " ".join(lines[2:])
+        original_cues += 1
+        refreshed_cues.extend(split_portrait_cue(text, seconds(start), seconds(end)))
+    assert original_cues == 146
+    assert all(font.getlength(text) <= 320 for _, _, text in refreshed_cues)
+    assert len(refreshed_cues) < 450
+
+
+def test_portrait_long_vietnamese_cue_becomes_multiple_ordered_cues():
+    text = " ".join(["N\u1ed9i dung ti\u1ebfng Vi\u1ec7t r\u00f5 r\u00e0ng, d\u1ec5 \u0111\u1ecdc."] * 6)
+    cues = split_portrait_cue(text, 3.0, 7.0)
+
+    assert len(cues) >= 3
+    assert " ".join(cue[2] for cue in cues) == text
+    assert cues[0][0] == 3.0 and cues[-1][1] == 7.0
+    assert all(end > start for start, end, _ in cues)
+    assert all(cues[index][1] == cues[index + 1][0] for index in range(len(cues) - 1))
+
+
+def test_portrait_short_and_subsecond_cues_are_safe():
+    assert split_portrait_cue("Xin ch\u00e0o!", 0.0, 0.7) == [(0.0, 0.7, "Xin ch\u00e0o!")]
+    # A long 0.7s cue still gets positive, ordered render-only windows.
+    cues = split_portrait_cue(" ".join(["Vi\u1ec7t Nam r\u1ea5t \u0111\u1eb9p."] * 4), 0.0, 0.7)
+    assert all(end > start for start, end, _ in cues)
+
+
+def test_portrait_option_writes_split_srt_and_correct_cue_count(tmp_path):
+    text = "\u0110\u00e2y l\u00e0 c\u00e2u \u0111\u1ea7u \u0111\u1ee7 d\u00e0i. \u0110\u00e2y l\u00e0 c\u00e2u sau \u0111\u1ee7 d\u00e0i."
+    path = tmp_path / "portrait.srt"
+    result = write_subtitles(
+        make_transcript([make_segment(0.0, 2.0, text)]), path,
+        options=SubtitleOptions(max_line_length=None, max_lines=1, portrait_sequential_cues=True),
+    )
+    content = path.read_text(encoding="utf-8")
+
+    assert result.cue_count == 2
+    assert "00:00:00,000 --> 00:00:01,000" in content
+    assert "00:00:01,000 --> 00:00:02,000" in content
+    assert "\n\n" in content and "\n" in content
+
+
+def test_nonportrait_subtitle_options_keep_one_original_cue():
+    text = "\u0110\u00e2y l\u00e0 c\u00e2u \u0111\u1ea7u \u0111\u1ee7 d\u00e0i. \u0110\u00e2y l\u00e0 c\u00e2u sau \u0111\u1ee7 d\u00e0i."
+    content = render_srt(make_transcript([make_segment(0.0, 2.0, text)]), SubtitleOptions(max_line_length=None))
+    assert content.count(" --> ") == 1
+
+
 def test_normalizes_existing_whitespace_and_newlines():
     transcript = make_transcript(
         [make_segment(text="Xin chào\n\n   mọi người")]
@@ -272,3 +358,16 @@ def test_does_not_mutate_timed_transcript(tmp_path):
     assert transcript.to_dict() == original
     with pytest.raises(FrozenInstanceError):
         transcript.source_file = "other.mp4"
+
+
+
+def test_portrait_long_two_second_text_balances_two_one_second_cues():
+    text = "Đây là một câu tiếng Việt rất dài phải chia thành hai lượt rõ ràng."
+    parts = split_portrait_cue(text, 8.0, 10.0)
+    assert len(parts) == 2
+    assert [(start,end) for start,end,_ in parts] == [(8.0,9.0),(9.0,10.0)]
+    assert " ".join(content for _,_,content in parts) == text
+
+
+def test_portrait_single_line_still_keeps_short_dialogue():
+    assert split_portrait_cue("Đồng ý!", 4.0, 6.0) == [(4.0,6.0,"Đồng ý!")]

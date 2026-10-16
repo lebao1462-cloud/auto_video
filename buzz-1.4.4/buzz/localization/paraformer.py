@@ -2,13 +2,20 @@
 
 import gc
 import importlib.util
+import logging
+from logging.handlers import RotatingFileHandler
 import multiprocessing
 import os
 from pathlib import Path
 import queue
 import sys
+try:
+    import psutil  # Optional health signal; no new mandatory dependency.
+except ImportError:
+    psutil = None
 import tempfile
 import threading
+import time
 from typing import Any
 import unicodedata
 
@@ -23,10 +30,34 @@ _MODEL_DIRECTORIES = {
     "vad": "iic--speech_fsmn_vad_zh-cn-16k-common-pytorch",
     "punc": "iic--punc_ct-transformer_zh-cn-common-vocab272727-pytorch",
 }
+logger = logging.getLogger(__name__)
+
+
+def _worker_logger() -> logging.Logger:
+    """Write only lifecycle/timing details, not transcript content or credentials."""
+    worker_logger = logging.getLogger("autovideo.paraformer.worker")
+    if worker_logger.handlers:
+        return worker_logger
+    root = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir())
+    path = root / "Buzz" / "Buzz" / "Logs" / "paraformer_worker.log"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            path, maxBytes=2_000_000, backupCount=2, encoding="utf-8"
+        )
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        worker_logger.addHandler(handler)
+        worker_logger.setLevel(logging.INFO)
+        worker_logger.propagate = False
+    except OSError:
+        pass
+    return worker_logger
 
 
 def _paraformer_worker(requests, responses) -> None:
     """Spawn-safe worker target.  The model deliberately never enters the GUI process."""
+    worker_logger = _worker_logger()
+    worker_logger.info("Paraformer worker started pid=%s", os.getpid())
     model = None
     while True:
         request = requests.get()
@@ -35,6 +66,8 @@ def _paraformer_worker(requests, responses) -> None:
         request_id, wav = request
         try:
             if model is None:
+                started = time.monotonic()
+                worker_logger.info("Loading Paraformer model request=%s", request_id)
                 from funasr import AutoModel
                 local_models = paraformer_model_paths()
                 model = AutoModel(
@@ -45,19 +78,44 @@ def _paraformer_worker(requests, responses) -> None:
                     ncpu=min(4, max(1, os.cpu_count() or 1)),
                     disable_update=True, disable_pbar=True,
                 )
-            responses.put((request_id, True, model.generate(
+                worker_logger.info("Paraformer model ready elapsed=%.1fs",
+                                   time.monotonic() - started)
+            started = time.monotonic()
+            worker_logger.info("Transcribing request=%s audio_file_bytes=%s",
+                               request_id, Path(wav).stat().st_size)
+            output = model.generate(
                 input=wav, sentence_timestamp=True, return_raw_text=True,
                 batch_size_s=60, batch_size_threshold_s=30,
-            )))
+            )
+            worker_logger.info("Transcription complete request=%s elapsed=%.1fs",
+                               request_id, time.monotonic() - started)
+            responses.put((request_id, True, output))
         except Exception as exc:
+            worker_logger.exception("Paraformer request failed request=%s", request_id)
             responses.put((request_id, False, f"{type(exc).__name__}: {exc}"))
 
 
-class _ParaformerWorkerService:
-    """One spawned model host, reused until cancellation, failure, or shutdown."""
+class _ParaformerWorkerExited(RuntimeError):
+    """The isolated model host stopped before replying to its request."""
 
-    def __init__(self, target=_paraformer_worker) -> None:
+
+class _ParaformerWorkerTimedOut(RuntimeError):
+    """The isolated model host exceeded the hard per-request time limit."""
+
+
+class _ParaformerWorkerService:
+    """Run one ASR request per isolated spawned model host.
+
+    Releasing the model after every video part avoids retaining native model
+    allocations across a long localization run.  The request lock also means a
+    cancelled request cannot tear down another request's worker.
+    """
+
+    def __init__(self, target=_paraformer_worker, *, timeout_seconds: float = 480.0) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("Paraformer ASR timeout must be positive")
         self._target = target
+        self.timeout_seconds = timeout_seconds
         self._process = self._requests = self._responses = None
         self._lifecycle_lock = threading.Lock()
         self._request_lock = threading.Lock()
@@ -103,28 +161,117 @@ class _ParaformerWorkerService:
             self._close_locked()
         gc.collect()
 
+    @staticmethod
+    def _exit_description(exitcode: int | None) -> str:
+        if exitcode is None:
+            return "exit code unavailable"
+        if exitcode < 0:
+            return f"exit code {exitcode} (Windows NTSTATUS 0x{exitcode & 0xFFFFFFFF:08X})"
+        return f"exit code {exitcode}"
+
+    def _unexpected_exit_locked(self, process) -> _ParaformerWorkerExited:
+        # Capture this before close(): multiprocessing.Process.close() makes
+        # exitcode inaccessible on some Python versions.
+        detail = self._exit_description(process.exitcode)
+        self._close_locked()
+        return _ParaformerWorkerExited(
+            "Paraformer worker exited unexpectedly "
+            f"({detail}); possible memory or native-resource exhaustion."
+        )
+
+    def _generate_once(self, wav: str, cancel_event=None) -> Any:
+        with self._lifecycle_lock:
+            self._start()
+            self._next_request += 1
+            request_id = self._next_request
+            process, requests, responses = self._process, self._requests, self._responses
+            requests.put((request_id, wav))
+        # Slow but active 15-minute video ASR must not trip a wall-clock limit.
+        # Only silence in worker CPU activity for this many seconds signals a
+        # likely native deadlock. Without psutil, use a conservative wall limit.
+        last_activity = time.monotonic()
+        last_cpu = None
+        cpu_process = None
+        if psutil is not None:
+            try:
+                cpu_process = psutil.Process(process.pid)
+            except (psutil.Error, OSError):
+                pass
+        idle_limit = (self.timeout_seconds if cpu_process is not None
+                      else max(self.timeout_seconds, 1800.0))
+        next_check = 0.0
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                self.shutdown()
+                raise LocalizationTranscriptionCancelled("Localization was cancelled during Paraformer transcription")
+            now = time.monotonic()
+            if cpu_process is not None and now >= next_check:
+                next_check = now + 0.5
+                try:
+                    times = cpu_process.cpu_times()
+                    current_cpu = times.user + times.system
+                    if last_cpu is None or current_cpu > last_cpu + 0.05:
+                        last_activity = now
+                    last_cpu = current_cpu
+                except (psutil.Error, OSError):
+                    cpu_process = None
+                    idle_limit = max(self.timeout_seconds, 1800.0)
+            if now - last_activity >= idle_limit:
+                # No worker activity. Retire the model worker before retrying;
+                # keep every completed video part and ASR checkpoint.
+                self.shutdown()
+                raise _ParaformerWorkerTimedOut(
+                    f"Paraformer ASR had no progress for {idle_limit:g} seconds"
+                )
+            try:
+                response_id, ok, value = responses.get(timeout=0.05)
+            except queue.Empty:
+                with self._lifecycle_lock:
+                    # A process can put its response immediately before
+                    # exiting; give the pipe one nonblocking final drain.
+                    if process is self._process and not process.is_alive():
+                        try:
+                            response_id, ok, value = responses.get_nowait()
+                        except queue.Empty:
+                            raise self._unexpected_exit_locked(process)
+                    else:
+                        continue
+            except (EOFError, OSError):
+                with self._lifecycle_lock:
+                    if process is self._process and not process.is_alive():
+                        raise self._unexpected_exit_locked(process)
+                raise
+            if response_id != request_id:
+                # Responses from an already retired worker must never be used
+                # for a subsequent request.
+                continue
+            if not ok:
+                raise RuntimeError(value)
+            return value
+
     def generate(self, wav: str, cancel_event=None) -> Any:
         with self._request_lock:
-            with self._lifecycle_lock:
-                self._start()
-                self._next_request += 1
-                request_id = self._next_request
-                self._requests.put((request_id, wav))
-            while True:
-                if cancel_event is not None and cancel_event.is_set():
-                    self.shutdown()
-                    raise LocalizationTranscriptionCancelled("Localization was cancelled during Paraformer transcription")
+            for attempt in range(2):
                 try:
-                    response_id, ok, value = self._responses.get(timeout=0.05)
-                except queue.Empty:
-                    with self._lifecycle_lock:
-                        if self._process is None or not self._process.is_alive():
-                            self._close_locked()
-                            raise RuntimeError("Paraformer worker exited unexpectedly")
+                    value = self._generate_once(wav, cancel_event=cancel_event)
+                except (_ParaformerWorkerExited, _ParaformerWorkerTimedOut) as exc:
+                    if attempt:
+                        raise
+                    logger.warning(
+                        "Paraformer worker unavailable (%s); retrying same prepared WAV "
+                        "once in a fresh process", exc,
+                    )
                     continue
-                if response_id == request_id:
-                    if not ok:
-                        raise RuntimeError(value)
+                except Exception:
+                    # A normal FunASR exception is not retried, but it must
+                    # not leave a model host around for a later video part.
+                    self.shutdown()
+                    raise
+                else:
+                    # Model memory belongs to this task only.  Do this while
+                    # holding _request_lock so no later request can race the
+                    # graceful sentinel/queue cleanup.
+                    self.shutdown()
                     return value
 
 

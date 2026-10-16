@@ -22,10 +22,12 @@ from buzz.localization.workflow import (
     LocalizationCancelled, LocalizationProgress, LocalizationStage,
     LocalizationWorkflowOptions, LocalizationWorkflowResult,
 )
+from buzz.localization.still_frame import effective_still_frame_extension_options
 
 _TIME = re.compile(r"^(\d+:\d{2}:\d{2}[,.]\d{3}) --> (\d+:\d{2}:\d{2}[,.]\d{3})$")
 _PART_MANIFEST = "localization-part-complete.json"
 _PART_MANIFEST_VERSION = 1
+_RECOVERY_CONFIRMATION = "RECOVER_COMPLETED_PART"
 _ASR_CHECKPOINT = "localization-asr-checkpoint.json"
 _ASR_CHECKPOINT_VERSION = 1
 _SECRET_NAMES = frozenset({
@@ -35,6 +37,22 @@ _SECRET_NAMES = frozenset({
 _NON_OUTPUT_PROVIDER_FIELDS = frozenset({
     "rate_limit_fallback_models",
 })
+
+
+def _maximum_rendered_part_extension_seconds(
+    chunk_seconds: float, options: LocalizationWorkflowOptions,
+) -> float:
+    """Share the planner cap, including the bounded long-part fallback.
+
+    Dense 900-second parts can require more than 5% after all shortening
+    retries have failed.  The planner permits at most 15% for exact-default
+    bounds; shorter clips and explicit lower bounds remain strict.
+    """
+    effective = effective_still_frame_extension_options(
+        options.still_frame_extension, media_duration=chunk_seconds,
+    )
+    fraction = 0.15 if chunk_seconds >= 300.0 else 0.05
+    return min(effective.max_seconds_total, chunk_seconds * fraction)
 
 
 def _stable_value(value):
@@ -331,6 +349,68 @@ def _load_completed_part(
         return None
 
 
+def reconcile_completed_part(
+    *, source: Path, part_dir: Path, fingerprint: str, chunk_seconds: float,
+    subtitle_format: str, expected_source_sha256: str,
+    maximum_extension_seconds: float = 0.0, confirmation: str,
+) -> dict:
+    """Explicitly recreate one missing part manifest after an operator audit.
+
+    This is deliberately not part of normal resume.  A rendered MP4 cannot
+    prove which translation, voice, or render settings produced it, so callers
+    must first compare those settings with the pending run and provide the
+    current source's SHA-256 plus the exact confirmation token.  The function
+    only records files that pass the same integrity and duration checks used by
+    normal resume.
+    """
+    if confirmation != _RECOVERY_CONFIRMATION:
+        raise ValueError("Completed-part recovery requires explicit operator confirmation")
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        raise ValueError("fingerprint must be the exact current part SHA-256")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_source_sha256):
+        raise ValueError("expected_source_sha256 must be a lowercase SHA-256 digest")
+    actual_source_sha256 = _file_record(source)["sha256"]
+    if actual_source_sha256 != expected_source_sha256:
+        raise ValueError("Source SHA-256 does not match the audited source")
+    if subtitle_format not in {"srt", "vtt"}:
+        raise ValueError("subtitle_format must be 'srt' or 'vtt'")
+
+    part_video = part_dir / "source.vi.mp4"
+    subtitle = part_dir / f"source.vi.{subtitle_format}"
+    if not part_video.is_file() or part_video.stat().st_size <= 0:
+        raise ValueError("Rendered part video is missing or empty")
+    if not subtitle.is_file() or subtitle.stat().st_size <= 0:
+        raise ValueError("Rendered part subtitle is missing or empty")
+    duration = probe_media_duration(part_video)
+    if duration <= 0:
+        raise ValueError("Rendered part video has no readable duration")
+    extension_seconds = max(0.0, duration - chunk_seconds)
+    if abs(duration - (chunk_seconds + extension_seconds)) > 0.25:
+        raise ValueError("Rendered part duration is incompatible with this chunk")
+    if (not isinstance(maximum_extension_seconds, (int, float))
+            or isinstance(maximum_extension_seconds, bool)
+            or maximum_extension_seconds < 0
+            or extension_seconds > maximum_extension_seconds + 0.25):
+        raise ValueError("Rendered part exceeds the audited timeline extension bound")
+
+    manifest_path = part_dir / _PART_MANIFEST
+    payload = {
+        "version": _PART_MANIFEST_VERSION,
+        "fingerprint": fingerprint,
+        "video": _file_record(part_video),
+        "subtitle": _file_record(subtitle),
+        "extension_seconds": round(extension_seconds, 3),
+        # Audit information does not participate in normal resume validation;
+        # it documents the deliberate, one-time reconciliation.
+        "recovered": {
+            "source_sha256": actual_source_sha256,
+            "confirmation": _RECOVERY_CONFIRMATION,
+        },
+    }
+    _write_manifest_atomic(manifest_path, payload)
+    return payload
+
+
 def _shift_timestamp(value: str, seconds: float) -> str:
     hours, minutes, rest = value.split(":")
     whole, millis = re.split("[,.]", rest)
@@ -447,8 +527,9 @@ def localize_chunked_video(
                 ))
             continue
 
-        # A stale marker must not survive a failed reprocessing attempt.
-        manifest_path.unlink(missing_ok=True)
+        # Keep an invalid manifest until a replacement part has rendered
+        # successfully.  It is valuable forensic/recovery evidence, and a
+        # later atomic write replaces it only after all output checks pass.
         if _reusable_prepared_clip(clip, source, chunk_seconds):
             if progress_callback:
                 progress_callback(LocalizationProgress(
@@ -524,6 +605,11 @@ def localize_chunked_video(
                             total, f"Part {index + 1}/{count}: waiting for ASR resource",
                         ))) if progress_callback else None,
                     ):
+                        if progress_callback:
+                            progress_callback(LocalizationProgress(
+                                LocalizationStage.TRANSCRIBE, index * steps_per_piece,
+                                total, f"Part {index + 1}/{count}: recognizing speech ({asr_provider})",
+                            ))
                         transcript = transcribe_func(
                             str(clip), transcription_options, model_path, **transcribe_kwargs,
                         )
@@ -563,14 +649,20 @@ def localize_chunked_video(
         check_cancel()
         part_duration = probe_media_duration(part_video)
         extension_seconds = max(0.0, part_duration - chunk_seconds)
-        maximum_extension = min(
-            options.still_frame_extension.max_seconds_total, chunk_seconds * 0.02,
+        maximum_extension = _maximum_rendered_part_extension_seconds(
+            chunk_seconds, options,
         )
         if extension_seconds > maximum_extension + 0.25:
             raise RuntimeError(
                 f"Rendered part {index + 1} grew by {extension_seconds:.2f}s, "
                 f"above its explicit {maximum_extension:.2f}s extension bound"
             )
+        if extension_seconds > chunk_seconds * 0.05 and progress_callback:
+            progress_callback(LocalizationProgress(
+                LocalizationStage.RENDER, (index + 1) * steps_per_piece, total,
+                f"Part {index + 1}/{count}: timing recovery grew video by "
+                f"{extension_seconds:.2f}s ({extension_seconds / chunk_seconds * 100:.1f}%)",
+            ))
         if part_duration <= 0 or abs(part_duration - (chunk_seconds + extension_seconds)) > 0.25:
             raise RuntimeError(
                 f"Rendered part {index + 1} duration {part_duration:.2f}s differs "

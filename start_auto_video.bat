@@ -18,6 +18,10 @@ if errorlevel 1 echo [WARNING] ffmpeg.exe not found on PATH.
 where ffprobe.exe >nul 2>&1
 if errorlevel 1 echo [WARNING] ffprobe.exe not found on PATH.
 
+if not defined BUZZ_VIENEU_PYTHON if exist "%ROOT%.vieneu-venv\Scripts\python.exe" set "BUZZ_VIENEU_PYTHON=%ROOT%.vieneu-venv\Scripts\python.exe"
+if not defined BUZZ_VIENEU_MODEL_DIR if exist "%ROOT%models\VieNeu-TTS-v3-Turbo\onnx_update\config.json" set "BUZZ_VIENEU_MODEL_DIR=%ROOT%models\VieNeu-TTS-v3-Turbo\onnx_update"
+if not defined BUZZ_VIENEU_HF_HOME if exist "%ROOT%models\HuggingFace\hub" set "BUZZ_VIENEU_HF_HOME=%ROOT%models\HuggingFace"
+
 pushd "%APP_DIR%"
 "%PYTHON_EXE%" main.py
 set "RESULT=%ERRORLEVEL%"

@@ -256,3 +256,144 @@ def test_vieneu_providers_share_worker_until_final_close(monkeypatch, tmp_path):
     assert len(processes) == 2
     third.close()
     assert processes[1].terminated
+
+
+def test_vieneu_recovers_from_one_stalled_worker(monkeypatch, tmp_path):
+    """A timeout must kill the stuck worker, then synthesize from a fresh process."""
+    from buzz.localization.providers import LocalizationProviderError
+
+    runtime = tmp_path / "python.exe"
+    runtime.touch()
+    model, cache = tmp_path / "model", tmp_path / "hf"
+    model.mkdir()
+    cache.mkdir()
+    processes = []
+
+    class Process:
+        def __init__(self, stuck):
+            self.stuck = stuck
+            self.closed = threading.Event()
+            self.stdin = self
+            self.stdout = self
+
+        def write(self, line):
+            self.payload = json.loads(line)
+            if not self.stuck:
+                Path(self.payload["output_file"]).write_bytes(b"wav")
+
+        def flush(self):
+            pass
+
+        def readline(self):
+            if self.stuck:
+                self.closed.wait(2)
+                return ""
+            return json.dumps({
+                "id": self.payload["id"], "ok": True, "duration": 1.5,
+            }) + "\n"
+
+        def poll(self):
+            return 0 if self.closed.is_set() else None
+
+        def terminate(self):
+            self.closed.set()
+
+        def wait(self, timeout):
+            return 0
+
+    def launch(*args, **kwargs):
+        proc = Process(stuck=len(processes) == 0)
+        processes.append(proc)
+        return proc
+
+    monkeypatch.setattr("buzz.localization.providers.subprocess.Popen", launch)
+    provider = VieNeuTTSProvider(
+        python_executable=str(runtime), model_dir=str(model), hf_home=str(cache),
+        worker_timeout_seconds=0.02, max_timeout_retries=1,
+    )
+    try:
+        result = provider.synthesize(TTSRequest(
+            "Xin chào", "vi", str(tmp_path / "result"), voice="Ngọc Huyền",
+        ))
+        assert result.audio_duration == 1.5
+        assert len(processes) == 2
+        assert processes[0].closed.is_set()
+    finally:
+        provider.close()
+
+
+def test_vieneu_two_timeouts_raise_without_infinite_retry(monkeypatch, tmp_path):
+    from buzz.localization.providers import LocalizationProviderError
+
+    runtime = tmp_path / "python.exe"
+    runtime.touch()
+    model, cache = tmp_path / "model", tmp_path / "hf"
+    model.mkdir()
+    cache.mkdir()
+    processes = []
+
+    class StuckProcess:
+        def __init__(self):
+            self.closed = threading.Event()
+            self.stdin = self
+            self.stdout = self
+        def write(self, line):
+            pass
+        def flush(self):
+            pass
+        def readline(self):
+            self.closed.wait(2)
+            return ""
+        def poll(self):
+            return 0 if self.closed.is_set() else None
+        def terminate(self):
+            self.closed.set()
+        def wait(self, timeout):
+            return 0
+
+    def launch(*args, **kwargs):
+        process = StuckProcess()
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr("buzz.localization.providers.subprocess.Popen", launch)
+    provider = VieNeuTTSProvider(
+        python_executable=str(runtime), model_dir=str(model), hf_home=str(cache),
+        worker_timeout_seconds=0.02, max_timeout_retries=1,
+    )
+    with pytest.raises(LocalizationProviderError, match=r"after 2 attempts"):
+        provider.synthesize(TTSRequest("Xin chào", "vi", str(tmp_path / "result")))
+    assert len(processes) == 2
+    assert all(process.closed.is_set() for process in processes)
+    provider.close()
+
+
+def test_vieneu_terminates_launcher_and_child_process_tree_on_windows(monkeypatch):
+    import os
+    from types import SimpleNamespace
+    from buzz.localization import providers
+
+    if os.name != "nt":
+        pytest.skip("Windows virtualenv launcher behavior")
+
+    class Process:
+        pid = 45678
+        def __init__(self):
+            self.waited = False
+        def poll(self):
+            return None
+        def wait(self, timeout):
+            self.waited = True
+
+    command_list = []
+    def fake_run(command, **kwargs):
+        command_list.append(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(providers.subprocess, "run", fake_run)
+    proc = Process()
+    session = SimpleNamespace(process=proc)
+    providers.VieNeuTTSProvider._stop_worker(session)
+    assert session.process is None
+    assert command_list == [["taskkill", "/PID", "45678", "/T", "/F"]]
+    assert proc.waited

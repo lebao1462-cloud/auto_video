@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -13,6 +14,7 @@ from buzz.localization.transcript import (
 )
 
 SUPPORTED_TARGET_LANGUAGES = {"vi"}
+logger = logging.getLogger(__name__)
 
 
 class TranslationProvider(Protocol):
@@ -157,20 +159,26 @@ def _is_speakable_translated_text(value) -> bool:
     )
 
 
-_REGISTER_MIXES = (
-    ("tao", "người"), ("tao", "cậu"), ("ta", "mày"),
-    ("tôi", "người"), ("tôi", "mày"),
-)
+def _has_prohibited_dialogue_pronoun(value: str) -> bool:
+    """Reject vulgar first/second person, but allow literal eyebrows ('lông mày')."""
+    if not isinstance(value, str):
+        return False
+    normalized = value.casefold()
+    # This is a noun, not the second-person pronoun.
+    normalized = re.sub(r"(?<!\w)(?:lông|chân|đôi)\s+mày(?!\w)", "", normalized)
+    return bool(re.search(r"(?<!\w)(?:tao|mày)(?!\w)", normalized))
 
 
 def _valid_reviewed_text(value) -> bool:
-    """Reject deterministic, unsafe register mistakes without rewriting model text."""
-    if not _is_speakable_translated_text(value):
+    """Reject prohibited pronouns and bad calques, without mistaking nouns for pronouns.
+
+    It is incorrect to reject any sentence containing both `tôi` and `người`:
+    `Tôi biết người đó` is ordinary Vietnamese. Dialogue consistency itself
+    is decided by Gemini from the scene, not by unordered word-set matches.
+    """
+    if not _is_speakable_translated_text(value) or _has_prohibited_dialogue_pronoun(value):
         return False
-    words = set(re.findall(r"[^\W\d_]+", value.casefold(), flags=re.UNICODE))
-    if "hố" in words and "cha" in words:
-        return False
-    return not any(left in words and right in words for left, right in _REGISTER_MIXES)
+    return re.search(r"(?<!\w)hố\s+cha(?!\w)", value.casefold()) is None
 
 
 def _review_checkpoint_fingerprint(raw_fingerprint: str, raw_items: dict, provider) -> str:
@@ -248,10 +256,19 @@ def _review_translation_register(
     fingerprint = _review_checkpoint_fingerprint(raw_fingerprint, raw_items, provider)
     review_path = _review_checkpoint_path(checkpoint) if checkpoint else None
     completed = _read_checkpoint(review_path, fingerprint) if review_path else {}
+    def valid_completed_item(identifier, value):
+        if identifier not in raw_items or value["source_text"] != raw_items[identifier]["source_text"]:
+            return False
+        translated = value["translated_text"]
+        return _valid_reviewed_text(translated) or (
+            value.get("review_status") == "raw_fallback"
+            and translated == raw_items[identifier]["translated_text"]
+            and _valid_reviewed_text(translated)
+        )
+
     completed = {
         identifier: value for identifier, value in completed.items()
-        if identifier in raw_items and value["source_text"] == raw_items[identifier]["source_text"]
-        and _valid_reviewed_text(value["translated_text"])
+        if valid_completed_item(identifier, value)
     }
     positions = {item.segment_id: index for index, item in enumerate(items)}
 
@@ -260,50 +277,114 @@ def _review_translation_register(
         return tuple(_TranslationContextSegment(
             item.start, item.end, item.text, item.segment_id,
             completed[item.segment_id]["translated_text"],
-        ) for item in items[max(0, first - 12):first]
+        ) for item in items[max(0, first - 18):first]
             if item.segment_id in completed)
 
     def review_batch(batch):
         pending = [item for item in batch if item.segment_id not in completed]
         if not pending:
             return
-        last_error = None
+        last_malformed_error = None
+        last_provider_error = None
         for _ in range(2):
             try:
                 response = review(
                     pending, transcript.source_language, target_language,
                     context=context_for(pending),
                 )
-                if not isinstance(response, (list, tuple)) or len(response) != len(pending):
-                    raise ValueError("Translation provider returned a different review segment count")
-                expected = {item.segment_id for item in pending}
-                validated = {}
-                for result in response:
-                    if not isinstance(result, (list, tuple)) or len(result) != 2:
-                        raise ValueError("Translation provider returned an invalid review response")
-                    identifier, translated = result
-                    if identifier in validated or identifier not in expected or not _valid_reviewed_text(translated):
-                        raise ValueError("Translation provider returned an invalid reviewed translation")
-                    validated[identifier] = {
-                        "source_text": raw_items[identifier]["source_text"],
-                        "translated_text": translated.strip(),
-                    }
-                if set(validated) != expected:
-                    raise ValueError("Translation provider returned missing review IDs")
-                completed.update(validated)
+            except Exception as exc:
+                # Provider/network/quota failures are not malformed responses and must
+                # remain visible to the caller rather than becoming raw fallbacks.
+                last_provider_error = exc
+                continue
+
+            malformed = None
+            if not isinstance(response, (list, tuple)):
+                malformed = ValueError("Translation provider returned an invalid review response")
+                response = ()
+            expected = {item.segment_id for item in pending}
+            duplicate_ids = set()
+            response_ids = []
+            for result in response:
+                if (
+                    isinstance(result, (list, tuple)) and len(result) == 2
+                    and isinstance(result[0], str)
+                ):
+                    response_ids.append(result[0])
+            seen_ids = set()
+            for identifier in response_ids:
+                if identifier in seen_ids:
+                    duplicate_ids.add(identifier)
+                seen_ids.add(identifier)
+            for result in response:
+                if not isinstance(result, (list, tuple)) or len(result) != 2:
+                    malformed = malformed or ValueError(
+                        "Translation provider returned an invalid review response"
+                    )
+                    continue
+                identifier, translated = result
+                if not isinstance(identifier, str):
+                    malformed = malformed or ValueError(
+                        "Translation provider returned an invalid review response"
+                    )
+                    continue
+                if identifier not in expected:
+                    logger.warning("Ignoring unknown review segment ID")
+                    malformed = malformed or ValueError(
+                        "Translation provider returned an invalid review response"
+                    )
+                    continue
+                if identifier in duplicate_ids:
+                    logger.warning("Ignoring duplicate review segment ID %s", identifier)
+                    malformed = malformed or ValueError(
+                        "Translation provider returned an invalid review response"
+                    )
+                    continue
+                if not _valid_reviewed_text(translated):
+                    malformed = malformed or ValueError(
+                        "Translation provider returned an invalid reviewed translation"
+                    )
+                    continue
+                completed[identifier] = {
+                    "source_text": raw_items[identifier]["source_text"],
+                    "translated_text": translated.strip(),
+                }
                 if review_path:
                     _write_checkpoint(review_path, fingerprint, completed)
+            pending = [item for item in pending if item.segment_id not in completed]
+            if not pending:
                 return
-            except Exception as exc:
-                last_error = exc
+            last_malformed_error = malformed or ValueError(
+                "Translation provider returned missing review IDs"
+            )
+        if last_provider_error is not None:
+            raise last_provider_error
         if len(pending) == 1:
-            raise last_error
+            item = pending[0]
+            raw_text = raw_items[item.segment_id]["translated_text"]
+            if not _valid_reviewed_text(raw_text):
+                raise ValueError(
+                    "Gemini review could not remove prohibited pronouns or invalid wording; "
+                    "refusing to put an unsafe raw fallback into subtitles"
+                ) from last_malformed_error
+            completed[item.segment_id] = {
+                "source_text": raw_items[item.segment_id]["source_text"],
+                "translated_text": raw_text,
+                "review_status": "raw_fallback",
+            }
+            if review_path:
+                _write_checkpoint(review_path, fingerprint, completed)
+            logger.warning(
+                "Using raw translation fallback for review segment %s after %s",
+                item.segment_id, type(last_malformed_error).__name__,
+            )
+            return
         midpoint = len(pending) // 2
         review_batch(pending[:midpoint])
         review_batch(pending[midpoint:])
 
-    for start in range(0, len(items), 120):
-        review_batch(items[start:start + 120])
+    for start in range(0, len(items), 30):
+        review_batch(items[start:start + 30])
     return [TranslatedLocalizationSegment(
         item.start, item.end, raw_items[item.segment_id]["source_text"],
         completed[item.segment_id]["translated_text"],
@@ -351,7 +432,7 @@ def translate_for_localization(
             """Use recent completed Vietnamese lines as scene/register memory."""
             first = positions[batch[0].segment_id]
             context = []
-            for item in identified[max(0, first - 8):first]:
+            for item in identified[max(0, first - 12):first]:
                 completed_item = completed.get(item.segment_id)
                 if completed_item is None:
                     continue

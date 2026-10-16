@@ -7,6 +7,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtWidgets import QApplication
 
 from buzz.settings.settings import Settings as RealSettings
+from buzz.store.keyring_store import Key
 from buzz.widgets.localization_dashboard import (
     CANCELLED, COMPLETED, FAILED, PROCESSING, WAITING, LocalizationDashboard, LocalizationJob,
 )
@@ -89,6 +90,28 @@ def test_initial_five_empty_slots(qtbot, tmp_path):
 def test_dashboard_uses_fake_settings_only(qtbot, tmp_path):
     dashboard(qtbot, tmp_path)
     assert len(FakeSettings.instances) == 1
+
+
+def test_dashboard_is_gemini_only_and_hides_advanced_options(qtbot, tmp_path):
+    view = dashboard(qtbot, tmp_path)
+    assert view.translation_provider_combo.count() == 1
+    assert view.translation_provider_combo.currentData() == "gemini"
+    assert view.advanced_options.isHidden()
+    job = view.add_videos([str(tmp_path / "one.mp4")])[0]
+    assert job.worker.kwargs["translation_provider_name"] == "gemini"
+    assert job.worker.kwargs["translation_base_url"] is None
+    view.shutdown()
+    finish(qtbot, job.worker, job)
+
+
+def test_dashboard_keeps_gemini_key_secure(qtbot, tmp_path, monkeypatch):
+    view = dashboard(qtbot, tmp_path)
+    stored = []
+    monkeypatch.setattr("buzz.widgets.localization_dashboard.set_password", lambda *args: stored.append(args))
+    view.api_key_edit.setText("gemini-secret")
+    view.save_api_key()
+    assert view.api_key_edit.echoMode() == view.api_key_edit.EchoMode.Password
+    assert stored == [(Key.GEMINI_API_KEY, "gemini-secret")]
 
 
 def test_non_persistent_dashboard_never_reads_or_writes_keyring(qtbot, monkeypatch):
@@ -285,6 +308,22 @@ def test_thread_cleanup_waits_for_native_thread_before_releasing_refs(qtbot, tmp
     assert thread.deleted == 1
 
 
+def test_output_directory_prefers_existing_part_checkpoints_over_new_empty_suffix(qtbot, tmp_path):
+    view = dashboard(qtbot, tmp_path)
+    root = tmp_path / "output"
+    original = root / "p01"
+    accidental_duplicate = root / "p01-2"
+    (original / "p01_localization_work" / "part_0002"
+     / "source_localization_work").mkdir(parents=True)
+    (original / "p01_localization_work" / "part_0002"
+     / "source_localization_work" / "timing-recovery-checkpoint.json").write_text("{}")
+    (accidental_duplicate / "p01_localization_work" / "part_0001").mkdir(parents=True)
+    (accidental_duplicate / "p01_localization_work" / "part_0001"
+     / "source.mp4").write_bytes(b"incomplete")
+
+    assert view._job_output_directory(root, Path("p01.mp4")) == original
+
+
 def test_output_directory_prefers_highest_generation_over_newer_empty_checkpoint(qtbot, tmp_path):
     view = dashboard(qtbot, tmp_path)
     root = tmp_path / "output"
@@ -360,6 +399,24 @@ def test_adding_failed_source_retries_same_job_and_directory(qtbot, tmp_path):
     assert "Tiếp tục từ checkpoint hiện có" in job.detail
 
 
+def test_add_videos_deduplicates_pending_source_without_allocating_second_output(qtbot, tmp_path):
+    view = dashboard(qtbot, tmp_path)
+    source = str(tmp_path / "p01.mp4")
+
+    first = view.add_videos([source])
+    duplicate = view.add_videos([source])
+    repeated_in_one_request = view.add_videos([str(tmp_path / "p02.mp4")] * 2)
+
+    assert len(first) == 1
+    assert duplicate == []
+    assert len(repeated_in_one_request) == 1
+    assert [job for job in view.jobs if job and Path(job.source_video).name == "p01.mp4"] == first
+    assert not (tmp_path / "output" / "p01-2").exists()
+    view.shutdown()
+    for job in (first[0], repeated_in_one_request[0]):
+        finish(qtbot, job.worker, job)
+
+
 def test_retry_uses_changed_api_key_and_same_job_directory_and_slot(qtbot, tmp_path, monkeypatch):
     view = dashboard(qtbot, tmp_path)
     source = str(tmp_path / "p01.mp4")
@@ -380,7 +437,7 @@ def test_retry_uses_changed_api_key_and_same_job_directory_and_slot(qtbot, tmp_p
     assert job.output_directory == directory
     assert job.status == PROCESSING
     assert job.worker is not first_worker
-    assert job.worker.kwargs["source_video"] == source
+    assert os.path.normcase(job.worker.kwargs["source_video"]) == os.path.normcase(source)
     assert job.worker.kwargs["output_directory"] == directory
     assert job.worker.kwargs["translation_api_key"] == "replacement-key"
     assert saved_keys and saved_keys[0][1] == "replacement-key"
@@ -477,3 +534,76 @@ def test_output_directory_without_checkpoint_allocates_unique_new_directory(qtbo
     (root / "p01").mkdir()
 
     assert view._job_output_directory(root, Path("p01.mp4")) == root / "p01-2"
+
+def test_manual_video_orientation_is_visible_and_mutually_exclusive(qtbot, tmp_path):
+    view = dashboard(qtbot, tmp_path)
+    assert view.portrait_subtitle_overlay_checkbox.isChecked() is False
+    assert view.landscape_video_radio.isChecked() is True
+    assert not view.advanced_options.isAncestorOf(view.landscape_video_radio)
+    assert not view.advanced_options.isAncestorOf(view.portrait_subtitle_overlay_checkbox)
+    view.portrait_subtitle_overlay_checkbox.setChecked(True)
+    assert view.landscape_video_radio.isChecked() is False
+    view.landscape_video_radio.setChecked(True)
+    assert view.landscape_video_radio.isChecked() is True
+    assert view.portrait_subtitle_overlay_checkbox.isChecked() is False
+
+
+def test_manual_video_orientation_snapshots_on_add_and_ignores_mocked_media_probe(qtbot, tmp_path, monkeypatch):
+    view = dashboard(qtbot, tmp_path)
+    portrait_named_landscape = tmp_path / "landscape-1920x1080.mp4"
+    landscape_named_portrait = tmp_path / "portrait-1080x1920.mp4"
+    probe_calls = []
+
+    def unexpected_probe(*args, **kwargs):
+        probe_calls.append((args, kwargs))
+        raise AssertionError("Dashboard must not probe media orientation")
+
+    monkeypatch.setattr("subprocess.run", unexpected_probe)
+    view.portrait_subtitle_overlay_checkbox.setChecked(True)
+    first = view.add_videos([str(portrait_named_landscape)])[0]
+    assert first.portrait_subtitle_overlay is True
+    assert first.worker.kwargs["portrait_subtitle_overlay"] is True
+    view.landscape_video_radio.setChecked(True)
+    second = view.add_videos([str(landscape_named_portrait)])[0]
+    assert first.worker.kwargs["portrait_subtitle_overlay"] is True
+    assert second.portrait_subtitle_overlay is False
+    assert second.worker.kwargs["portrait_subtitle_overlay"] is False
+    assert probe_calls == []
+    view.shutdown()
+    finish(qtbot, first.worker, first)
+    finish(qtbot, second.worker, second)
+
+
+def test_dashboard_has_no_auto_orientation_detection(qtbot, tmp_path):
+    view = dashboard(qtbot, tmp_path)
+    assert not hasattr(view, "_is_portrait_video")
+    assert not hasattr(view, "_should_apply_portrait_subtitles")
+    assert view.portrait_subtitle_overlay_checkbox.isChecked() is False
+    view.shutdown()
+
+
+def test_portrait_option_snapshots_on_add_and_does_not_change_active_job(qtbot, tmp_path):
+    view = dashboard(qtbot, tmp_path)
+    view.portrait_subtitle_overlay_checkbox.setChecked(True)
+    first = view.add_videos([str(tmp_path / "portrait.mp4")])[0]
+    assert first.portrait_subtitle_overlay is True
+    assert first.worker.kwargs["portrait_subtitle_overlay"] is True
+    view.landscape_video_radio.setChecked(True)
+    second = view.add_videos([str(tmp_path / "landscape.mp4")])[0]
+    assert first.worker.kwargs["portrait_subtitle_overlay"] is True
+    assert second.portrait_subtitle_overlay is False
+    assert second.worker.kwargs["portrait_subtitle_overlay"] is False
+    view.shutdown()
+    finish(qtbot, first.worker, first)
+    finish(qtbot, second.worker, second)
+def test_subtitle_refresh_action_validates_mp4_and_adjacent_subtitle(qtbot, tmp_path):
+    view = dashboard(qtbot, tmp_path)
+    view.subtitle_refresh_source_edit.setText(str(tmp_path / "missing.mp4"))
+    view.start_subtitle_refresh()
+    assert "existing dubbed MP4" in view.subtitle_refresh_status.text()
+
+    video = tmp_path / "source.vi.mp4"
+    video.write_bytes(b"not a real mp4")
+    view.subtitle_refresh_source_edit.setText(str(video))
+    view.start_subtitle_refresh()
+    assert "SRT/VTT" in view.subtitle_refresh_status.text()

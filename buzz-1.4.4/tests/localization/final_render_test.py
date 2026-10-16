@@ -12,6 +12,8 @@ from buzz.localization.final_render import (
     blur_bilibili_watermark_video,
     build_bilibili_watermark_filter_graph,
     render_localized_mp4,
+    refresh_dubbed_portrait_subtitles,
+    subtitle_refresh_output_path,
 )
 
 
@@ -557,3 +559,159 @@ def test_bilibili_watermark_options_and_standalone_command(tmp_path):
     blur_bilibili_watermark_video(video, tmp_path / "blurred.mp4", options=options, ffmpeg_runner=runner)
     assert "-c:a" in runner.commands[0]
     assert runner.commands[0][runner.commands[0].index("-c:a") + 1] == "copy"
+
+def test_portrait_preset_overlays_vietnamese_at_chinese_subtitle_height(tmp_path):
+    from buzz.localization.final_render import build_portrait_subtitle_filter_graph
+    video, audio, subtitle = create_inputs(tmp_path)
+    runner = FakeRunner()
+    options = FinalRenderOptions(
+        subtitle_mode="burn", cover_original_subtitles=True,
+        blur_bilibili_watermark=True, portrait_subtitle_overlay=True,
+        overlay_ben_review_logo=True,
+    )
+    render_localized_mp4(
+        video, audio, tmp_path / "portrait.mp4", subtitle_file=subtitle,
+        options=options, ffmpeg_runner=runner,
+    )
+    cmd = runner.commands[0]
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert graph == build_portrait_subtitle_filter_graph(
+        graph.split("subtitles='", 1)[1].split("':force_style=", 1)[0],
+        overlay_logo=True,
+    )
+    assert "-vf" not in cmd
+    assert "portrait_top_blur" in graph and "portrait_bottom_blur" in graph
+    assert "portrait_dialogue_blur" in graph
+    assert "crop=iw*0.90:ih*0.06:iw*0.05:ih*0.655" in graph
+    assert "overlay=x=W*0.05:y=H*0.655" in graph
+    assert "drawbox=x=iw*0.05:y=ih*0.655:w=iw*0.90:h=ih*0.06" in graph
+    assert "Alignment=5,MarginV=0,FontSize=32" in graph
+    assert "ben_review_logo" in graph
+    assert "ih*0.82" not in graph and "watermark_ready" not in graph
+    assert graph.index("portrait_dialogue_blur") < graph.index("subtitles=")
+    assert graph.index("subtitles=") < graph.index("[ben_review_base][ben_review_logo]overlay")
+    assert cmd[cmd.index("-map") + 1] == "[vout]"
+    assert cmd[cmd.index("-c:a") + 1] == "aac"
+
+
+def test_portrait_preset_requires_burn_and_preserves_landscape_default(tmp_path):
+    with pytest.raises(ValueError, match="portrait_subtitle_overlay"):
+        FinalRenderOptions(subtitle_mode="soft", portrait_subtitle_overlay=True)
+    with pytest.raises(ValueError, match="portrait_subtitle_overlay"):
+        FinalRenderOptions(subtitle_mode="none", portrait_subtitle_overlay=True)
+    assert FinalRenderOptions().portrait_subtitle_overlay is False
+    video, audio, subtitle = create_inputs(tmp_path)
+    runner = FakeRunner()
+    render_localized_mp4(
+        video, audio, tmp_path / "landscape.mp4", subtitle_file=subtitle,
+        options=FinalRenderOptions(subtitle_mode="burn", cover_original_subtitles=True),
+        ffmpeg_runner=runner,
+    )
+    graph = runner.commands[0][runner.commands[0].index("-filter_complex") + 1]
+    assert "portrait_top_blur" not in graph
+    assert "portrait_dialogue_blur" not in graph
+    assert "cover" in graph
+
+def test_portrait_one_line_ass_preserves_entire_cues_and_fits_width(tmp_path):
+    from buzz.localization.final_render import _portrait_one_line_ass
+    source = tmp_path / "source.srt"
+    short = "Xin chào!"
+    long = "Tôi sẽ đi cùng anh. Nhưng chúng ta phải cẩn thận. Và vẫn còn một câu rất dài."
+    source.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n" + short
+        + "\n\n2\n00:00:01,000 --> 00:00:03,000\n"
+        + "Tôi sẽ đi cùng anh.\n"
+        + "Nhưng chúng ta phải cẩn thận. Và vẫn còn một câu rất dài.\n",
+        encoding="utf-8",
+    )
+    derived = _portrait_one_line_ass(source, tmp_path)
+    try:
+        text = derived.read_text(encoding="utf-8-sig")
+        # Legacy full cues are split only in the temporary ASS, not the SRT.
+        assert text.count("Dialogue: ") >= 2
+        assert short in text
+        assert all(word in text for word in long.split())
+        assert "\\an5\\pos(540,1315)\\q2" in text  # centered x and y inside blur band
+        assert "\\N" not in text
+        lines = [line for line in text.splitlines() if line.startswith("Dialogue: ")]
+        assert all("\\fs32\\fscx100" in line for line in lines)
+        # Every render-only legacy split remains sequential (no overlap/gap).
+        times = [line.split(",")[1:3] for line in lines]
+        assert all(times[index][1] == times[index + 1][0] for index in range(len(times) - 1))
+        assert "1:00:00" not in text  # no accidental hour offset
+    finally:
+        derived.unlink()
+
+
+def test_portrait_render_temp_ass_is_deleted_after_runner(tmp_path):
+    video, audio, subtitle = create_inputs(tmp_path)
+    observed = []
+    def runner(cmd):
+        graph = cmd[cmd.index("-filter_complex") + 1]
+        from pathlib import Path
+        import re
+        match = re.search(r"subtitles='([^']+\.ass)'", graph)
+        assert match is not None
+        derived_path = Path(match.group(1).replace(r"\:", ":"))
+        assert derived_path.is_file()
+        assert "Dialogue:" in derived_path.read_text(encoding="utf-8-sig")
+        observed.append(derived_path)
+        Path(cmd[-1]).write_bytes(b"fake mp4")
+    render_localized_mp4(
+        video, audio, tmp_path / "output.mp4", subtitle_file=subtitle,
+        options=FinalRenderOptions(subtitle_mode="burn", portrait_subtitle_overlay=True),
+        ffmpeg_runner=runner,
+    )
+    assert len(observed) == 1 and not observed[0].exists()
+
+
+def test_subtitle_refresh_maps_original_audio_and_only_dialogue_band(tmp_path):
+    video = tmp_path / "source.vi.mp4"
+    subtitle = tmp_path / "source.vi.srt"
+    output = subtitle_refresh_output_path(video)
+    video.write_bytes(b"source")
+    subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\nXin chao Viet Nam\n", encoding="utf-8")
+    commands = []
+
+    def probe(_):
+        return subprocess.CompletedProcess([], 0, '{"streams":[{"width":1080,"height":1920}],"format":{"duration":"904.0"}}', "")
+
+    def runner(command, *, cancel_event=None):
+        commands.append(command)
+        Path(command[-1]).write_bytes(b"refreshed")
+
+    result = refresh_dubbed_portrait_subtitles(
+        video, output, subtitle_file=subtitle, ffmpeg_runner=runner, ffprobe_runner=probe,
+    )
+
+    command = commands[0]
+    graph = command[command.index("-filter_complex") + 1]
+    assert result.video_file == str(output)
+    assert command[command.index("-map") + 1] == "[vout]"
+    assert command[command.index("-map", command.index("-map") + 1) + 1] == "0:a:0"
+    assert command[command.index("-c:a") + 1] == "copy"
+    assert "crop=iw*0.90:ih*0.06:iw*0.05:ih*0.655" in graph
+    assert "portrait_top" not in graph and "portrait_bottom" not in graph and "ben_review" not in graph
+    assert output.is_file()
+    assert not list(tmp_path.glob("portrait_one_line_*.ass"))
+
+
+def test_subtitle_refresh_rejects_existing_output_and_cleans_partial_on_cancel(tmp_path):
+    from buzz.localization.audio_mix import AudioMixingCancelled
+    video = tmp_path / "source.vi.mp4"
+    subtitle = tmp_path / "source.vi.srt"
+    output = subtitle_refresh_output_path(video)
+    video.write_bytes(b"source")
+    subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\nXin chao\n", encoding="utf-8")
+    def probe(_):
+        return subprocess.CompletedProcess([], 0, '{"streams":[{"width":1080,"height":1920}],"format":{"duration":"1.0"}}', "")
+    def cancelled(command, *, cancel_event=None):
+        Path(command[-1]).write_bytes(b"partial")
+        raise AudioMixingCancelled("cancelled")
+    with pytest.raises(AudioMixingCancelled):
+        refresh_dubbed_portrait_subtitles(video, output, subtitle_file=subtitle, ffmpeg_runner=cancelled, ffprobe_runner=probe)
+    assert not output.exists()
+    assert not list(tmp_path.glob("*.partial.mp4"))
+    output.write_bytes(b"do not overwrite")
+    with pytest.raises(FinalRenderError, match="already exists"):
+        refresh_dubbed_portrait_subtitles(video, output, subtitle_file=subtitle, ffprobe_runner=probe)

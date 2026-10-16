@@ -23,7 +23,8 @@ from buzz.localization.audio_mix import (
 from buzz.localization.final_render import FinalRenderOptions, FinalRenderResult, render_localized_mp4
 from buzz.localization.still_frame import (
     StillFrameExtensionError, StillFrameExtensionOptions,
-    plan_still_frame_extensions, probe_video_fps, render_still_frame_video,
+    effective_still_frame_extension_options, plan_still_frame_extensions, plan_terminal_still_frame_extension,
+    probe_video_fps, reconcile_still_frame_extensions, render_still_frame_video,
 )
 from buzz.localization.resources import DEFAULT_RESOURCE_SCHEDULER, ResourceCancelled
 from buzz.localization.subtitles import SubtitleOptions, SubtitleResult, write_subtitles
@@ -37,6 +38,7 @@ from buzz.localization.transcript import (
     LocalizationTranscript, LocalizationTranscriptionCancelled,
     transcribe_for_localization,
 )
+from buzz.localization.dialogue_qa import auto_review_dialogue, DialogueQACancelled
 from buzz.localization.translation import (
     TranslatedLocalizationSegment,
     TranslatedLocalizationTranscript,
@@ -357,6 +359,16 @@ def _synchronize_with_translation_recovery(
     source_video: Path | None = None,
 ):
     current = synthesized
+    source_media_end = media_end
+    # This is intentionally derived only once from the original clip.  A
+    # terminal correction must consume the same adaptive total as internal
+    # freezes instead of making a longer part eligible for a larger cap.
+    effective_extension_options = effective_still_frame_extension_options(
+        options.still_frame_extension, media_duration=source_media_end,
+    )
+    # A terminal ASR overrun extends the source video at its real endpoint.
+    # Preserve the event while normal timing recovery fixes earlier utterances.
+    terminal_video_extensions: tuple = ()
     attempts_by_segment: dict[int, int] = {}
     final_edge_rate_attempts: dict[int, set[int]] = {}
 
@@ -535,10 +547,49 @@ def _synchronize_with_translation_recovery(
         return fast_options, increase
 
     while True:
+        # Reserve a terminal ASR/container correction before the synchronizer
+        # visits earlier segments.  Otherwise an ordinary internal overflow
+        # can mask the tail and incorrectly ask the ordinary planner to insert
+        # a freeze beyond the real source endpoint.
+        terminal_overrun = (
+            media_end is not None
+            and current.segments
+            and float(current.segments[-1].end) > media_end + 1e-9
+        )
+        if terminal_overrun:
+            if options.use_background_separation:
+                raise TimingSynchronizationError(
+                    "Terminal still-frame extension cannot be used with background "
+                    "separation; background audio would need identical retiming."
+                )
+            try:
+                extension_options = effective_extension_options
+                if source_video is not None:
+                    extension_options = replace(
+                        extension_options, fps=probe_video_fps(source_video),
+                    )
+                plan = plan_terminal_still_frame_extension(
+                    current, options.timing_policy, media_end=media_end,
+                    options=extension_options,
+                )
+                # Earlier utterances may still need ordinary timing recovery.
+                # Keep the terminal freeze across those retries.
+                current = plan.transcript
+                media_end += plan.total_duration
+                terminal_video_extensions = plan.events
+                continue
+            except StillFrameExtensionError as plan_error:
+                raise TimingSynchronizationError(
+                    "Terminal ASR timestamp exceeds the source media end; terminal "
+                    f"still-frame extension was refused: {plan_error}"
+                ) from plan_error
         try:
-            return synchronize_for_localization(
+            timed = synchronize_for_localization(
                 current, options.timing_policy, media_end=media_end
             )
+            if terminal_video_extensions:
+                timed = replace(timed, video_extensions=terminal_video_extensions)
+            return timed
         except TimingSynchronizationError as exc:
             failures = overflows() if exc.segment_index is not None else []
             index = exc.segment_index
@@ -597,9 +648,17 @@ def _synchronize_with_translation_recovery(
             if final_rate_retried:
                 # At most two Edge-only retries are allowed per segment; remeasure normally.
                 continue
-            if (not failures or (not callable(batch_shorten) and not callable(shorten))
-                    or recovery_exhausted):
-                if recovery_exhausted and options.still_frame_extension.enabled:
+            no_shortening_provider = not callable(batch_shorten) and not callable(shorten)
+            if not failures or no_shortening_provider or recovery_exhausted:
+                # A provider without concise-translation support must still be
+                # able to take the local, bounded visual fallback.  Previously
+                # this branch raised the original rate error before invoking
+                # the still-frame planner, even though no remote retry was
+                # possible and the existing ASR/TTS checkpoints were usable.
+                if (
+                    (no_shortening_provider or recovery_exhausted)
+                    and options.still_frame_extension.enabled
+                ):
                     if options.use_background_separation:
                         raise TimingSynchronizationError(
                             "Still-frame extension cannot be used with background separation; "
@@ -608,7 +667,25 @@ def _synchronize_with_translation_recovery(
                             max_playback_rate=exc.max_playback_rate,
                         ) from exc
                     try:
-                        extension_options = options.still_frame_extension
+                        extension_options = effective_extension_options
+                        # The terminal event has already consumed part of the
+                        # global extension budget.  Ordinary recovery must use
+                        # only the remainder so rendering cannot exceed the
+                        # documented total, even when both paths are needed.
+                        terminal_seconds = sum(
+                            event.duration for event in terminal_video_extensions
+                        )
+                        remaining_extension_budget = (
+                            extension_options.max_seconds_total - terminal_seconds
+                        )
+                        if remaining_extension_budget <= 1e-9:
+                            raise StillFrameExtensionError(
+                                "Terminal still-frame extension exhausted the total extension limit"
+                            )
+                        extension_options = replace(
+                            extension_options,
+                            max_seconds_total=remaining_extension_budget,
+                        )
                         if source_video is not None:
                             extension_options = replace(
                                 extension_options, fps=probe_video_fps(source_video),
@@ -622,7 +699,11 @@ def _synchronize_with_translation_recovery(
                             media_end=(media_end + plan.total_duration
                                        if media_end is not None else None),
                         )
-                        return replace(timed, video_extensions=plan.events)
+                        video_events = tuple(sorted(
+                            (*terminal_video_extensions, *plan.events),
+                            key=lambda event: event.at,
+                        ))
+                        return replace(timed, video_extensions=video_events)
                     except StillFrameExtensionError as plan_error:
                         raise TimingSynchronizationError(
                             f"{exc}; still-frame extension was refused: {plan_error}",
@@ -916,7 +997,22 @@ def _localize_single_video(
 
     with gated("gemini", LocalizationStage.TRANSLATE, "Gemini"):
         translated = translate_for_localization(transcript, translation_provider, checkpoint_path=workspace / "translation-checkpoint.json")
-    report(LocalizationStage.TRANSLATE, "Vietnamese translation completed")
+        if callable(getattr(translation_provider, "review_dialogue_alignment", None)):
+            def qa_progress(completed: int, total: int) -> None:
+                if progress_callback is not None:
+                    progress_callback(LocalizationProgress(
+                        LocalizationStage.TRANSLATE, done + 0.7 * completed / total,
+                        steps, f"Gemini kiểm tra lời thoại {completed}/{total}",
+                    ))
+            try:
+                translated = auto_review_dialogue(
+                    translated, translation_provider,
+                    checkpoint_path=workspace / "dialogue-qa-checkpoint.json",
+                    progress_callback=qa_progress, cancel_event=cancel_event,
+                )
+            except DialogueQACancelled as exc:
+                raise LocalizationCancelled(str(exc)) from exc
+    report(LocalizationStage.TRANSLATE, "Vietnamese translation and dialogue QA completed")
 
     translated = _coalesce_trailing_tiny_translation(translated, source_duration)
     recovery_checkpoint = workspace / "timing-recovery-checkpoint.json"
@@ -996,11 +1092,49 @@ def _localize_single_video(
             separate_background_with_demucs(extracted_audio, background_audio)
             report(LocalizationStage.SEPARATE_BACKGROUND, "Background audio separated")
 
+        # A resumed recovery checkpoint can retain a timed tail after a prior
+        # still-frame plan was made.  Reconcile here, immediately before the
+        # one plan is rendered and mixed, so neither speech nor subtitles can
+        # outlast the video input.
+        speech_end = max(
+            max(float(segment.end), float(segment.start) + float(segment.slot_duration))
+            for segment in timed.segments
+        )
+        planned_video_end = source_duration + sum(
+            event.duration for event in timed.video_extensions
+        )
+        if speech_end > planned_video_end + 1e-6:
+            if options.use_background_separation:
+                raise TimingSynchronizationError(
+                    "Still-frame render reconciliation cannot be used with background "
+                    "separation; background audio would need identical retiming."
+                )
+            extension_options = replace(
+                effective_still_frame_extension_options(
+                    options.still_frame_extension, media_duration=source_duration,
+                ), fps=probe_video_fps(source),
+            )
+            try:
+                timed = reconcile_still_frame_extensions(
+                    timed, media_end=source_duration, options=extension_options,
+                )
+            except StillFrameExtensionError as exc:
+                raise TimingSynchronizationError(
+                    f"Still-frame render reconciliation was refused: {exc}"
+                ) from exc
+
         # The retimed silent video is the sole video input for final render.
         # It is created only when recovery explicitly planned frozen frames.
         render_source = source
         extended_duration = source_duration
         if timed.video_extensions:
+            extension_seconds = sum(event.duration for event in timed.video_extensions)
+            if extension_seconds > source_duration * 0.05:
+                logger.warning(
+                    "Still-frame timing recovery grows video by %.3fs (%.1f%%); "
+                    "speech is retained and playback remains within its hard ceiling.",
+                    extension_seconds, extension_seconds / source_duration * 100,
+                )
             render_source = render_still_frame_video(
                 source, workspace / "retimed_source_video.mp4", timed.video_extensions,
             )
@@ -1010,8 +1144,11 @@ def _localize_single_video(
                             options=options.audio_options, target_duration=extended_duration)
         report(LocalizationStage.MIX_AUDIO, "Localized audio mixed")
         subtitle_file = output_dir / f"{source.stem}.vi.{options.subtitle_format}"
+        subtitle_options = options.subtitle_options
+        if options.render_options.portrait_subtitle_overlay:
+            subtitle_options = replace(subtitle_options, portrait_sequential_cues=True)
         subtitle_result = write_subtitles(timed, subtitle_file, format=options.subtitle_format,
-                                          options=options.subtitle_options)
+                                          options=subtitle_options)
         report(LocalizationStage.SUBTITLES, "Vietnamese subtitles created")
         final_file = output_dir / f"{source.stem}.vi.mp4"
         final_result = render_localized_mp4(

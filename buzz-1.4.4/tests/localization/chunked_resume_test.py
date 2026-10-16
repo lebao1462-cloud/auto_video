@@ -1,5 +1,8 @@
 import json
 import os
+from dataclasses import replace
+
+import pytest
 
 from buzz.localization import chunked
 from buzz.localization.transcript import LocalizationSegment, LocalizationTranscript
@@ -98,3 +101,72 @@ def test_gemini_transport_timeout_keeps_legacy_chunk_identity():
     assert _provider_identity(previous) == _provider_identity(updated)
     assert _provider_identity(updated) == _provider_identity(custom)
     assert _provider_identity(updated)["settings"]["timeout"] == 60.0
+
+
+def test_reconcile_completed_part_requires_audited_source_and_explicit_confirmation(tmp_path, monkeypatch):
+    source = tmp_path / "source.mp4"
+    part_dir = tmp_path / "part_0001"
+    source.write_bytes(b"original-source")
+    part_dir.mkdir()
+    (part_dir / "source.vi.mp4").write_bytes(b"rendered-video")
+    (part_dir / "source.vi.srt").write_text(
+        "1\n00:00:00,000 --> 00:00:02,000\nxin chao\n", encoding="utf-8",
+    )
+    monkeypatch.setattr(chunked, "probe_media_duration", lambda _: 2.0)
+    source_hash = chunked._file_record(source)["sha256"]
+
+    with pytest.raises(ValueError, match="explicit operator confirmation"):
+        chunked.reconcile_completed_part(
+            source=source, part_dir=part_dir, fingerprint="f" * 64,
+            chunk_seconds=2.0, subtitle_format="srt",
+            expected_source_sha256=source_hash, confirmation="no",
+        )
+    with pytest.raises(ValueError, match="does not match"):
+        chunked.reconcile_completed_part(
+            source=source, part_dir=part_dir, fingerprint="f" * 64,
+            chunk_seconds=2.0, subtitle_format="srt",
+            expected_source_sha256="0" * 64,
+            confirmation="RECOVER_COMPLETED_PART",
+        )
+
+    manifest = chunked.reconcile_completed_part(
+        source=source, part_dir=part_dir, fingerprint="f" * 64,
+        chunk_seconds=2.0, subtitle_format="srt",
+        expected_source_sha256=source_hash, confirmation="RECOVER_COMPLETED_PART",
+    )
+    assert manifest["recovered"]["source_sha256"] == source_hash
+    assert chunked._load_completed_part(
+        part_dir / "localization-part-complete.json", "f" * 64,
+        part_dir / "source.vi.mp4", part_dir / "source.vi.srt", 2.0,
+    ) is not None
+
+
+def test_rendered_part_growth_budget_allows_verified_long_tts_but_bounds_short_clips():
+    from buzz.localization.workflow import LocalizationWorkflowOptions
+    from buzz.localization.still_frame import StillFrameExtensionOptions
+
+    options = LocalizationWorkflowOptions(output_directory="unused")
+    # Part 0002 needed 31.033s internal plus 2.633s terminal: 33.667s.
+    assert chunked._maximum_rendered_part_extension_seconds(900, options) == 135.0
+    assert 33.667 < chunked._maximum_rendered_part_extension_seconds(900, options)
+    assert chunked._maximum_rendered_part_extension_seconds(180, options) == 9.0
+    limited = replace(options, still_frame_extension=StillFrameExtensionOptions(
+        max_seconds_total=18.0,
+    ))
+    assert chunked._maximum_rendered_part_extension_seconds(900, limited) == 18.0
+
+
+def test_part_fingerprint_excludes_runtime_still_frame_fallback(tmp_path):
+    from buzz.localization.still_frame import StillFrameExtensionOptions
+    from buzz.localization.workflow import LocalizationWorkflowOptions
+
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    options = LocalizationWorkflowOptions(output_directory=str(tmp_path))
+    common = (source, 3, 2700.0, 900.0, _options(), "model", _TranslationProvider(),
+              _TranslationProvider(), options, "whisper")
+    baseline = chunked._part_fingerprint(*common)
+    narrowed = replace(options, still_frame_extension=StillFrameExtensionOptions(
+        max_seconds_total=18.0, max_seconds_per_event=.5,
+    ))
+    assert chunked._part_fingerprint(*(*common[:-2], narrowed, common[-1])) == baseline

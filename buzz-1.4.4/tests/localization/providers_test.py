@@ -253,6 +253,46 @@ def test_openai_compatible_translation_provider_returns_vietnamese_text():
     assert call["messages"][1]["content"] == "Hello world"
 
 
+def test_openai_compatible_provider_falls_back_after_rate_limit():
+    calls = []
+
+    class Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs["model"])
+            if kwargs["model"] == "primary":
+                raise RuntimeError("429 rate limit exceeded")
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content="Bản dịch dự phòng")
+            )])
+
+    provider = OpenAICompatibleTranslationProvider(
+        api_key="test-key", model="primary, backup",
+    )
+    provider._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=Completions())
+    )
+
+    assert provider.translate("Hello", "en", "vi") == "Bản dịch dự phòng"
+    assert calls == ["primary", "backup"]
+    assert provider.last_model_used == "backup"
+
+
+def test_openai_compatible_provider_reports_all_models_rate_limited():
+    provider = OpenAICompatibleTranslationProvider(
+        api_key="test-key", model="primary, backup",
+    )
+    provider._client = SimpleNamespace(chat=SimpleNamespace(
+        completions=SimpleNamespace(
+            create=lambda **kwargs: (_ for _ in ()).throw(
+                RuntimeError("429 rate limit exceeded")
+            )
+        )
+    ))
+
+    with pytest.raises(LocalizationProviderError, match="every configured model"):
+        provider.translate("Hello", "en", "vi")
+
+
 def test_translation_provider_supports_chinese_source():
     provider = OpenAICompatibleTranslationProvider(
         api_key="test-key",
@@ -907,7 +947,7 @@ def test_edge_tts_batch_propagates_open_or_singleton_opened_service_circuit(monk
                         lambda *_args: (_ for _ in ()).throw(NoAudioReceived("empty")))
     monkeypatch.setattr("buzz.localization.providers.time.sleep", lambda _delay: None)
 
-    with pytest.raises(TTSServiceTemporarilyUnavailable):
+    with pytest.raises(TTSBatchFallbackRequired):
         provider.synthesize_batch(requests)
 
 
@@ -1033,8 +1073,8 @@ def test_edge_tts_batch_generic_transient_is_bounded_and_releases_for_workflow_r
         ])
 
     assert caught.value.retry_after_seconds == 12
-    assert len(calls) == 2
-    assert sleeps == [1.0]
+    assert len(calls) == 1
+    assert sleeps == []
 
 
 def test_edge_tts_attempt_timeout_retries_then_succeeds(monkeypatch, tmp_path):
@@ -1346,10 +1386,16 @@ def test_edge_tts_batch_certificate_error_retries_then_succeeds(monkeypatch, tmp
     monkeypatch.setattr(provider, "_split_batch_audio",
                         lambda combined, output, start, end: Path(output).write_bytes(b"audio"))
     monkeypatch.setattr("buzz.localization.providers.time.sleep", lambda delay: None)
-    results = provider.synthesize_batch([
+    requests = [
         TTSRequest("Mot", "vi", str(tmp_path / "one")),
         TTSRequest("Hai", "vi", str(tmp_path / "two")),
-    ])
+    ]
+    # A transient batch failure must release its worker slot immediately.
+    # The higher-level workflow can retry the batch later.
+    with pytest.raises(TTSServiceTemporarilyUnavailable):
+        provider.synthesize_batch(requests)
+    assert len(attempts) == 1
+    results = provider.synthesize_batch(requests)
     assert len(attempts) == 2
     assert len(results) == 2
 
@@ -1600,10 +1646,11 @@ def test_gemini_batch_shortens_in_one_json_request_and_validates_ids():
     provider._generate_content_with_retry = lambda **kwargs: SimpleNamespace(
         text='{"segments":[{"id":"a","shortened_text":"x y"}]}'
     )
-    with pytest.raises(LocalizationProviderError, match="invalid singleton"):
-        provider.shorten_translations(
-            segments=segments, source_language="en", target_language="vi"
-        )
+    # The bounded batch recovery keeps verified originals on malformed IDs
+    # rather than looping or inventing a potentially incomplete shortened line.
+    assert provider.shorten_translations(
+        segments=segments, source_language="en", target_language="vi"
+    ) == ["x y", "hai dai"]
 
 
 def test_gemini_batch_shortening_retries_when_word_count_exceeds_hard_max():
@@ -1670,7 +1717,7 @@ def test_gemini_batch_shortening_retries_when_p01_like_candidate_is_too_short():
     assert "between its minimum_word_count and target_word_count" in calls[1]["contents"]
 
 
-def test_gemini_singleton_shortening_retries_too_short_candidate_with_both_bounds():
+def test_gemini_batch_shortening_uses_original_when_candidate_is_below_bounds():
     import json
     from types import SimpleNamespace
     from buzz.localization.providers import GeminiTranslationProvider
@@ -1679,13 +1726,9 @@ def test_gemini_singleton_shortening_retries_too_short_candidate_with_both_bound
 
     def generate(**kwargs):
         calls.append(kwargs)
-        if len(calls) <= 2:
-            return SimpleNamespace(text=json.dumps({"segments": [{
-                "id": "a", "shortened_text": "mot",
-            }]}))
-        if len(calls) == 3:
-            return SimpleNamespace(text="mot")
-        return SimpleNamespace(text="mot hai")
+        return SimpleNamespace(text=json.dumps({"segments": [{
+            "id": "a", "shortened_text": "mot",
+        }]}))
 
     provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
     provider._generate_content_with_retry = generate
@@ -1694,11 +1737,8 @@ def test_gemini_singleton_shortening_retries_too_short_candidate_with_both_bound
         segments=[{"id": "a", "source_text": "one", "translated_text": "mot hai ba bon",
                    "required_rate": 2.0, "max_playback_rate": 1.1}],
         source_language="en", target_language="vi",
-    ) == ["mot hai"]
-    assert len(calls) == 4
-    assert "word count between 2 and 2" in calls[2]["contents"]
-    assert "required range of 2 to 2 words" in calls[3]["contents"]
-    assert "Previous candidate: mot" in calls[3]["contents"]
+    ) == ["mot hai ba bon"]
+    assert len(calls) == 2
 
 
 def test_gemini_batch_shortening_uses_timing_proportional_budget_for_mild_overflow():
@@ -1785,7 +1825,7 @@ def test_gemini_batch_shortening_retries_non_speakable_result():
     assert "between its minimum_word_count and target_word_count" in calls[1]["contents"]
 
 
-def test_gemini_singleton_shortening_retries_non_speakable_candidate():
+def test_gemini_batch_shortening_uses_original_after_non_speakable_structured_output():
     from types import SimpleNamespace
     from buzz.localization.providers import GeminiTranslationProvider
 
@@ -1793,9 +1833,7 @@ def test_gemini_singleton_shortening_retries_non_speakable_candidate():
 
     def generate(**kwargs):
         calls.append(kwargs)
-        if len(calls) <= 2:
-            return SimpleNamespace(text='{"segments":[{"id":"a","shortened_text":"..."}]}')
-        return SimpleNamespace(text="mot hai")
+        return SimpleNamespace(text='{"segments":[{"id":"a","shortened_text":"..."}]}')
 
     provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
     provider._generate_content_with_retry = generate
@@ -1804,12 +1842,11 @@ def test_gemini_singleton_shortening_retries_non_speakable_candidate():
         segments=[{"id": "a", "source_text": "one", "translated_text": "mot hai ba bon",
                    "required_rate": 2.0, "max_playback_rate": 1.1}],
         source_language="en", target_language="vi",
-    ) == ["mot hai"]
-    assert len(calls) == 3
-    assert "Never return punctuation-only text" in calls[2]["contents"]
+    ) == ["mot hai ba bon"]
+    assert len(calls) == 2
 
 
-def test_gemini_singleton_shortening_uses_strict_retry_after_invalid_batch():
+def test_gemini_batch_shortening_uses_original_after_invalid_structured_bounds():
     from types import SimpleNamespace
     from buzz.localization.providers import GeminiTranslationProvider
 
@@ -1817,9 +1854,7 @@ def test_gemini_singleton_shortening_uses_strict_retry_after_invalid_batch():
 
     def generate(**kwargs):
         calls.append(kwargs)
-        if len(calls) <= 2:
-            return SimpleNamespace(text='{"segments":[{"id":"a","shortened_text":"mot hai ba"}]}')
-        return SimpleNamespace(text="mot hai")
+        return SimpleNamespace(text='{"segments":[{"id":"a","shortened_text":"mot hai ba"}]}')
 
     provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
     provider._generate_content_with_retry = generate
@@ -1828,13 +1863,11 @@ def test_gemini_singleton_shortening_uses_strict_retry_after_invalid_batch():
         segments=[{"id": "a", "source_text": "one", "translated_text": "mot hai ba bon",
                    "required_rate": 2.0, "max_playback_rate": 1.1}],
         source_language="en", target_language="vi",
-    ) == ["mot hai"]
-    assert len(calls) == 3
-    assert "word count between 2 and 2" in calls[2]["contents"]
-    assert "Compress wording, never facts" in calls[2]["contents"]
+    ) == ["mot hai ba bon"]
+    assert len(calls) == 2
 
 
-def test_gemini_singleton_shortening_adapts_prompt_to_overlong_candidate():
+def test_gemini_batch_shortening_does_not_fan_out_overlong_candidates_to_singletons():
     from types import SimpleNamespace
     from buzz.localization.providers import GeminiTranslationProvider
 
@@ -1842,11 +1875,7 @@ def test_gemini_singleton_shortening_adapts_prompt_to_overlong_candidate():
 
     def generate(**kwargs):
         calls.append(kwargs)
-        if len(calls) <= 2:
-            return SimpleNamespace(text='{"segments":[{"id":"a","shortened_text":"mot hai ba"}]}')
-        if len(calls) == 3:
-            return SimpleNamespace(text="mot hai ba")
-        return SimpleNamespace(text="mot hai")
+        return SimpleNamespace(text='{"segments":[{"id":"a","shortened_text":"mot hai ba"}]}')
 
     provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
     provider._generate_content_with_retry = generate
@@ -1855,14 +1884,11 @@ def test_gemini_singleton_shortening_adapts_prompt_to_overlong_candidate():
         segments=[{"id": "a", "source_text": "one", "translated_text": "mot hai ba bon",
                    "required_rate": 2.0, "max_playback_rate": 1.1}],
         source_language="en", target_language="vi",
-    ) == ["mot hai"]
-    assert len(calls) == 4
-    assert "previous candidate below has 3 whitespace-separated words" in calls[3]["contents"]
-    assert "required range of 2 to 2 words" in calls[3]["contents"]
-    assert "Previous candidate: mot hai ba" in calls[3]["contents"]
+    ) == ["mot hai ba bon"]
+    assert len(calls) == 2
 
 
-def test_gemini_singleton_shortening_returns_best_overlong_after_strict_retries():
+def test_gemini_batch_shortening_uses_original_not_unverified_overlong_candidate():
     from types import SimpleNamespace
     from buzz.localization.providers import GeminiTranslationProvider
 
@@ -1870,9 +1896,7 @@ def test_gemini_singleton_shortening_returns_best_overlong_after_strict_retries(
 
     def generate(**kwargs):
         calls.append(kwargs)
-        if len(calls) <= 2:
-            return SimpleNamespace(text='{"segments":[{"id":"a","shortened_text":"mot hai ba"}]}')
-        return SimpleNamespace(text="mot hai ba")
+        return SimpleNamespace(text='{"segments":[{"id":"a","shortened_text":"mot hai ba"}]}')
 
     provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
     provider._generate_content_with_retry = generate
@@ -1881,12 +1905,11 @@ def test_gemini_singleton_shortening_returns_best_overlong_after_strict_retries(
         segments=[{"id": "a", "source_text": "one", "translated_text": "mot hai ba bon",
                    "required_rate": 2.0, "max_playback_rate": 1.1}],
         source_language="en", target_language="vi",
-    ) == ["mot hai ba"]
-    assert len(calls) == 6
-    assert "Previous candidate: mot hai ba" in calls[-1]["contents"]
+    ) == ["mot hai ba bon"]
+    assert len(calls) == 2
 
 
-def test_gemini_singleton_shortening_never_falls_back_to_too_short_candidate():
+def test_gemini_batch_shortening_never_uses_too_short_candidate():
     from types import SimpleNamespace
     from buzz.localization.providers import GeminiTranslationProvider
 
@@ -1901,19 +1924,15 @@ def test_gemini_singleton_shortening_never_falls_back_to_too_short_candidate():
     provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
     provider._generate_content_with_retry = generate
 
-    with pytest.raises(
-        LocalizationProviderError,
-        match="below minimum word count",
-    ):
-        provider.shorten_translations(
-            segments=[{"id": "a", "source_text": "one", "translated_text": "mot hai ba bon",
-                       "required_rate": 2.0, "max_playback_rate": 1.1}],
-            source_language="en", target_language="vi",
-        )
-    assert len(calls) == 6
+    assert provider.shorten_translations(
+        segments=[{"id": "a", "source_text": "one", "translated_text": "mot hai ba bon",
+                   "required_rate": 2.0, "max_playback_rate": 1.1}],
+        source_language="en", target_language="vi",
+    ) == ["mot hai ba bon"]
+    assert len(calls) == 2
 
 
-def test_gemini_singleton_shortening_rejects_structured_output_after_id_errors():
+def test_gemini_batch_shortening_preserves_id_alignment_after_id_errors():
     from types import SimpleNamespace
     from buzz.localization.providers import GeminiTranslationProvider
 
@@ -1926,19 +1945,15 @@ def test_gemini_singleton_shortening_rejects_structured_output_after_id_errors()
     provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
     provider._generate_content_with_retry = generate
 
-    with pytest.raises(
-        LocalizationProviderError,
-        match="unusable structured output",
-    ):
-        provider.shorten_translations(
-            segments=[{"id": "a", "source_text": "one", "translated_text": "mot hai ba bon",
-                       "required_rate": 2.0, "max_playback_rate": 1.1}],
-            source_language="en", target_language="vi",
-        )
+    assert provider.shorten_translations(
+        segments=[{"id": "a", "source_text": "one", "translated_text": "mot hai ba bon",
+                   "required_rate": 2.0, "max_playback_rate": 1.1}],
+        source_language="en", target_language="vi",
+    ) == ["mot hai ba bon"]
     assert len(calls) == 2
 
 
-def test_gemini_batch_shortening_fails_after_two_malformed_json_responses():
+def test_gemini_batch_shortening_uses_original_after_two_malformed_json_responses():
     from types import SimpleNamespace
     from buzz.localization.providers import GeminiTranslationProvider
 
@@ -1951,14 +1966,38 @@ def test_gemini_batch_shortening_fails_after_two_malformed_json_responses():
     provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
     provider._generate_content_with_retry = generate
 
-    with pytest.raises(LocalizationProviderError, match="unusable structured output"):
-        provider.shorten_translations(
-            segments=[{"id": "a", "source_text": "one", "translated_text": "mot hai ba bon",
-                       "required_rate": 2.0, "max_playback_rate": 1.1}],
-            source_language="en", target_language="vi",
-        )
+    assert provider.shorten_translations(
+        segments=[{"id": "a", "source_text": "one", "translated_text": "mot hai ba bon",
+                   "required_rate": 2.0, "max_playback_rate": 1.1}],
+        source_language="en", target_language="vi",
+    ) == ["mot hai ba bon"]
     assert len(calls) == 2
     assert all("word count between" not in call["contents"] for call in calls[:2])
+
+
+def test_gemini_batch_shortening_rate_limit_uses_originals_without_cooldown_loop():
+    from buzz.localization.providers import GeminiTranslationProvider, LocalizationProviderError
+
+    calls = []
+
+    def rate_limited(**kwargs):
+        calls.append(kwargs)
+        raise LocalizationProviderError("Gemini rate-limit cooldown budget exhausted")
+
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider._generate_content_with_retry = rate_limited
+    segments = [
+        {"id": "first", "source_text": "one", "translated_text": "mot hai ba bon",
+         "required_rate": 2.0, "max_playback_rate": 1.1},
+        {"id": "second", "source_text": "two", "translated_text": "nam sau bay tam",
+         "required_rate": 2.0, "max_playback_rate": 1.1},
+    ]
+
+    assert provider.shorten_translations(
+        segments=segments, source_language="en", target_language="vi",
+    ) == ["mot hai ba bon", "nam sau bay tam"]
+    assert len(calls) == 1
+    assert calls[0]["max_rate_limit_cooldown_rounds"] == 0
 
 
 def test_gemini_batch_shortening_retries_only_missing_segment_and_preserves_order():
@@ -2072,7 +2111,7 @@ def test_gemini_batch_shortening_salvages_valid_ids_amid_missing_duplicate_and_u
     assert len(calls) == 2
 
 
-def test_gemini_batch_shortening_uses_singleton_recovery_without_midpoint_splits():
+def test_gemini_batch_shortening_uses_originals_for_unresolved_ids_without_singletons():
     import json
     from types import SimpleNamespace
     from buzz.localization.providers import GeminiTranslationProvider
@@ -2081,8 +2120,6 @@ def test_gemini_batch_shortening_uses_singleton_recovery_without_midpoint_splits
 
     def generate(**kwargs):
         calls.append(kwargs)
-        if "config" not in kwargs:
-            return SimpleNamespace(text="mot hai")
         payload = json.loads(kwargs["contents"].split("Input JSON:\n", 1)[1])
         identifiers = [item["id"] for item in payload["segments"]]
         if len(calls) == 1:
@@ -2108,8 +2145,8 @@ def test_gemini_batch_shortening_uses_singleton_recovery_without_midpoint_splits
 
     assert provider.shorten_translations(
         segments=segments, source_language="en", target_language="vi",
-    ) == ["mot a", "mot hai", "mot c", "mot hai"]
-    assert len(calls) == 4
+    ) == ["mot a", "mot hai ba bon", "mot c", "mot hai ba bon"]
+    assert len(calls) == 2
     assert ["a", "b", "c", "d"] == [item["id"] for item in json.loads(
         calls[0]["contents"].split("Input JSON:\n", 1)[1]
     )["segments"]]
@@ -2241,6 +2278,46 @@ def test_gemini_register_review_payload_and_hard_rules():
     assert "hố cha" in captured["contents"]
 
 
+def test_gemini_register_review_preserves_partial_and_invalid_items_for_recovery():
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider._generate_content_with_retry = lambda **kwargs: SimpleNamespace(
+        text=json.dumps({"segments": [
+            {"id": "segment-1", "revised_translated_text": "ta sẽ giúp người"},
+            {"id": "segment-2", "revised_translated_text": ""},
+            {"id": "unexpected", "revised_translated_text": "not requested"},
+            {"revised_translated_text": "missing ID"},
+        ]})
+    )
+    items = [
+        SimpleNamespace(segment_id="segment-1", text="源一", translated_text="ta giúp người"),
+        SimpleNamespace(segment_id="segment-2", text="源二", translated_text="tôi giúp cậu"),
+    ]
+    assert provider.review_translation_register(items, "zh", "vi") == [
+        ("segment-1", "ta sẽ giúp người"),
+        ("segment-2", ""),
+        ("unexpected", "not requested"),
+        (None, "missing ID"),
+    ]
+
+
+def test_gemini_register_review_bad_json_is_retryable_but_api_error_is_not():
+    from buzz.localization.providers import GeminiTranslationProvider
+
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    item = SimpleNamespace(segment_id="segment-1", text="源", translated_text="bản dịch")
+    provider._generate_content_with_retry = lambda **kwargs: SimpleNamespace(text="{bad-json")
+    assert provider.review_translation_register([item], "zh", "vi") == []
+
+    def failed_request(**kwargs):
+        raise ConnectionError("service unavailable")
+
+    provider._generate_content_with_retry = failed_request
+    with pytest.raises(LocalizationProviderError, match="service unavailable"):
+        provider.review_translation_register([item], "zh", "vi")
+
+
 def test_gemini_shortening_prompts_preserve_register():
     from buzz.localization.providers import GeminiTranslationProvider
 
@@ -2257,7 +2334,7 @@ def test_gemini_shortening_prompts_preserve_register():
     assert "never switch pronoun pair or register" in captured[0]
 
 
-def test_gemini_batch_and_strict_shortening_prompts_preserve_register():
+def test_gemini_batch_shortening_prompt_preserves_register():
     from buzz.localization.providers import GeminiTranslationProvider
 
     captured = []
@@ -2275,9 +2352,9 @@ def test_gemini_batch_and_strict_shortening_prompts_preserve_register():
                    "translated_text": "ta that su khong biet gi ca",
                    "required_rate": 2, "max_playback_rate": 1.1}],
         source_language="en", target_language="vi",
-    ) == ["ta khong biet"]
+    ) == ["ta that su khong biet gi ca"]
     assert "Preserve the current Vietnamese pronouns" in captured[0]
-    assert "Preserve the current Vietnamese pronouns" in captured[2]
+    assert "Preserve the current Vietnamese pronouns" in captured[1]
 
 
 def test_gemini_batch_rejects_missing_id():
@@ -2591,3 +2668,139 @@ def test_gemini_non_retryable_error_fails_immediately():
     with pytest.raises(Exception, match="INVALID_ARGUMENT"):
         provider._generate_content_with_retry(contents="x")
     assert calls == ["primary"]
+
+
+def test_gemini_v4_prompt_identifies_speakers_and_forbids_vulgar_pronouns():
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider
+    captured = {}
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+
+    def generate(**kwargs):
+        captured["contents"] = kwargs["contents"]
+        return SimpleNamespace(text=json.dumps({"segments": [{
+            "id": "scene-1",
+            "corrected_text": "你答应给我十块钱",
+            "translated_text": "Anh đã hứa đưa em mười đồng.",
+        }]}))
+
+    provider._generate_content_with_retry = generate
+    item = SimpleNamespace(segment_id="scene-1", start=0, end=2,
+                           text="你答应给我十块钱")
+    result = provider.translate_segments([item], "zh", "vi")
+    assert result[0][1] == "Anh đã hứa đưa em mười đồng."
+    prompt = captured["contents"]
+    assert "who addresses whom" in prompt
+    assert "romantic couple" in prompt
+    assert "Never use the Vietnamese pronouns 'tao' or 'mày'" in prompt
+    assert "NO missing" in prompt
+    assert "source utterance" in prompt
+    assert "Input JSON:\n" in prompt
+    assert provider.translation_policy_version.endswith("no-tao-may-complete-concise")
+    assert "3.5 to 4.2" in prompt
+    assert "two or more speakers" in prompt
+    assert "years, months, dates" in prompt
+
+
+def test_gemini_v4_batch_rejects_prohibited_dialogue_without_losing_ids():
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider, LocalizationProviderError
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider._generate_content_with_retry = lambda **kwargs: SimpleNamespace(
+        text=json.dumps({"segments": [{
+            "id": "line-id", "corrected_text": "你", "translated_text": "Mày đi đi",
+        }]}))
+    with pytest.raises(LocalizationProviderError, match="prohibited Vietnamese pronouns"):
+        provider.translate_segments([
+            SimpleNamespace(segment_id="line-id", start=0, end=1, text="你")
+        ], "zh", "vi")
+
+
+def test_gemini_v4_review_repairs_incomplete_dialogue_without_hiding_context():
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    captured = {}
+
+    def generate(**kwargs):
+        captured["prompt"] = kwargs["contents"]
+        return SimpleNamespace(text=json.dumps({"segments": [{
+            "id": "one", "revised_translated_text": "Anh đã hứa đưa em mười đồng.",
+        }]}))
+
+    provider._generate_content_with_retry = generate
+    result = provider.review_translation_register([
+        SimpleNamespace(segment_id="one", text="你答应给我十块钱",
+                        translated_text="Anh hứa rồi.")
+    ], "zh", "vi", context=[])
+    assert result == [("one", "Anh đã hứa đưa em mười đồng.")]
+    assert "source_text as ground truth" in captured["prompt"]
+    assert "missing or mangled meaningful words" in captured["prompt"]
+    assert "Input JSON:\n" in captured["prompt"]
+
+
+def test_gemini_v4_single_translation_rejects_tao_may():
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider, LocalizationProviderError
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider._generate_content_with_retry = lambda **kwargs: SimpleNamespace(
+        text="Tao đã bảo mày rồi.")
+    with pytest.raises(LocalizationProviderError, match="prohibited Vietnamese pronouns"):
+        provider.translate("我都说过了", "zh", "vi")
+
+
+def test_gemini_v4_shortening_rejects_tao_may():
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider, LocalizationProviderError
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider._generate_content_with_retry = lambda **kwargs: SimpleNamespace(
+        text="Tao nói rồi")
+    with pytest.raises(LocalizationProviderError, match="prohibited Vietnamese pronouns"):
+        provider.shorten_translation(
+            source_text="我都说过了", translated_text="Tôi đã nói rồi.",
+            source_language="zh", target_language="vi", required_rate=2.2,
+            max_playback_rate=2.0,
+        )
+
+
+def test_gemini_dialogue_qa_prompt_handles_neighbors_and_timing_brevity():
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    seen = {}
+
+    def generate(**kwargs):
+        seen["prompt"] = kwargs["contents"]
+        seen["mime"] = kwargs["config"]["response_mime_type"]
+        return SimpleNamespace(text=json.dumps({"segments": [
+            {"id": "line-000000", "revised_vietnamese": "Anh về ngay đi."}
+        ]}))
+
+    provider._generate_content_with_retry = generate
+    results = provider.review_dialogue_alignment(
+        segments=({"id": "line-000000", "source_text": "你马上回来",
+                   "start":0,"end":1.5,"available_seconds":1.5,
+                   "current_vietnamese":"Anh phải về nhà ngay lập tức!",
+                   "needs_fidelity_or_timing_review": True},),
+        context=({"id":"neighbor","source_text":"我会等你",
+                  "current_vietnamese":"Em sẽ đợi anh."},),
+        source_language="zh",target_language="vi",
+    )
+    assert results == [("line-000000", "Anh về ngay đi.")]
+    assert "NEVER move an adjacent sentence" in seen["prompt"]
+    assert "NEVER omit a source" in seen["prompt"]
+    assert "context_only" in seen["prompt"]
+    assert "5.2" in seen["prompt"]
+    assert seen["mime"]=="application/json"
+
+
+def test_gemini_dialogue_qa_returns_empty_on_bad_json():
+    from types import SimpleNamespace
+    from buzz.localization.providers import GeminiTranslationProvider
+    provider = GeminiTranslationProvider.__new__(GeminiTranslationProvider)
+    provider._generate_content_with_retry=lambda **kw:SimpleNamespace(text="{}")
+    assert provider.review_dialogue_alignment(
+        segments=({"id":"a","source_text":"你好",
+            "current_vietnamese":"Xin chào"},),
+        source_language="zh",target_language="vi",
+    )==[]

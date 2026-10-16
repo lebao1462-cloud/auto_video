@@ -43,18 +43,36 @@ def _service_test_worker(requests, responses):
         if value == "block":
             while True:
                 time.sleep(0.1)
+        if value == "error":
+            responses.put((request_id, False, "FunASR test error"))
+            continue
         responses.put((request_id, True, {"pid": os.getpid(), "loads": loads}))
 
 
-def test_worker_reuses_model_and_restarts_after_cancel():
+def _crashing_worker(requests, responses):
+    """Module-level crash target: safe to import in Windows spawned children."""
+    request_id, value = requests.get()
+    if value == "always-crash":
+        os._exit(37)
+    marker = Path(value)
+    if not marker.exists():
+        marker.write_text("crashed", encoding="utf-8")
+        os._exit(23)
+    # Simulate a late response from a retired request; it must be ignored.
+    responses.put((request_id - 1, True, {"stale": True}))
+    responses.put((request_id, True, {"pid": os.getpid(), "attempt": 2}))
+
+
+def test_worker_is_restarted_after_every_success_and_after_cancel():
     from buzz.localization import paraformer
 
     service = paraformer._ParaformerWorkerService(_service_test_worker)
     try:
         first = service.generate("ok")
         second = service.generate("ok")
-        assert first["pid"] == second["pid"]
+        assert first["pid"] != second["pid"]
         assert second["loads"] == 1
+        assert service._process is None
 
         cancelled = threading.Event()
         outcome = []
@@ -75,6 +93,48 @@ def test_worker_reuses_model_and_restarts_after_cancel():
         assert isinstance(outcome[0], paraformer.LocalizationTranscriptionCancelled)
         restarted = service.generate("ok")
         assert restarted["pid"] != first["pid"]
+        assert service._process is None
+    finally:
+        service.shutdown()
+
+
+def test_worker_crash_retries_once_with_fresh_worker_and_ignores_stale_response(tmp_path: Path):
+    from buzz.localization import paraformer
+
+    service = paraformer._ParaformerWorkerService(_crashing_worker)
+    marker = tmp_path / "first-attempt-crashed"
+    try:
+        result = service.generate(str(marker))
+        assert result["attempt"] == 2
+        assert marker.exists()
+        assert service._next_request == 2
+        assert service._process is None
+    finally:
+        service.shutdown()
+
+
+def test_worker_crash_reports_exit_code_after_one_retry():
+    from buzz.localization import paraformer
+
+    service = paraformer._ParaformerWorkerService(_crashing_worker)
+    try:
+        with pytest.raises(RuntimeError, match="exit code 37"):
+            service.generate("always-crash")
+        assert service._next_request == 2
+        assert service._process is None
+    finally:
+        service.shutdown()
+
+
+def test_normal_worker_error_is_not_retried_or_retained():
+    from buzz.localization import paraformer
+
+    service = paraformer._ParaformerWorkerService(_service_test_worker)
+    try:
+        with pytest.raises(RuntimeError, match="FunASR test error"):
+            service.generate("error")
+        assert service._next_request == 1
+        assert service._process is None
     finally:
         service.shutdown()
 
@@ -202,3 +262,32 @@ def test_shared_model_is_constructed_once_and_generate_is_serialized(monkeypatch
     assert len(calls) == 1
     assert maximum == 1
     reset_paraformer_model_cache()
+
+
+
+def test_worker_timeout_retries_only_once_and_cleans_up():
+    """A live-but-silent ASR subprocess must not block the GUI indefinitely."""
+    from buzz.localization import paraformer
+
+    service = paraformer._ParaformerWorkerService(
+        _service_test_worker, timeout_seconds=2.0,
+    )
+    try:
+        started = time.monotonic()
+        with pytest.raises(RuntimeError, match="Paraformer ASR had no progress for"):
+            service.generate("block")
+        # Spawning twice can be slow under Windows antivirus scans.
+        assert time.monotonic() - started < 30
+        assert service._next_request == 2
+        assert service._process is None
+        # Windows can take several seconds just to spawn the interpreter.
+        service.timeout_seconds = 20.0
+        assert service.generate("ok")["loads"] == 1
+    finally:
+        service.shutdown()
+
+
+def test_worker_rejects_invalid_hard_timeout():
+    from buzz.localization import paraformer
+    with pytest.raises(ValueError, match="timeout"):
+        paraformer._ParaformerWorkerService(timeout_seconds=0)

@@ -968,6 +968,25 @@ def test_timing_recovery_never_exceeds_hard_playback_rate_ceiling(tmp_path):
     assert max(segment.playback_rate for segment in timed.segments) <= 1.10
 
 
+def test_still_frame_fallback_handles_111_rate_without_a_shortening_provider(tmp_path):
+    """A resumed job can retain its checkpoints when no new Gemini call is possible."""
+    original = _synthesized_for_recovery(tmp_path, durations=(1.0, 1.111))
+
+    timed = _synchronize_with_translation_recovery(
+        original, FakeTranslationProvider(), RecoveryTTSProvider([]),
+        LocalizationWorkflowOptions(
+            output_directory=str(tmp_path), timing_policy=TimingPolicy(),
+            still_frame_extension=StillFrameExtensionOptions(enabled=True, fps=30),
+        ),
+        media_end=2.0,
+    )
+
+    assert len(timed.video_extensions) == 1
+    assert timed.video_extensions[0].segment_index == 1
+    assert timed.video_extensions[0].duration == pytest.approx(1 / 30)
+    assert all(segment.playback_rate <= 1.10 for segment in timed.segments)
+
+
 def test_timing_recovery_does_not_shorten_final_segment_that_fits_media_tail(tmp_path):
     translator = ShorteningProvider()
     tts = RecoveryTTSProvider([])
@@ -1743,6 +1762,57 @@ def test_chunked_vtt_merges_with_absolute_offsets(tmp_path):
 def test_natural_timing_defaults_to_four_recovery_attempts(tmp_path):
     assert LocalizationWorkflowOptions(output_directory=str(tmp_path)).timing_recovery_attempts == 4
 
+
+def test_terminal_asr_overrun_uses_local_tail_without_translation_or_tts(tmp_path):
+    audio = tmp_path / "segment-000145.wav"
+    audio.write_bytes(b"audio")
+    synthesized = SynthesizedLocalizationTranscript(
+        source_file="source.mp4", source_language="en", target_language="vi",
+        segments=(SynthesizedLocalizationSegment(
+            899.97, 902.20, "last source", "dÃ²ng cuá»‘i", str(audio), 4.56,
+            "test", "voice",
+        ),),
+    )
+    translator = ShorteningProvider()
+    tts = RecoveryTTSProvider([1.0])
+    timed = _synchronize_with_translation_recovery(
+        synthesized, translator, tts,
+        LocalizationWorkflowOptions(
+            output_directory=str(tmp_path), timing_policy=TimingPolicy(),
+            still_frame_extension=StillFrameExtensionOptions(
+                fps=30, max_terminal_seconds=5,
+            ),
+        ),
+        media_end=900.021334,
+    )
+    assert not translator.calls
+    assert not tts.requests
+    assert timed.segments[-1].translated_text == "dÃ²ng cuá»‘i"
+    assert timed.video_extensions[0].at == pytest.approx(900.021334)
+    assert timed.segments[-1].end <= 900.021334 + timed.video_extensions[0].duration
+    assert timed.segments[-1].playback_rate <= 1.10
+
+
+def test_terminal_asr_overrun_refusal_is_actionable_without_remote_calls(tmp_path):
+    audio = tmp_path / "segment.wav"
+    audio.write_bytes(b"audio")
+    synthesized = SynthesizedLocalizationTranscript(
+        "source.mp4", "en", "vi", (
+            SynthesizedLocalizationSegment(9.9, 12, "a", "b", str(audio), 4.56, "test", None),
+        ),
+    )
+    translator, tts = ShorteningProvider(), RecoveryTTSProvider([1.0])
+    with pytest.raises(TimingSynchronizationError, match="terminal still-frame extension was refused"):
+        _synchronize_with_translation_recovery(
+            synthesized, translator, tts,
+            LocalizationWorkflowOptions(
+                output_directory=str(tmp_path),
+                still_frame_extension=StillFrameExtensionOptions(enabled=False),
+            ), media_end=10,
+        )
+    assert not translator.calls
+    assert not tts.requests
+
 def test_timing_recovery_auto_stretches_after_exhausted_gemini_without_cutting(tmp_path):
     translator = RepeatedShorteningProvider()
     tts = RecoveryTTSProvider([1.30] * 4)
@@ -1822,4 +1892,79 @@ def test_timing_recovery_uses_bounded_still_frame_when_exact_failure_is_missed(t
     assert len(timed.video_extensions) == 1
     assert timed.video_extensions[0].segment_index == 1
     assert timed.video_extensions[0].duration <= 0.5
+    assert all(segment.playback_rate <= 1.10 for segment in timed.segments)
+
+
+
+def test_terminal_asr_overrun_keeps_tail_while_recovering_earlier_voice(tmp_path):
+    """The real 146-line job also has earlier rate overflow; tail fix must not exit early."""
+    timeline = (
+        (0.0, 1.0, 1.40),
+        (1.0, 2.0, 1.00),
+        (899.97, 902.20, 4.56),
+    )
+    segments = []
+    for i, (start, end, audio_duration) in enumerate(timeline):
+        path = tmp_path / f"source-segment-{i:06d}.wav"
+        path.write_bytes(b"audio")
+        segments.append(SynthesizedLocalizationSegment(
+            start, end, f"source {i}", f"Vietnamese {i}",
+            str(path), audio_duration, "fake", "voice",
+        ))
+    synthesized = SynthesizedLocalizationTranscript(
+        "source.mp4", "en", "vi", tuple(segments),
+    )
+    translator = ShorteningProvider()
+    tts = RecoveryTTSProvider([0.9])
+    timed = _synchronize_with_translation_recovery(
+        synthesized, translator, tts,
+        LocalizationWorkflowOptions(
+            output_directory=str(tmp_path), timing_policy=TimingPolicy(),
+            still_frame_extension=StillFrameExtensionOptions(
+                fps=30, max_terminal_seconds=5,
+            ),
+        ),
+        media_end=900.021334,
+    )
+    assert len(translator.calls) == len(tts.requests) == 1
+    assert len(timed.segments) == 3
+    assert timed.segments[-1].source_text == "source 2"
+    assert timed.segments[-1].translated_text == "Vietnamese 2"
+    assert len(timed.video_extensions) == 1
+    assert timed.video_extensions[0].at == pytest.approx(900.021334)
+    assert timed.segments[-1].end <= 900.021334 + timed.video_extensions[0].duration
+    assert all(segment.playback_rate <= 1.10 for segment in timed.segments)
+
+
+def test_terminal_and_internal_freezes_share_the_total_extension_cap(tmp_path):
+    # A neighboring segment is required to make the first utterance overflow.
+    # Without it the 899s silent gap is available and no internal freeze occurs.
+    timeline = (
+        (0.0, 1.0, 1.40),
+        (1.0, 2.0, 0.40),
+        (899.97, 902.20, 4.56),
+    )
+    segments = []
+    for index, (start, end, audio_duration) in enumerate(timeline):
+        audio = tmp_path / f"segment-{index:06d}.wav"
+        audio.write_bytes(b"audio")
+        segments.append(SynthesizedLocalizationSegment(
+            start, end, f"source {index}", f"translation {index}",
+            str(audio), audio_duration, "fake", "voice",
+        ))
+    timed = _synchronize_with_translation_recovery(
+        SynthesizedLocalizationTranscript("source.mp4", "en", "vi", tuple(segments)),
+        RepeatedShorteningProvider(), RecoveryTTSProvider([1.40]),
+        LocalizationWorkflowOptions(
+            output_directory=str(tmp_path), timing_policy=TimingPolicy(),
+            timing_recovery_attempts=1,
+            still_frame_extension=StillFrameExtensionOptions(
+                fps=30, max_seconds_total=5, max_terminal_seconds=5,
+            ),
+        ),
+        media_end=900.021334,
+    )
+    assert [event.segment_index for event in timed.video_extensions] == [0, 2]
+    assert sum(event.duration for event in timed.video_extensions) <= 5
+    assert timed.video_extensions[-1].at == pytest.approx(900.021334)
     assert all(segment.playback_rate <= 1.10 for segment in timed.segments)

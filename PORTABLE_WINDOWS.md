@@ -1,65 +1,83 @@
-# Auto Video — cài đặt trên máy Windows khác
+# Auto Video — cài trên máy Windows khác
 
-> **Trạng thái:** Tài liệu và công cụ kiểm tra này áp dụng cho mã nguồn **đang có trên GitHub**. Bản Auto Video mới nhất đã chỉnh sửa trên máy `DESKTOP-L9P8PI4` trong ngày 15–16/10/2026 **chưa được đồng bộ** vì máy đó đang mất kết nối điều khiển. **Không coi nhánh này là bản phát hành mới nhất** cho tới khi hoàn thành đồng bộ mã nguồn và kiểm thử trên máy sạch.
+Mã nguồn Auto Video được đồng bộ theo nhánh `setup/windows-portable-20261016` từ máy phát triển Windows. Các công cụ cài đặt, kiểm tra thư viện và mô hình VieNeu được giữ trong cùng repository. **Chưa xác minh cài đặt từ đầu trên một máy Windows khác.**
 
-## 1. Yêu cầu
+## Yêu cầu
 
-- Windows 10/11 **64 bit**, Python **3.12.x** 64 bit.
-- Git, Internet để cài thư viện và tải mô hình AI lần đầu.
-- FFmpeg và FFprobe trong `PATH` (bộ cài `setup_windows.bat` sẽ thử cài bằng winget).
-- Khuyến nghị RAM >= 16 GB và ổ trống đủ cho mô hình + dữ liệu render. Không cần chép cache hoặc video từ máy cũ để cài chương trình.
+- Windows 10/11 64 bit; Python **3.12.x** (64 bit).
+- Git và Internet để cài thư viện, lấy mô hình lúc sử dụng lần đầu.
+- FFmpeg/FFprobe trong PATH (script cài đặt có thể thử cài bằng winget).
+- Khuyến nghị RAM từ 16 GB và dung lượng trống tối thiểu vài GB; mô hình, video và dữ liệu render có thể cần nhiều hơn.
+- Không cần sao chép thư mục `.venv`, cache, video hoặc khóa API từ máy cũ.
 
-## 2. Clone, cài, mở
+## Bước 1. Clone và cài Auto Video
 
-Mở **PowerShell** tại thư mục bạn muốn đặt Auto Video:
+Mở PowerShell trong thư mục bạn muốn sử dụng:
 
 ```powershell
 git clone https://github.com/lebao1462-cloud/auto_video.git
 cd auto_video
 git switch setup/windows-portable-20261016
 .\setup_windows.bat
-.\check_portable_windows.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\check_portable_windows.ps1
 .\start_auto_video.bat
 ```
 
-Nhánh `setup/windows-portable-20261016` hiện mới bao gồm phần chuẩn bị cài đặt; nhánh `master` chưa đồng bộ bản mã nguồn mới nhất từ máy gốc. Nếu chính sách Windows chặn PowerShell script, thay bằng:
+Khi mở chương trình, nhập Gemini API key vào giao diện trên **máy mới**. Khóa không được lưu trong GitHub. `setup_windows.bat` sẽ tạo `.venv` rồi cài thư viện ứng dụng theo `buzz-1.4.4/pyproject.toml` và `buzz-1.4.4/localization-requirements.txt`. Repository có `uv.lock` và `poetry.lock` cho các trường hợp cần đồng bộ thư viện theo các trình quản lý đó.
+
+Nếu bạn chỉ dùng **Gemini + Edge TTS**, có thể bỏ qua cài VieNeu dưới đây. Các mô hình Paraformer-zh qua FunASR/ModelScope được tải về cache khi sử dụng lần đầu; lần tải đầu tiên cần Internet.
+
+## Bước 2 (tùy chọn). Cài VieNeu cho giọng Ngọc Huyền
+
+Mô hình ONNX của VieNeu quá lớn để đưa vào Git. Script dưới đây cài `vieneu==3.8.3` trong **môi trường Python riêng**, tải các trọng số VieNeu và bộ giải mã MOSS từ các repository của tác giả trên Hugging Face:
+
+```powershell
+.\setup_vieneu_windows.bat
+powershell -NoProfile -ExecutionPolicy Bypass -File .\check_portable_windows.ps1 -RequireVieNeu
+.\start_auto_video.bat
+```
+
+- VieNeu: <https://huggingface.co/pnnbao-ump/VieNeu-TTS-v3-Turbo>
+- Bộ giải mã âm thanh: <https://huggingface.co/OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano-ONNX>
+- Thư viện VieNeu: phiên bản `3.8.3`, chạy ONNX/CPU độc lập với môi trường ứng dụng.
+
+Dữ liệu mặc định trên máy mới, tương đối so với thư mục clone:
+
+```text
+auto_video/
+  .venv/                           (môi trường GUI)
+  .vieneu-venv/                    (môi trường VieNeu)
+  models/
+    VieNeu-TTS-v3-Turbo/onnx_update/
+    HuggingFace/hub/
+```
+
+`start_auto_video.bat` nhận biết những đường dẫn này khi có file tương ứng, và truyền các biến `BUZZ_VIENEU_PYTHON`, `BUZZ_VIENEU_MODEL_DIR`, `BUZZ_VIENEU_HF_HOME` cho chương trình. Bạn cũng có thể tự cấu hình ba biến trên trỏ đến các mô hình đã tải ở vị trí khác; script sẽ không ghi đè biến đã đặt. VieNeu và mô hình là tài sản của bên thứ ba: tôn trọng giấy phép và quyền tải của tác giả.
+
+Nếu chỉ muốn cài thư viện trước, chưa tải mô hình: `setup_vieneu_windows.bat --no-models`. Khi cần tải sau, chạy `.vieneu-venv\Scripts\python.exe install_vieneu_models.py`.
+
+## Bước 3. Kiểm tra và dùng
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\check_portable_windows.ps1
+.\start_auto_video.bat
 ```
 
-`setup_windows.bat` cài ứng dụng ở `.venv` riêng thông qua `buzz-1.4.4/pyproject.toml` và `buzz-1.4.4/localization-requirements.txt`. Các phiên bản được khai báo trong `poetry.lock` và `uv.lock` (nếu chọn quy trình tương ứng). **Không** copy nguyên `.venv` từ máy cũ: virtualenv có đường dẫn phụ thuộc từng máy.
+Chọn một video ngắn, dịch bằng Gemini, xuất MP4 rồi kiểm tra hình, âm thanh, phụ đề và giọng đọc. Các bản ghi checkpoint và video dài không được sao chép theo repository. Chương trình có thể tự tải mô hình Paraformer khi dùng, cần mạng và đủ dung lượng đĩa.
 
-## 3. Gemini và nhận dạng tiếng Trung
+Nếu bạn muốn xây bản chạy độc lập .exe không cần cài Python trên máy đích thì đó là **bước đóng gói riêng**; mã nguồn cùng lockfile/bộ cài Python không tương đương với một bản portable EXE đã kiểm thử.
 
-- Mở chương trình và nhập **Gemini API key trong giao diện** của bạn. Tuyệt đối không đưa key vào GitHub, `.bat`, tài liệu, log công khai hay commit.
-- Paraformer-zh (FunASR/ModelScope) tải các mô hình khi sử dụng lần đầu. Thiết lập `MODELSCOPE_CACHE` nếu muốn cất mô hình ở ổ khác.
-- `FFmpeg`/`FFprobe` là chương trình hệ thống, không phải thư viện Python; phải có trên máy mới.
+## Không đưa lên GitHub
 
-## 4. VieNeu TTS (giọng Ngọc Huyền)
+Không commit khóa Gemini, `.env`, token, mật khẩu, log cá nhân, video nguồn/đầu ra, checkpoint người dùng, cache `.venv`/uv/pip, tệp mô hình `.onnx`, `.pt`, `.safetensors` hoặc các thư mục chứa dữ liệu cá nhân. Kiểm tra `git status` trước mọi lần push.
 
-Auto Video dùng một **Python riêng biệt** để chạy VieNeu ONNX. Mã nguồn GUI trên GitHub **không bao gồm** bản phát hành VieNeu, mô hình ONNX và cache Hugging Face. Cài VieNeu theo hướng dẫn **chính thức của nhà cung cấp/giấy phép của mô hình**, trong một môi trường riêng, sau đó cấu hình **trên máy mới** các biến:
+## Kiểm thử
+
+Các bài kiểm thử đơn vị của dự án nằm ở `buzz-1.4.4/tests`. Chạy ví dụ:
 
 ```powershell
-$env:BUZZ_VIENEU_PYTHON = "C:\AutoVideo-VieNeu\.venv\Scripts\python.exe"
-$env:BUZZ_VIENEU_MODEL_DIR = "C:\AIModels\VieNeu-TTS-v3-Turbo\onnx_update"
-$env:BUZZ_VIENEU_HF_HOME = "C:\AIModels\HuggingFace"
+cd buzz-1.4.4
+..\.venv\Scripts\python.exe -m pytest -q tests/localization
 ```
 
-Ba đường dẫn ở trên chỉ là **ví dụ**, không phải thư mục được tạo tự động. Thay bằng đường dẫn có thật và đảm bảo môi trường VieNeu import được module `vieneu`. Chạy `start_auto_video.bat` **trong cùng phiên PowerShell** để giữ các biến; nếu muốn cấu hình vĩnh viễn, khai báo trong Windows Environment Variables (không ghi vào repository).
-
-Những giọng, các file tham chiếu và bộ mô hình cần kiểm tra riêng: không thể đảm bảo giọng `Ngọc Huyền` hoạt động chỉ bằng cách `git clone` và chạy `pip install`.
-
-## 5. Không đưa lên GitHub
-
-- API keys/tokens, mật khẩu, file `.env`, database người dùng và cấu hình riêng.
-- Video nguồn/đầu ra `.mp4`, `.wav`, phụ đề cá nhân, checkpoint dịch, log, cache, bộ mô hình `.onnx`, `.pt`, `.safetensors`.
-- Thư mục `.venv`, `build`, `dist`, cache pip/uv, bản chạy PyInstaller build trên từng máy.
-
-GitHub lưu **mã nguồn + phiên bản thư viện khai báo + hướng dẫn**, không nhất thiết chứa toàn bộ file nhị phân; các trọng số mô hình phải được tải hoặc chuyển riêng theo giấy phép.
-
-## 6. Kiểm tra
-
-Chạy `check_portable_windows.ps1` để thấy thư viện, FFmpeg và đường dẫn VieNeu đang thiếu. Sau khi thiết lập xong, thử chạy một video ngắn với Gemini rồi kiểm tra MP4 có hình, tiếng và phụ đề trước khi xử lý phim dài.
-
-**Chưa xác nhận kiểm thử trên máy Windows sạch**. Cần đồng bộ mã nguồn mới nhất từ `D:\codex\auto_video`, soát key và kiểm thử lại trước khi đánh dấu bản portable hoàn chỉnh.
+Việc có đủ thư viện **không đảm bảo** kết quả dựng video trên mọi loại CPU/GPU. Cần một lượt kiểm thử end-to-end trên máy Windows mới để xác nhận chính thức.

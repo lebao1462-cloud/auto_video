@@ -219,7 +219,7 @@ def test_batch_translation_keeps_timestamps_and_corrected_chinese():
         segments=[LocalizationSegment(float(i), float(i + 1), f"文本{i}") for i in range(31)],
     )
     result = translate_for_localization(transcript, provider)
-    assert provider.calls == [(30, 0), (1, 8)]
+    assert provider.calls == [(30, 0), (1, 12)]
     assert result.segments[30].start == 30
     assert result.segments[30].end == 31
     assert result.segments[30].source_text == "修正0"
@@ -245,12 +245,12 @@ def test_batch_translation_passes_completed_vietnamese_context_across_boundary()
     translate_for_localization(transcript, provider)
 
     context = provider.contexts[1]
-    assert len(context) == 8
+    assert len(context) == 12
     assert [item.text for item in context] == [
-        f"corrected line {index}" for index in range(22, 30)
+        f"corrected line {index}" for index in range(18, 30)
     ]
     assert [item.translated_text for item in context] == [
-        f"Vietnamese line {index}" for index in range(22, 30)
+        f"Vietnamese line {index}" for index in range(18, 30)
     ]
 
 
@@ -426,10 +426,10 @@ def test_register_review_runs_after_raw_translation_and_uses_reviewed_batches(tm
         transcript, provider, checkpoint_path=tmp_path / "translation-checkpoint.json"
     )
     assert result.segments[0].translated_text == "reviewed raw line 0"
-    assert len(provider.contexts) == 2
-    assert len(provider.contexts[1]) == 12
-    assert [item.translated_text for item in provider.contexts[1]] == [
-        f"reviewed raw line {index}" for index in range(108, 120)
+    assert len(provider.contexts) == 5
+    assert len(provider.contexts[-1]) == 18
+    assert [item.translated_text for item in provider.contexts[-1]] == [
+        f"reviewed raw line {index}" for index in range(102, 120)
     ]
 
     resumed = Provider()
@@ -493,9 +493,88 @@ def test_malformed_register_review_retries_then_splits_without_losing_entries():
     assert len(provider.calls) == 4
 
 
+def test_register_review_salvages_valid_items_without_resending_them(tmp_path):
+    class Provider:
+        def __init__(self):
+            self.calls = []
+
+        def translate_segments(self, segments, source_language, target_language, *, context):
+            return [(item.text, f"raw {item.text}") for item in segments]
+
+        def review_translation_register(self, segments, source_language, target_language, *, context):
+            self.calls.append(tuple(item.segment_id for item in segments))
+            if len(segments) == 1:
+                return [(segments[0].segment_id, "...")]
+            return [
+                (segments[0].segment_id, f"reviewed {segments[0].translated_text}"),
+                (segments[1].segment_id, "..."),
+            ]
+
+    checkpoint = tmp_path / "translation-checkpoint.json"
+    provider = Provider()
+    result = translate_for_localization(make_transcript(segments=[
+        LocalizationSegment(0, 1, "one"), LocalizationSegment(1, 2, "two"),
+        LocalizationSegment(2, 3, "three"),
+    ]), provider, checkpoint_path=checkpoint)
+
+    assert [item.translated_text for item in result.segments] == [
+        "reviewed raw one", "reviewed raw two", "raw three",
+    ]
+    assert provider.calls == [
+        (provider.calls[0][0], provider.calls[0][1], provider.calls[0][2]),
+        (provider.calls[0][1], provider.calls[0][2]),
+        # Both retries were already used by the batch; avoid extra singleton requests.
+    ]
+    saved = json.loads(
+        (tmp_path / "translation-register-checkpoint.json").read_text(encoding="utf-8")
+    )
+    assert saved["segments"][provider.calls[0][2]]["review_status"] == "raw_fallback"
+
+
+def test_invalid_singleton_review_uses_checkpointed_raw_fallback_on_resume(tmp_path):
+    class Provider:
+        def __init__(self):
+            self.review_calls = 0
+
+        def translate_segments(self, segments, source_language, target_language, *, context):
+            return [(item.text, "tao sẽ giết người") for item in segments]
+
+        def review_translation_register(self, segments, source_language, target_language, *, context):
+            self.review_calls += 1
+            return [(segments[0].segment_id, "tao sẽ giết người")]
+
+    checkpoint = tmp_path / "translation-checkpoint.json"
+    first = Provider()
+    with pytest.raises(ValueError, match="refusing to put an unsafe raw fallback"):
+        translate_for_localization(make_transcript(), first, checkpoint_path=checkpoint)
+    assert first.review_calls == 2
+    # Never cache a disallowed fallback and never silently return it on resume.
+    reviewed = tmp_path / "translation-register-checkpoint.json"
+    if reviewed.exists():
+        assert "raw_fallback" not in reviewed.read_text(encoding="utf-8")
+
+
+def test_register_review_provider_outage_raises_instead_of_raw_fallback():
+    class Provider:
+        def __init__(self):
+            self.review_calls = 0
+
+        def translate_segments(self, segments, source_language, target_language, *, context):
+            return [(item.text, "raw translation") for item in segments]
+
+        def review_translation_register(self, segments, source_language, target_language, *, context):
+            self.review_calls += 1
+            raise ConnectionError("review provider unavailable")
+
+    provider = Provider()
+    with pytest.raises(ConnectionError, match="review provider unavailable"):
+        translate_for_localization(make_transcript(), provider)
+    assert provider.review_calls == 2
+
+
 @pytest.mark.parametrize("text, valid", [
     ("tao sẽ giết người", False), ("HỐ CHA thật", False),
-    ("ta sẽ giết người", True), ("tao sẽ giết mày", True), ("Bình thường", True),
+    ("ta sẽ giết người", True), ("tao sẽ giết mày", False), ("Bình thường", True), ("Lông mày đẹp", True), ("MÀY đừng đi", False),
 ])
 def test_review_validator(text, valid):
     assert _valid_reviewed_text(text) is valid

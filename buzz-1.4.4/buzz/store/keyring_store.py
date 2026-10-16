@@ -14,6 +14,11 @@ from buzz.settings.settings import APP_NAME
 class Key(enum.Enum):
     OPENAI_API_KEY = "OpenAI API key"
     GEMINI_API_KEY = "Gemini API key"
+    GROK_API_KEY = "Grok API key"
+    CLOUDFLARE_API_TOKEN = "Cloudflare API token"
+    OPENROUTER_API_KEY = "OpenRouter API key"
+    MISTRAL_API_KEY = "Mistral API key"
+    GROQ_API_KEY = "Groq API key"
 
 
 def _is_linux() -> bool:

@@ -31,15 +31,17 @@ def test_simple_ui_uses_fixed_pipeline_defaults(qtbot, monkeypatch):
     assert dialog.cancel_button.text() == "Hủy"
 
 
-def test_simple_ui_only_exposes_video_key_and_voice(qtbot, monkeypatch):
+def test_legacy_dialog_is_gemini_only(qtbot, monkeypatch):
     dialog = _dialog(qtbot, monkeypatch)
 
     assert dialog.source_edit.parent() is not None
     assert dialog.api_key_edit.parent() is not None
     assert dialog.voice_combo.parent() is not None
     assert dialog.output_edit.parent() is None
-    assert dialog.translation_provider_combo.parent() is None
-    assert dialog.translation_model_edit.parent() is None
+    assert dialog.translation_provider_combo.count() == 1
+    assert dialog.translation_provider_combo.currentData() == "gemini"
+    assert dialog.translation_provider_combo.isHidden()
+    assert dialog.translation_model_edit.isHidden()
     assert dialog.subtitle_mode_combo.parent() is None
     assert dialog.cover_original_subtitles_checkbox.parent() is None
     assert dialog.blur_bilibili_watermark_checkbox.parent() is not None
@@ -92,6 +94,20 @@ def test_gemini_api_key_saves_to_keyring(qtbot, monkeypatch):
     assert saved == [(Key.GEMINI_API_KEY, "new-gemini-key")]
 
 
+def test_worker_rejects_unexpected_non_gemini_provider(monkeypatch):
+    worker = LocalizationWorker(
+        source_video="source.mp4", output_directory="output", source_language=None,
+        translation_provider_name="argos", translation_base_url=None,
+        translation_api_key="key", translation_model="gemini-3.5-flash-lite",
+        tts_voice="vi-VN-HoaiMyNeural", subtitle_mode="burn",
+        cover_original_subtitles=True, blur_bilibili_watermark=True,
+    )
+    errors = []
+    worker.failed.connect(errors.append)
+    worker.run()
+    assert errors == ["Only Gemini translation is supported for new localization jobs."]
+
+
 def test_worker_uses_gemini_paraformer_and_timing_policy(monkeypatch):
     calls = []
     provider_args = []
@@ -125,7 +141,11 @@ def test_worker_uses_gemini_paraformer_and_timing_policy(monkeypatch):
     worker.run()
 
     assert provider_args == [
-        {"api_key": "key", "model": "gemini-3.5-flash-lite"}
+        {
+            "api_key": "key",
+            "model": "gemini-3.5-flash-lite",
+            "rate_limit_fallback_models": (),
+        }
     ]
     args, kwargs = calls[0]
     assert kwargs["asr_provider"] == "paraformer-zh"
@@ -135,3 +155,32 @@ def test_worker_uses_gemini_paraformer_and_timing_policy(monkeypatch):
     assert args[5].render_options.blur_bilibili_watermark is True
     assert args[5].render_options.overlay_ben_review_logo is True
     assert args[5].use_background_separation is False
+
+def test_portrait_preset_checkbox_default_off_and_visible(qtbot, monkeypatch):
+    dialog = _dialog(qtbot, monkeypatch)
+    assert dialog.portrait_subtitle_overlay_checkbox.isChecked() is False
+    assert dialog.portrait_subtitle_overlay_checkbox.parent() is not None
+
+
+def test_worker_passes_portrait_render_and_one_line_subtitle_options(monkeypatch):
+    from buzz.localization.subtitles import SubtitleOptions
+    calls = []
+    monkeypatch.setattr("buzz.widgets.localization_dialog.GeminiTranslationProvider", lambda **kwargs: object())
+    monkeypatch.setattr("buzz.widgets.localization_dialog.EdgeTTSProvider", lambda **kwargs: object())
+    monkeypatch.setattr(
+        "buzz.widgets.localization_dialog.localize_video",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or object(),
+    )
+    worker = LocalizationWorker(
+        source_video="source.mp4", output_directory="output", source_language=None,
+        translation_provider_name="gemini", translation_base_url=None,
+        translation_api_key="test-key", translation_model="gemini-3.5-flash-lite",
+        tts_voice="vi-VN-HoaiMyNeural", subtitle_mode="burn",
+        cover_original_subtitles=True, blur_bilibili_watermark=True,
+        overlay_ben_review_logo=True, portrait_subtitle_overlay=True,
+    )
+    worker.run()
+    config = calls[0][0][5]
+    assert config.render_options.portrait_subtitle_overlay is True
+    assert config.render_options.overlay_ben_review_logo is True
+    assert config.subtitle_options == SubtitleOptions(max_line_length=None, max_lines=1)

@@ -53,7 +53,9 @@ class VieNeuTTSProvider:
     model_dir: str | None = None
     hf_home: str | None = None
     worker_command: Sequence[str] | None = None
-    worker_timeout_seconds: float = 120.0
+    # Allow slow first ONNX model initialization; retry one stalled worker.
+    worker_timeout_seconds: float = 240.0
+    max_timeout_retries: int = 1
     _session: _VieNeuSharedSession | None = field(default=None, init=False, repr=False)
     _lifecycle_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
@@ -92,6 +94,8 @@ class VieNeuTTSProvider:
             )
         if self.worker_timeout_seconds <= 0:
             raise ValueError("VieNeu worker timeout must be positive")
+        if self.max_timeout_retries < 0:
+            raise ValueError("VieNeu retry count cannot be negative")
 
     @staticmethod
     def _existing(path: str) -> str | None:
@@ -109,7 +113,11 @@ class VieNeuTTSProvider:
     def _worker_environment(self) -> dict[str, str]:
         env = os.environ.copy()
         hub_cache = str(Path(self.hf_home) / "hub")
+        # Separate, bounded diagnostic log for the isolated model subprocess.
+        worker_log = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir())
+        worker_log = worker_log / "Buzz" / "Buzz" / "Logs" / "vieneu_worker.log"
         env.update({
+            "BUZZ_VIENEU_WORKER_LOG": str(worker_log),
             "HF_HOME": str(self.hf_home),
             "HF_HUB_CACHE": hub_cache,
             "HUGGINGFACE_HUB_CACHE": hub_cache,
@@ -174,6 +182,24 @@ class VieNeuTTSProvider:
         session.process = None
         if process is None or process.poll() is not None:
             return
+        # On Windows a virtualenv launcher may spawn the actual ONNX Python
+        # process. Terminating only the launcher strands a 1+ GB child.
+        pid = getattr(process, "pid", None)
+        if os.name == "nt" and isinstance(pid, int) and pid > 0:
+            try:
+                stopped = subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=8, check=False,
+                )
+                if stopped.returncode == 0:
+                    process.wait(timeout=2)
+                    return
+                logger.warning("VieNeu process-tree stop returned %s for pid %s",
+                               stopped.returncode, pid)
+            except (OSError, subprocess.SubprocessError) as exc:
+                logger.warning("VieNeu process-tree stop failed for pid %s: %s",
+                               pid, exc)
         try:
             process.terminate()
             process.wait(timeout=2)
@@ -208,7 +234,7 @@ class VieNeuTTSProvider:
         thread.join(self.worker_timeout_seconds)
         if thread.is_alive():
             self._invalidate_session(session)
-            raise LocalizationProviderError(
+            raise _VieNeuWorkerTimedOut(
                 f"VieNeu synthesis exceeded {self.worker_timeout_seconds:g} seconds"
             )
         if failure:
@@ -236,6 +262,7 @@ class VieNeuTTSProvider:
         output.unlink(missing_ok=True)
         with self._lifecycle_lock:
             session = self._acquire_session()
+            timeout_failures = 0
             while True:
                 with session.request_lock:
                     # A request waiting behind a failed request must register
@@ -265,6 +292,25 @@ class VieNeuTTSProvider:
                             raise LocalizationProviderError(
                                 "VieNeu worker returned a mismatched response"
                             )
+                    except _VieNeuWorkerTimedOut as exc:
+                        timeout_failures += 1
+                        logger.warning(
+                            "VieNeu timed out after %.0fs (attempt %d/%d, chars=%d, voice=%s); "
+                            "restarting isolated worker%s",
+                            self.worker_timeout_seconds, timeout_failures,
+                            self.max_timeout_retries + 1, len(request.text),
+                            request.voice or self.default_voice,
+                            "" if timeout_failures <= self.max_timeout_retries
+                            else " exhausted",
+                        )
+                        if timeout_failures > self.max_timeout_retries:
+                            raise LocalizationProviderError(
+                                f"VieNeu synthesis exceeded {self.worker_timeout_seconds:g} "
+                                f"seconds after {timeout_failures} attempts"
+                            ) from exc
+                        output.unlink(missing_ok=True)
+                        session = self._acquire_session()
+                        continue
                     except LocalizationProviderError:
                         raise
                     except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -494,6 +540,10 @@ class LocalizationProviderError(RuntimeError):
     """Raised when a concrete localization provider fails."""
 
 
+class _VieNeuWorkerTimedOut(LocalizationProviderError):
+    """A stuck isolated worker that may be restarted once per request."""
+
+
 class _EdgeTTSNoAudioExhausted(LocalizationProviderError):
     """Signal that a single payload exhausted only empty-audio retries."""
 
@@ -587,12 +637,26 @@ class OpenAICompatibleTranslationProvider:
     model: str
     base_url: str | None = None
     timeout: float = 60.0
+    rate_limit_fallback_models: tuple[str, ...] | None = None
 
     def __post_init__(self):
         if not self.api_key:
             raise ValueError("Translation API key is required")
-        if not self.model:
+        model_candidates = self._parse_model_list(self.model)
+        if not model_candidates:
             raise ValueError("Translation model is required")
+        configured_fallbacks = self.rate_limit_fallback_models
+        if configured_fallbacks is None:
+            configured_fallbacks = self._parse_model_list(
+                os.getenv("BUZZ_TRANSLATION_FALLBACK_MODELS", "")
+            )
+        else:
+            configured_fallbacks = self._parse_model_list(configured_fallbacks)
+        self.model = model_candidates[0]
+        self.rate_limit_fallback_models = tuple(dict.fromkeys(
+            (*model_candidates[1:], *configured_fallbacks)
+        ))
+        self._quota_exhausted_models: set[str] = set()
         self._client = OpenAI(
             api_key=self.api_key,
             base_url=self.base_url or None,
@@ -611,27 +675,64 @@ class OpenAICompatibleTranslationProvider:
             raise ValueError("Source language must be 'en' or 'zh'")
 
         source_name = "English" if source_language == "en" else "Chinese"
-        try:
-            response = self._client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            f"Translate {source_name} into natural Vietnamese. "
-                            "Return only the Vietnamese translation. Preserve meaning, "
-                            "names, numbers, punctuation intent, and speaking style. "
-                            "Do not add explanations or quotation marks."
-                        ),
-                    },
-                    {"role": "user", "content": text},
-                ],
-                timeout=self.timeout,
-            )
-        except Exception as exc:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    f"Translate {source_name} into natural Vietnamese. "
+                    "Return only the Vietnamese translation. Preserve meaning, "
+                    "names, numbers, punctuation intent, and speaking style. "
+                    "Do not add explanations or quotation marks."
+                ),
+            },
+            {"role": "user", "content": text},
+        ]
+        last_rate_limit_error = None
+        self.last_model_used = None
+        for model in self._model_candidates():
+            if model in self._quota_exhausted_models:
+                continue
+            for attempt in range(3):
+                try:
+                    response = self._client.chat.completions.create(
+                        model=model, messages=messages, timeout=self.timeout,
+                    )
+                    self.last_model_used = model
+                    break
+                except Exception as exc:
+                    if not self._is_rate_limit_error(exc):
+                        raise LocalizationProviderError(
+                            f"Translation provider request failed: {exc}"
+                        ) from exc
+                    last_rate_limit_error = exc
+                    retry_after = self._retry_after_seconds(exc)
+                    if retry_after is not None and attempt < 2:
+                        logger.warning(
+                            "Translation model %s temporarily rate-limited; "
+                            "retrying after %.1fs (%d/2)",
+                            model, retry_after, attempt + 1,
+                        )
+                        time.sleep(retry_after)
+                        continue
+                    # An ordinary minute-level rate limit must not blacklist the
+                    # model permanently. Only model/quota exhaustion without a
+                    # reset hint enters the unavailable model set.
+                    if retry_after is None:
+                        self._quota_exhausted_models.add(model)
+                    logger.warning(
+                        "Translation model %s remains rate-limited; switching models",
+                        model,
+                    )
+                    break
+            else:
+                continue
+            if self.last_model_used == model:
+                break
+        else:
             raise LocalizationProviderError(
-                f"Translation provider request failed: {exc}"
-            ) from exc
+                "Translation quota or rate limit is exhausted for every configured "
+                "model. Add fallback models or try again after quota resets."
+            ) from last_rate_limit_error
 
         if (
             not response.choices
@@ -644,6 +745,41 @@ class OpenAICompatibleTranslationProvider:
         if not translated:
             raise LocalizationProviderError("Translation provider returned empty text")
         return translated
+
+    @staticmethod
+    def _parse_model_list(value) -> tuple[str, ...]:
+        if isinstance(value, str):
+            values = re.split(r"[,\n\r]+", value)
+        else:
+            values = value or ()
+        return tuple(dict.fromkeys(
+            item.strip() for item in values if isinstance(item, str) and item.strip()
+        ))
+
+    def _model_candidates(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys((self.model, *self.rate_limit_fallback_models)))
+
+    @staticmethod
+    def _retry_after_seconds(exc: Exception) -> float | None:
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", {}) or {}
+        raw = headers.get("retry-after") or headers.get("Retry-After")
+        try:
+            delay = float(raw)
+        except (ValueError, TypeError):
+            return None
+        return max(1.0, min(delay + 1.0, 90.0)) if delay >= 0 else None
+
+    @staticmethod
+    def _is_rate_limit_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return (
+            "429" in message
+            or "rate limit" in message
+            or "rate_limit" in message
+            or "resource_exhausted" in message
+            or "quota exceeded" in message
+        )
 
 
 def _run_argos_worker(
@@ -884,6 +1020,54 @@ class NLLBTranslationProvider:
         return [(text, vietnamese) for text, vietnamese in zip(source_texts, translated)]
 
 
+
+_VI_DIALOGUE_CONTINUITY_POLICY = (
+    " CRITICAL DIALOGUE CONTINUITY POLICY FOR CHINESE-TO-VIETNAMESE VIDEO: "
+    "First determine from all nearby source lines which characters are talking, "
+    "who addresses whom, and whether a passage is narration or inner monologue. "
+    "Track the same pair of interlocutors across consecutive lines and preserve "
+    "their established relationship, relative ages, status and emotional distance. "
+    "For a confirmed romantic couple or intimate relationship, choose one natural "
+    "pair such as anh-em according to the speaker and addressee; for unfamiliar "
+    "modern adults, prefer tôi-anh / tôi-cô until the story establishes intimacy. "
+    "For Chinese period/fantasy relationships use the explicitly stated titles "
+    "(huynh, muội, sư huynh, tiền bối, điện hạ) when justified by source and scene; "
+    "never force archaic ta-người on an ordinary modern romance. "
+    "Do not guess a marriage or family relationship from anger, clothing, or a "
+    "single ambiguous sentence. Choose a conservative natural form if uncertain. "
+    "The Vietnamese second person and first person may be asymmetric by gender "
+    "or relation, but each speaker's usage must remain coherent. "
+    "Never use the Vietnamese pronouns 'tao' or 'mày' in ANY character dialogue, "
+    "narration, insults or interior monologue, regardless of original hostility, "
+    "vulgarity, story genre or existing flawed context. Express aggression through "
+    "natural wording instead, without changing any underlying facts. "
+    "If prior context already contains these prohibited pronouns, REPAIR them "
+    "rather than copying them. Never oscillate between anh-em, tôi-anh, tôi-cô, "
+    "ta-người or other pair merely for variety: change only with clear evidence "
+    "of a new speaker, different addressee or explicitly evolving relationship. "
+    "Preserve every source utterance and semantic detail: actors, actions, objects, "
+    "pronouns needed to disambiguate, time, cause and consequence, negation, numbers, "
+    "names, questions and answers. Translate every clause in order: NO missing "
+    "words that change meaning, truncated unfinished sentences, free summaries, "
+    "filler inventions, or lost replies. If a recognition line is ambiguous, "
+    "resolve only from surrounding source dialogue; never hallucinate a missing "
+    "event or rewrite an uncertain name or number. Keep syntax grammatical and "
+    "spoken Vietnamese natural. If narration spans a segment boundary, preserve "
+    "both fragments while keeping continuity, not an isolated fragment. "
+    "Timing constraints NEVER justify deleting a clause or changing its meaning. "
+    "Speak naturally and concisely: when source timestamps are provided, aim for "
+    "roughly 3.5 to 4.2 space-separated Vietnamese words per second if feasible, "
+    "but never force this target at the expense of the meaning. Shorten fillers, "
+    "repeated names and verbose wording instead of omitting source information. "
+    "Always retain explicit years, months, dates, ten-unit money amounts, names, "
+    "kinship, negation, and reason/result statements. When one ASR segment contains "
+    "two or more speakers, preserve their distinct replies and do not conflate "
+    "first-person narration with dialogue. If compression cannot fit naturally, "
+    "retain the full content for the later speech-timing recovery step. "
+    "Check the Vietnamese line against corrected source for full semantic coverage "
+    "before sending the response."
+)
+
 @dataclass
 class GeminiTranslationProvider:
     api_key: str
@@ -892,7 +1076,7 @@ class GeminiTranslationProvider:
     # Keep this configurable for callers which need a different limit.
     timeout: float = 120.0
     rate_limit_fallback_models: tuple[str, ...] | None = None
-    translation_policy_version: str = "vi-dialogue-register-v3"
+    translation_policy_version: str = "vi-dialogue-continuity-v5-no-tao-may-complete-concise"
 
     _quota_cooldown_seconds = 65.0
     _transient_retry_delays = (0, 5, 15)
@@ -951,7 +1135,9 @@ class GeminiTranslationProvider:
             primary, *fallbacks, *DEFAULT_GEMINI_FALLBACK_MODELS,
         )))
 
-    def _generate_content_with_retry(self, *, contents, config=None):
+    def _generate_content_with_retry(
+        self, *, contents, config=None, max_rate_limit_cooldown_rounds: int | None = None,
+    ):
         """Generate content while sharing quota state across this provider session."""
         models = self._model_candidates()
         exhausted = getattr(self, "_rpd_exhausted_models", None)
@@ -966,6 +1152,7 @@ class GeminiTranslationProvider:
 
         last_error = None
         transient_failed: set[str] = set()
+        cooldown_rounds = 0
         while True:
             now = time.monotonic()
             eligible = [
@@ -992,6 +1179,12 @@ class GeminiTranslationProvider:
                     if last_error is not None:
                         raise last_error
                     raise LocalizationProviderError("No Gemini models are available")
+                if (max_rate_limit_cooldown_rounds is not None
+                        and cooldown_rounds >= max_rate_limit_cooldown_rounds):
+                    raise LocalizationProviderError(
+                        "Gemini rate-limit cooldown budget exhausted; timing recovery "
+                        "will use its verified-text fallback"
+                    ) from last_error
                 next_ready = min(cooldowns.get(model, now) for model in remaining)
                 wait_seconds = max(0.0, next_ready - now)
                 # A finite wait prevents a tight loop even if a clock is adjusted.
@@ -1000,6 +1193,7 @@ class GeminiTranslationProvider:
                     "All available Gemini models are cooling down; waiting %.1f seconds",
                     wait_seconds,
                 )
+                cooldown_rounds += 1
                 time.sleep(max(wait_seconds, 0.1))
                 continue
 
@@ -1159,13 +1353,12 @@ class GeminiTranslationProvider:
 
         source_name = "English" if source_language == "en" else "Chinese"
         prompt = (
-            f"Translate the following {source_name} into natural, concise Vietnamese "
-            "suitable for spoken dubbing. Preserve meaning, names, numbers, units, "
-            "and important entities. Translate idioms, internet slang, memes, and genre "
-            "jargon by their intended meaning in natural Vietnamese; never use awkward "
-            "word-for-word calques. For Chinese cultivation/system-fiction dialogue, "
-            "keep pronouns, tone, and sentence flow natural for Vietnamese viewers. "
-            "Return only the Vietnamese translation, with no commentary or quotation marks.\n\n"
+            f"Translate this {source_name} source faithfully into fluent spoken "
+            "Vietnamese. Keep names, numbers, actions, negation, question/reply "
+            "structure and every source clause. Do not hallucinate and do not "
+            "drop words needed to understand the sentence. "
+            + _VI_DIALOGUE_CONTINUITY_POLICY
+            + " Output only the Vietnamese sentence, no quotes or explanation.\n\n"
             + text.strip()
         )
         try:
@@ -1180,6 +1373,9 @@ class GeminiTranslationProvider:
         translated = getattr(response, "text", None)
         if not isinstance(translated, str) or not translated.strip():
             raise LocalizationProviderError("Gemini returned empty translation text")
+        from buzz.localization.translation import _has_prohibited_dialogue_pronoun
+        if _has_prohibited_dialogue_pronoun(translated):
+            raise LocalizationProviderError("Gemini used prohibited Vietnamese pronouns")
         return translated.strip()
 
     def translate_segments(
@@ -1214,31 +1410,29 @@ class GeminiTranslationProvider:
             ],
         }
         prompt = (
-            "You are translating a video for Vietnamese dubbing. Read all segments "
-            "together for context. For Chinese, fix obvious Whisper recognition errors "
-            "using context, while preserving meaning, product terms, names, numbers "
-            "and units. For English, preserve the original transcript. Translate each "
-            "corrected segment to concise, natural spoken Vietnamese that can be spoken within its "
-            "start/end duration when feasible. Preserve every source clause, fact, number, unit, "
-            "negation, name, relationship and register; never truncate or summarize content merely "
-            "to fit time. Translate Chinese "
-            "idioms, internet slang, memes, and cultivation/system-fiction jargon by intended "
-            "meaning, never by awkward literal calques. Previous translated context is the "
-            "authoritative style and register memory for the ongoing scene. Keep the same "
-            "speaker/addressee pronoun pair and address terms across adjacent lines unless the "
-            "source explicitly signals a relationship, tone, or status change. NEVER alternate "
-            "tao-m\u00e0y, t\u00f4i-c\u1eadu, or ta-ng\u01b0\u1eddi merely for stylistic variety, and avoid mixed pairs "
-            "such as ta-m\u00e0y or t\u00f4i-ng\u01b0\u1eddi unless the source truly warrants an asymmetric honorific "
-            "relationship. For Chinese cultivation/system-fantasy, default to ta-ng\u01b0\u1eddi for "
-            "hostile, stranger, or fantasy confrontations when the relationship is unclear; use "
-            "t\u00f4i-c\u1eadu for neutral modern or peer dialogue; use tao-m\u00e0y only when the source is "
-            "clearly vulgar, intentionally insulting, or rough, then keep it stable through that "
-            "exchange. Keep inner monologue/self-talk consistent with the established protagonist "
-            "voice, and distinguish narration from character dialogue. Never combine, drop, reorder, or split "
-            "segments. Context-only entries are for background "
-            "and must NOT appear in the output. Keep each ID unchanged. Return a JSON "
-            "object with only a 'segments' array of objects with unchanged 'id', string "
-            "'corrected_text' and string 'translated_text'. Input JSON:\n"
+            "You are translating timestamped video into Vietnamese for faithful dubbing. "
+            "Read ALL segments together as one continuous scene and resolve speaker "
+            "turns, addressees, relationships and context BEFORE translating. "
+            "Chinese: correct only obvious recognition mistakes supported by nearby "
+            "source lines; when unsure retain source rather than inventing dialogue. "
+            "English: retain source_text unchanged. "
+            "Return ONE faithful, complete Vietnamese line per input ID, with the "
+            "corrected_text in the source language. Do not merge/split, omit, renumber "
+            "or reorder segments. Keep every clause, name, number, unit, negation, "
+            "question, answer, action and relation. Context-only items are READ-ONLY "
+            "memory; they must not be returned as output. Prior translated context "
+            "helps identify stable forms of address only when consistent with source; "
+            "repair previous errors instead of perpetuating them. Prefer preserving "
+            "meaning over unnaturally shortening lines; TTS timing is a later step. "
+            "Translate idioms and slang by their intended meaning, never by awkward literal calques. "
+            + _VI_DIALOGUE_CONTINUITY_POLICY
+            + " Previous translated context is the authoritative style and register memory "
+            "for the ongoing scene WHEN it is not inconsistent with source or this policy. "
+            "NEVER alternate register merely for style. "
+            'Return JSON object only: {"segments":[{"id":"unchanged_id", '
+            '"corrected_text":"source-language text", '
+            '"translated_text":"complete Vietnamese line"}]}. '
+            "Every ID exactly once. Input JSON:\n"
             + json.dumps(payload, ensure_ascii=False)
         )
         try:
@@ -1270,6 +1464,9 @@ class GeminiTranslationProvider:
                     raise ValueError("empty corrected transcript")
                 if not isinstance(translated, str) or not translated.strip():
                     raise ValueError("empty Vietnamese translation")
+                from buzz.localization.translation import _has_prohibited_dialogue_pronoun
+                if _has_prohibited_dialogue_pronoun(translated):
+                    raise ValueError("Gemini used prohibited Vietnamese pronouns")
                 source_index = expected_ids.index(identifier)
                 source_text = corrected if source_language == "zh" else segments[source_index].text
                 by_id[identifier] = (source_text.strip(), translated.strip())
@@ -1301,48 +1498,98 @@ class GeminiTranslationProvider:
             } for item in segments],
         }
         prompt = (
-            "You are a Vietnamese dialogue continuity editor, NOT a new translator. "
-            "Return every input ID once, in order, with revised_translated_text only. Preserve "
-            "every fact, clause, name, number, unit, negation, event, and segment boundary: "
-            "never merge, drop, reorder, or split. Fix only naturalness, Chinese literal calques, "
-            "pronoun/address-term continuity, and register. Context-only prior REVIEWED Vietnamese "
-            "is authoritative and must never appear as output. HARD cultivation/system-fantasy rules: "
-            "hostile, unknown, or fantasy character exchanges default to ta-người; do not drift to "
-            "tao-mày or tôi-cậu merely because Chinese is angry or rough. tao-mày is allowed only "
-            "when unmistakable modern vulgar register was already established for that exchange; "
-            "tôi-cậu is only clearly modern neutral peer dialogue. Same-sect relations prefer explicit "
-            "source titles (sư huynh, sư tỷ, huynh, đệ, tiền bối) or the established pair. System/host "
-            "must consistently use ký chủ for the protagonist; the host calls it hệ thống or the "
-            "established term. Keep one inner-monologue first-person voice within a scene. Keep narration "
-            "distinct, preferring a name or consistent third-person form. Never make a mixed ordinary "
-            "symmetric pair such as tao-người, tao-cậu, ta-mày, tôi-người, or tôi-mày. Chinese 坑爹 is "
-            "idiomatic slang and MUST NEVER become hố cha; use natural Vietnamese such as chơi khăm, "
-            "tệ hại, or khốn nạn according to tone. Keep anti-literal-calque guidance. Return JSON only: "
-            "{\"segments\":[{\"id\":...,\"revised_translated_text\":...}]}. Input JSON:\n"
+            "You are the FINAL Vietnamese dialogue fidelity and continuity editor. "
+            "Use original source_text as ground truth; the existing Vietnamese "
+            "translation is a draft, NOT authoritative when it loses details or "
+            "uses wrong address terms. First infer character-to-character "
+            "speaker/addressee relationships from this scene and prior reviewed "
+            "context. Repair all missing or mangled meaningful words, omitted "
+            "clauses and fragmentary sentences, preserving original meaning. "
+            "Compare each source clause with its Vietnamese counterpart, including "
+            "negations, agency, pronouns, kinship, events, numbers, and proper names. "
+            "Keep source segment boundaries and return each ID exactly once, in order. "
+            "Context-only lines must NOT be output. "
+            "Chinese 坑爹 is idiomatic: never translate as hố cha; use natural "
+            "Vietnamese such as chơi khăm depending on meaning. "
+            + _VI_DIALOGUE_CONTINUITY_POLICY
+            + ' Return JSON only: {"segments":[{"id":"unchanged_id", '
+            '"revised_translated_text":"complete grammatical Vietnamese"}]}. '
+            "Input JSON:\n"
             + json.dumps(payload, ensure_ascii=False)
         )
         try:
             response = self._generate_content_with_retry(
                 contents=prompt, config={"response_mime_type": "application/json"},
             )
-            result = json.loads(response.text)
-            values = result["segments"]
-            expected = [item.segment_id for item in segments]
-            if not isinstance(values, list) or len(values) != len(expected):
-                raise ValueError("wrong number of reviewed segments")
-            reviewed = {}
-            for value in values:
-                identifier = value["id"]
-                translated = value["revised_translated_text"]
-                if (identifier in reviewed or identifier not in expected
-                        or not isinstance(translated, str) or not translated.strip()):
-                    raise ValueError("invalid reviewed segment")
-                reviewed[identifier] = translated.strip()
-            if set(reviewed) != set(expected):
-                raise ValueError("missing reviewed segment ID")
-            return [(identifier, reviewed[identifier]) for identifier in expected]
         except Exception as exc:
+            # Transport, quota, or service failures must remain visible. They are
+            # not malformed review text and must not trigger a raw-text fallback.
             raise LocalizationProviderError(f"Gemini register review failed: {exc}") from exc
+        try:
+            result = json.loads(response.text)
+            values = result.get("segments") if isinstance(result, dict) else None
+        except (TypeError, ValueError, AttributeError):
+            values = None
+        if not isinstance(values, list):
+            logger.warning("Gemini register review returned an invalid JSON structure")
+            return []
+        # Preserve every identifiable entry, including invalid text, for the
+        # checkpointing reviewer to validate independently. Rejection/retry
+        # decisions belong there, not at this provider boundary.
+        return [
+            (entry.get("id"), entry.get("revised_translated_text"))
+            for entry in values if isinstance(entry, dict)
+        ]
+
+    def review_dialogue_alignment(
+        self, *, segments, context=(), source_language: str, target_language: str,
+    ) -> list[tuple[str, str]]:
+        """Review segment-to-source alignment and speech length before TTS."""
+        if source_language not in {"zh", "en"} or target_language != "vi":
+            raise ValueError("Dialogue QA requires Chinese/English to Vietnamese")
+        if not segments:
+            return []
+        payload = {"source_language": source_language,
+                   "context_only": list(context), "segments": list(segments)}
+        prompt = (
+            "You are the final Vietnamese film dialogue and timing reviewer. "
+            "This draft already passed general translation review. Now compare "
+            "EACH segment to ITS OWN source_text and neighboring source dialogue. "
+            "Automatic Chinese speech recognition may split one sentence across IDs. "
+            "NEVER move an adjacent sentence's meaning into the wrong ID or "
+            "duplicate a line from the previous or following segment. "
+            "Repair missing or wrong speakers, replies, characters, numbers, dates, "
+            "negations, actions, motivation and names only when supported by source. "
+            "Use context_only for continuity, never output its lines. "
+            "Keep previously established relationship forms and proper character "
+            "names stable; never flip anh-em and tôi-cô for stylistic variety. "
+            "Do not inject archaic pronouns into modern dialogue. "
+            "The Vietnamese pronouns 'tao' and 'mày' are forbidden in every scene. "
+            "When needs_fidelity_or_timing_review=true, compress unnecessary "
+            "repetition and filler in natural spoken Vietnamese, preferably within "
+            "5.2 Vietnamese words per available_seconds; NEVER omit a source "
+            "clause or change its meaning merely for this target. Timing recovery "
+            "after TTS will handle intrinsically long lines. "
+            "If not flagged, return current_vietnamese unchanged unless a clear "
+            "source mismatch exists. Preserve EVERY input ID once, in order; do "
+            "not merge or split IDs. Output JSON only, example: "
+            '{"segments":[{"id":"line-000000","revised_vietnamese":"Tôi hiểu rồi."}]}. '
+            "Input JSON:\\n" + json.dumps(payload, ensure_ascii=False)
+        )
+        try:
+            response = self._generate_content_with_retry(
+                contents=prompt, config={"response_mime_type": "application/json"})
+        except Exception as exc:
+            raise LocalizationProviderError(f"Gemini dialogue QA failed: {exc}") from exc
+        try:
+            result = json.loads(response.text)
+            rows = result["segments"]
+            if not isinstance(rows, list):
+                return []
+            return [(row.get("id"), row.get("revised_vietnamese"))
+                    for row in rows if isinstance(row, dict)]
+        except (TypeError, ValueError, KeyError, AttributeError):
+            return []
 
     def shorten_translation(
         self,
@@ -1366,7 +1613,7 @@ class GeminiTranslationProvider:
             "detail. Preserve the current Vietnamese pronouns, honorifics, names, and relationship "
             "register; never switch pronoun pair or register merely to save time. Use concise natural spoken Vietnamese; do not summarize away a clause "
             "or add commentary. Keep idioms and slang idiomatic in Vietnamese and never "
-            "regress to literal Chinese calques. Return only the rewritten Vietnamese "
+            "regress to literal Chinese calques. " + _VI_DIALOGUE_CONTINUITY_POLICY + " Return only the rewritten Vietnamese "
             f"line. Aim for at most {target_ratio:.0%} of the measured spoken length; this is a "
             "speech-time target, not a word-count exercise.\n"
             f"Source ({source_language}): {source_text.strip()}\n"
@@ -1381,6 +1628,9 @@ class GeminiTranslationProvider:
         shortened = getattr(response, "text", None)
         if not isinstance(shortened, str) or not shortened.strip():
             raise LocalizationProviderError("Gemini returned empty shortened translation")
+        from buzz.localization.translation import _has_prohibited_dialogue_pronoun
+        if _has_prohibited_dialogue_pronoun(shortened):
+            raise LocalizationProviderError("Gemini used prohibited Vietnamese pronouns while shortening")
         return shortened.strip()
 
     def shorten_translations(
@@ -1452,7 +1702,26 @@ class GeminiTranslationProvider:
         payload_by_id = {item["id"]: item for item in payload_segments}
         accepted = {}
         pending_ids = list(expected_ids)
-        saw_usable_item = False
+
+        def use_verified_originals(reason: str) -> list[str]:
+            """Keep positional alignment when Gemini cannot safely shorten a line.
+
+            The existing Vietnamese translation is the only candidate whose clauses and
+            register have already been reviewed.  It is therefore safer than inventing
+            a local truncation or accepting malformed structured output.  The workflow
+            will measure its TTS duration and apply its normal bounded rate/still-frame
+            recovery rather than silently dropping a segment.
+            """
+            unresolved = list(pending_ids)
+            for identifier in unresolved:
+                accepted[identifier] = payload_by_id[identifier]["current_vietnamese"]
+            logger.warning(
+                "Gemini timing shortening %s; using original verified Vietnamese for %d "
+                "segment(s) and continuing with measured TTS pacing (ids: %s)",
+                reason, len(unresolved), ", ".join(unresolved),
+            )
+            return [accepted[identifier] for identifier in expected_ids]
+
         for validation_attempt in range(2):
             pending_segments = [payload_by_id[identifier] for identifier in pending_ids]
             instructions = (
@@ -1465,7 +1734,7 @@ class GeminiTranslationProvider:
                 "measured_audio_seconds, available_seconds, and target_max_seconds are the timing "
                 "evidence: optimize for actual speech seconds, not word-count estimates. If a line "
                 "is too long, its shortened_text MUST be materially different from current_vietnamese. "
-                "Never omit a source clause or factual detail. "
+                "Never omit a source clause or factual detail. " + _VI_DIALOGUE_CONTINUITY_POLICY + " "
                 "do not add commentary or drop, "
                 "combine, reorder, or split entries. Respect each entry target_word_count "
                 "as a hard maximum and minimum_word_count as a hard minimum. Return JSON only: an object with a "
@@ -1507,8 +1776,17 @@ class GeminiTranslationProvider:
                         "response_mime_type": "application/json",
                         "response_json_schema": response_json_schema,
                     },
+                    # Timing recovery must not sit in an unbounded cooldown loop.
+                    # Try configured alternate models once, then retain reviewed text.
+                    max_rate_limit_cooldown_rounds=0,
                 )
             except Exception as exc:
+                message = str(exc).lower()
+                if any(marker in message for marker in (
+                    "429", "resource_exhausted", "rate-limit", "rate limit",
+                    "cooldown budget", "daily quota",
+                )):
+                    return use_verified_originals("is unavailable due to quota/rate limiting")
                 raise LocalizationProviderError(
                     f"Gemini batch translation shortening failed: {exc}"
                 ) from exc
@@ -1526,11 +1804,6 @@ class GeminiTranslationProvider:
                 for item in items:
                     if isinstance(item, dict) and item.get("id") in pending_ids:
                         occurrences.setdefault(item["id"], []).append(item)
-                # A matching ID means the response can be recovered at the
-                # segment level, even if its text or word count is invalid.
-                # Do not fan a wholly malformed/foreign response out into a
-                # request for every original segment.
-                saw_usable_item = saw_usable_item or bool(occurrences)
                 for identifier in pending_ids:
                     candidates = occurrences.get(identifier, [])
                     if len(candidates) != 1:
@@ -1540,6 +1813,9 @@ class GeminiTranslationProvider:
                         continue
                     shortened = shortened.strip()
                     if not _has_speakable_tts_text(shortened):
+                        continue
+                    from buzz.localization.translation import _has_prohibited_dialogue_pronoun
+                    if _has_prohibited_dialogue_pronoun(shortened):
                         continue
                     if shortened.casefold() == payload_by_id[identifier]["current_vietnamese"].casefold():
                         continue
@@ -1556,18 +1832,10 @@ class GeminiTranslationProvider:
                     len(pending_ids),
                 )
 
-        if not saw_usable_item:
-            raise LocalizationProviderError(
-                "Gemini batch translation shortening returned unusable structured output after retry"
-            )
-
-        for identifier in pending_ids:
-            accepted[identifier] = self._shorten_translation_strict(
-                singleton=payload_by_id[identifier], source_language=source_language,
-                target_word_count=target_word_counts[identifier],
-                minimum_word_count=minimum_word_counts[identifier],
-            )
-        return [accepted[identifier] for identifier in expected_ids]
+        # Two schema-constrained batch attempts are the complete shortening budget.
+        # Do not fan malformed IDs or impossible word bounds into N singleton calls:
+        # that was the quota-amplifying loop seen in long timing recovery runs.
+        return use_verified_originals("returned unresolved structured output after two attempts")
 
     def _shorten_translation_strict(
         self, *, singleton, source_language: str, target_word_count: int,
@@ -1582,7 +1850,8 @@ class GeminiTranslationProvider:
             "exception, relationship, name, number, unit, negation, and key detail; do not summarize "
             "away a clause. Preserve the current Vietnamese pronouns, honorifics, names, and relationship "
             "register; never switch pronoun pair or register merely to save time. Use concise natural spoken Vietnamese. "
-            "Your output MUST contain speakable Vietnamese content: at least one letter or "
+            + _VI_DIALOGUE_CONTINUITY_POLICY
+            + " Your output MUST contain speakable Vietnamese content: at least one letter or "
             "number. Never return punctuation-only text. "
             "Return only the rewritten Vietnamese line, with no JSON, labels, or commentary.\n"
             f"Source ({source_language}): {singleton['source_text']}\n"
@@ -1631,6 +1900,9 @@ class GeminiTranslationProvider:
                     raise ValueError("invalid singleton shortened translation")
                 if not _has_speakable_tts_text(shortened):
                     raise ValueError("shortened translation has no speakable content")
+                from buzz.localization.translation import _has_prohibited_dialogue_pronoun
+                if _has_prohibited_dialogue_pronoun(shortened):
+                    raise ValueError("shortened translation used prohibited Vietnamese pronouns")
                 word_count = len(shortened.split())
                 if word_count > target_word_count:
                     if (best_overlong_word_count is None

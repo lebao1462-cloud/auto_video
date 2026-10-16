@@ -2,18 +2,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import re
 import tempfile
 from typing import Callable
 
-from PyQt6.QtCore import QThread, QTimer, QUrl
+from PyQt6.QtCore import QObject, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
-from PyQt6.QtWidgets import QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QRadioButton, QVBoxLayout, QWidget
 from buzz.settings.settings import Settings
 from buzz.store.keyring_store import Key, get_password, set_password
 from buzz.localization.paraformer import reset_paraformer_model_cache
+from buzz.localization.final_render import (
+    FinalRenderError,
+    refresh_dubbed_portrait_subtitles,
+    subtitle_refresh_output_path,
+)
 from buzz.widgets.localization_dialog import LocalizationWorker
+from buzz.widgets.voice_preview import VoicePreviewControl
 from buzz.localization.voices import TTS_VOICE_CHOICES
 
 MAX_LOCALIZATION_JOBS = 5
@@ -31,9 +38,48 @@ class LocalizationJob:
     thread: QThread | None = None
     blur_bilibili_watermark: bool = True
     overlay_ben_review_logo: bool = True
+    portrait_subtitle_overlay: bool = False
 
 
 _LIVE_LOCALIZATION_JOBS: list[LocalizationJob] = []
+
+
+class SubtitleRefreshWorker(QObject):
+    """A cancellable, isolated refresh of subtitles on an already dubbed part."""
+    progress = pyqtSignal(int, str)
+    completed = pyqtSignal(str)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+    finished = pyqtSignal()
+
+    def __init__(self, source_video: str, subtitle_file: str | None, output_file: str):
+        super().__init__()
+        import threading
+        self.source_video, self.subtitle_file, self.output_file = source_video, subtitle_file, output_file
+        self._cancel_event = threading.Event()
+
+    def request_cancel(self):
+        self._cancel_event.set()
+
+    def run(self):
+        try:
+            self.progress.emit(5, "Dang tao phu de doc de va render lai...")
+            result = refresh_dubbed_portrait_subtitles(
+                self.source_video, self.output_file, subtitle_file=self.subtitle_file,
+                cancel_event=self._cancel_event,
+            )
+            if self._cancel_event.is_set():
+                self.cancelled.emit()
+            else:
+                self.progress.emit(100, "Da render xong phu de moi.")
+                self.completed.emit(result.video_file)
+        except Exception as exc:
+            if self._cancel_event.is_set():
+                self.cancelled.emit()
+            else:
+                self.failed.emit(str(exc))
+        finally:
+            self.finished.emit()
 
 class LocalizationJobRow(QWidget):
     def __init__(self, index: int, parent=None):
@@ -84,34 +130,193 @@ class LocalizationDashboard(QWidget):
         self._build_ui()
     def _build_ui(self):
         default = "D:/AutoVideoOutput" if Path("D:/").exists() else str(Path.home() / "AutoVideoOutput")
-        saved_api_key = get_password(Key.GEMINI_API_KEY) if self._persist_api_key else ""
-        self.api_key_edit = QLineEdit(saved_api_key or "")
+        # Gemini is the only new-job translation path.  GEMINI_MODEL remains
+        # an advanced environment override, while provider fallback stays internal.
+        self._gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+        self.api_key_edit = QLineEdit(
+            get_password(Key.GEMINI_API_KEY) if self._persist_api_key else ""
+        )
+        # Kept as one-item implementation details for compatibility with
+        # callers which inspect the dashboard, but never shown to the user.
+        self.translation_provider_combo = QComboBox()
+        self.translation_provider_combo.addItem("Gemini API", "gemini")
+        self.translation_base_url_edit = QLineEdit()
+        self.translation_model_edit = QLineEdit(self._gemini_model)
+        self.translation_status_label = QLabel()
         self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password); self.api_key_edit.editingFinished.connect(self.save_api_key)
         self.voice_combo = QComboBox()
         for label, value in TTS_VOICE_CHOICES: self.voice_combo.addItem(label, value)
+        self.voice_preview_control = VoicePreviewControl(self.voice_combo, self)
+        voice_row = QWidget(self)
+        voice_row_layout = QHBoxLayout(voice_row)
+        voice_row_layout.setContentsMargins(0, 0, 0, 0)
+        voice_row_layout.addWidget(self.voice_combo, 3)
+        voice_row_layout.addWidget(self.voice_preview_control, 2)
         self.blur_bilibili_watermark_checkbox = QCheckBox("Làm mờ logo Bilibili (góc phải trên)")
         self.blur_bilibili_watermark_checkbox.setChecked(True)
         self.blur_bilibili_watermark_checkbox.setToolTip("Làm mờ và phủ tối nhẹ vùng logo ở góc phải trên.")
         self.overlay_ben_review_logo_checkbox = QCheckBox("Chèn logo Ben review")
         self.overlay_ben_review_logo_checkbox.setChecked(True)
         self.overlay_ben_review_logo_checkbox.setToolTip("Chèn logo Ben review đã duyệt ở góc phải trên.")
+        self.landscape_video_radio = QRadioButton("Video ngang (16:9)")
+        self.portrait_subtitle_overlay_checkbox = QRadioButton("Video dọc (9:16)")
+        self.video_orientation_group = QButtonGroup(self)
+        self.video_orientation_group.addButton(self.landscape_video_radio)
+        self.video_orientation_group.addButton(self.portrait_subtitle_overlay_checkbox)
+        self.landscape_video_radio.setChecked(True)
+        self.portrait_subtitle_overlay_checkbox.setToolTip(
+            "Cho video 9:16; che logo trái trên, cảnh báo dưới và phụ đề Trung 68-71% chiều cao."
+        )
+        orientation_row = QWidget(self)
+        orientation_layout = QHBoxLayout(orientation_row)
+        orientation_layout.setContentsMargins(0, 0, 0, 0)
+        orientation_layout.addWidget(self.landscape_video_radio)
+        orientation_layout.addWidget(self.portrait_subtitle_overlay_checkbox)
+        orientation_layout.addStretch()
+        self.subtitle_refresh_source_edit = QLineEdit()
+        self.subtitle_refresh_srt_edit = QLineEdit()
+        self.subtitle_refresh_source_button = QPushButton("Select dubbed MP4")
+        self.subtitle_refresh_srt_button = QPushButton("Select SRT")
+        self.subtitle_refresh_button = QPushButton("Render lai phu de")
+        self.subtitle_refresh_status = QLabel()
+        self.subtitle_refresh_status.setWordWrap(True)
+        self.subtitle_refresh_source_button.clicked.connect(self.browse_subtitle_refresh_source)
+        self.subtitle_refresh_srt_button.clicked.connect(self.browse_subtitle_refresh_srt)
+        self.subtitle_refresh_button.clicked.connect(self.start_subtitle_refresh)
+        self._subtitle_refresh_worker = None
+        self._subtitle_refresh_thread = None
         self.output_edit = QLineEdit(self._configured_output_directory(default))
         self.output_button = QPushButton("Chọn thư mục"); self.output_button.clicked.connect(self.browse_output)
         self.add_video_button = QPushButton("+ Thêm video"); self.add_video_button.clicked.connect(self.browse_videos)
         output_row = QWidget(); output_layout = QHBoxLayout(output_row); output_layout.setContentsMargins(0, 0, 0, 0); output_layout.addWidget(self.output_edit); output_layout.addWidget(self.output_button)
-        form = QFormLayout(); form.addRow("Gemini API key:", self.api_key_edit); form.addRow("Giọng Việt:", self.voice_combo); form.addRow("Thư mục đầu ra:", output_row)
+        form = QFormLayout()
+        form.addRow("Dịch bằng:", self.translation_provider_combo)
+        form.addRow("", self.translation_status_label)
+        self.translation_base_url_label = QLabel("Translation API base URL:")
+        self.translation_api_key_label = QLabel("Gemini API key:")
+        self.translation_model_label = QLabel("Translation model(s):")
+        self.translation_model_edit.setToolTip(
+            "Một model hoặc danh sách ưu tiên, ngăn cách bằng dấu phẩy. "
+            "Khi hết quota, app sẽ thử model tiếp theo."
+        )
+        form.addRow(self.translation_base_url_label, self.translation_base_url_edit)
+        form.addRow(self.translation_api_key_label, self.api_key_edit)
+        form.addRow(self.translation_model_label, self.translation_model_edit)
+        form.addRow("Giọng Việt:", voice_row)
+        form.addRow("Loại video:", orientation_row)
+        form.addRow("Thư mục đầu ra:", output_row)
         form.addRow("", self.blur_bilibili_watermark_checkbox)
         form.addRow("", self.overlay_ben_review_logo_checkbox)
+        refresh_source_row = QWidget(); refresh_source_layout = QHBoxLayout(refresh_source_row); refresh_source_layout.setContentsMargins(0, 0, 0, 0); refresh_source_layout.addWidget(self.subtitle_refresh_source_edit); refresh_source_layout.addWidget(self.subtitle_refresh_source_button)
+        refresh_srt_row = QWidget(); refresh_srt_layout = QHBoxLayout(refresh_srt_row); refresh_srt_layout.setContentsMargins(0, 0, 0, 0); refresh_srt_layout.addWidget(self.subtitle_refresh_srt_edit); refresh_srt_layout.addWidget(self.subtitle_refresh_srt_button)
+        form.addRow("Dubbed MP4:", refresh_source_row)
+        form.addRow("SRT (optional):", refresh_srt_row)
+        advanced_form = QFormLayout()
+        for widget in (
+            self.translation_provider_combo, self.translation_status_label,
+            self.translation_base_url_edit, self.translation_model_edit,
+            output_row, self.blur_bilibili_watermark_checkbox,
+            self.overlay_ben_review_logo_checkbox, refresh_source_row,
+            refresh_srt_row,
+        ):
+            row = form.takeRow(widget)
+            if widget in {
+                self.translation_provider_combo, self.translation_status_label,
+                self.translation_base_url_edit, self.translation_model_edit,
+            }:
+                continue
+            if row.fieldItem is None:
+                continue
+            field = row.fieldItem.widget()
+            label = row.labelItem.widget() if row.labelItem is not None else None
+            if label is not None:
+                advanced_form.addRow(label, field)
+            else:
+                advanced_form.addRow(field)
+        advanced_form.addRow(self.subtitle_refresh_button)
+        advanced_form.addRow(self.subtitle_refresh_status)
+        self.advanced_options_button = QPushButton("Advanced options")
+        self.advanced_options_button.setCheckable(True)
+        self.advanced_options = QWidget(self)
+        self.advanced_options.setLayout(advanced_form)
+        self.advanced_options.hide()
+        self.advanced_options_button.toggled.connect(self.advanced_options.setVisible)
         self.rows = [LocalizationJobRow(index, self) for index in range(MAX_LOCALIZATION_JOBS)]
         for row in self.rows:
             row.action_button.clicked.connect(lambda _=False, row=row: self.on_row_action(row.index))
             row.retry_button.clicked.connect(lambda _=False, row=row: self.on_retry(row.index))
             row.open_button.clicked.connect(lambda _=False, row=row: self.open_job_output(row.index))
         layout = QVBoxLayout(self); layout.addWidget(QLabel("Dịch & lồng tiếng video")); layout.addLayout(form)
-        pipeline = QLabel("Tự động: Paraformer-zh → Gemini → Edge / VieNeu TTS → đồng bộ tự nhiên → làm mờ phụ đề gốc → phụ đề Việt"); pipeline.setWordWrap(True)
+        pipeline = QLabel("Tự động: Paraformer-zh → dịch thuật → Edge / VieNeu TTS → đồng bộ tự nhiên → làm mờ phụ đề gốc → phụ đề Việt"); pipeline.setWordWrap(True)
         layout.addWidget(pipeline); layout.addWidget(self.add_video_button)
+        layout.addWidget(self.advanced_options_button); layout.addWidget(self.advanced_options)
         for row in self.rows: layout.addWidget(row)
         layout.addStretch()
+
+    def browse_subtitle_refresh_source(self):
+        source, _ = QFileDialog.getOpenFileName(self, "Select dubbed MP4", "", "MP4 Files (*.mp4)")
+        if source:
+            source_path = Path(source)
+            self.subtitle_refresh_source_edit.setText(source)
+            adjacent = source_path.with_suffix(".srt")
+            self.subtitle_refresh_srt_edit.setText(str(adjacent) if adjacent.is_file() else "")
+
+    def browse_subtitle_refresh_srt(self):
+        subtitle, _ = QFileDialog.getOpenFileName(self, "Select Vietnamese subtitles", "", "Subtitle Files (*.srt *.vtt)")
+        if subtitle:
+            self.subtitle_refresh_srt_edit.setText(subtitle)
+
+    def start_subtitle_refresh(self):
+        if self._subtitle_refresh_thread is not None:
+            return
+        source = Path(self.subtitle_refresh_source_edit.text().strip())
+        subtitle_text = self.subtitle_refresh_srt_edit.text().strip()
+        subtitle = Path(subtitle_text) if subtitle_text else source.with_suffix(".srt")
+        output = subtitle_refresh_output_path(source)
+        if not source.is_file() or source.suffix.lower() != ".mp4":
+            self.subtitle_refresh_status.setText("Select an existing dubbed MP4.")
+            return
+        if not subtitle.is_file() or subtitle.suffix.lower() not in {".srt", ".vtt"}:
+            self.subtitle_refresh_status.setText("Select an adjacent or explicit SRT/VTT.")
+            return
+        if output.exists():
+            self.subtitle_refresh_status.setText(f"Refusing to overwrite existing output: {output}")
+            return
+        worker = SubtitleRefreshWorker(str(source), str(subtitle), str(output))
+        thread = QThread()
+        self._subtitle_refresh_worker, self._subtitle_refresh_thread = worker, thread
+        self.subtitle_refresh_button.setText("Cancel subtitle render")
+        self.subtitle_refresh_button.clicked.disconnect()
+        self.subtitle_refresh_button.clicked.connect(self.cancel_subtitle_refresh)
+        worker.moveToThread(thread); thread.started.connect(worker.run)
+        worker.progress.connect(lambda progress, detail: self.subtitle_refresh_status.setText(f"{progress}% - {detail}"))
+        worker.completed.connect(lambda path: self.subtitle_refresh_status.setText(f"Completed: {path}"))
+        worker.failed.connect(lambda error: self.subtitle_refresh_status.setText(f"Failed: {error}"))
+        worker.cancelled.connect(lambda: self.subtitle_refresh_status.setText("Cancelled; partial output removed."))
+        worker.finished.connect(thread.quit); worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._finish_subtitle_refresh)
+        thread.start()
+
+    def cancel_subtitle_refresh(self):
+        if self._subtitle_refresh_worker is not None:
+            self.subtitle_refresh_status.setText("Cancelling subtitle render...")
+            self._subtitle_refresh_worker.request_cancel()
+
+    def _finish_subtitle_refresh(self):
+        thread = self._subtitle_refresh_thread
+        if thread is not None:
+            thread.deleteLater()
+        self._subtitle_refresh_worker = self._subtitle_refresh_thread = None
+        self.subtitle_refresh_button.setText("Render lai phu de")
+        self.subtitle_refresh_button.clicked.disconnect()
+        self.subtitle_refresh_button.clicked.connect(self.start_subtitle_refresh)
+
+    def _translation_configuration_error(self) -> str | None:
+        if not self.api_key_edit.text().strip():
+            return "Vui lòng nhập Gemini API key trước khi thêm video."
+        if not self.translation_model_edit.text().strip():
+            return "Vui lòng nhập model dịch thuật."
+        return None
     def save_api_key(self):
         if not self._persist_api_key:
             return
@@ -138,8 +343,11 @@ class LocalizationDashboard(QWidget):
         configured = str(self.settings.value(
             Settings.Key.LOCALIZATION_OUTPUT_DIRECTORY, ""
         ) or "").strip()
-        if not configured or self._is_writable_directory(Path(configured)):
-            return configured or default
+        if not configured:
+            self.settings.set_value(Settings.Key.LOCALIZATION_OUTPUT_DIRECTORY, default)
+            return default
+        if self._is_writable_directory(Path(configured)):
+            return configured
 
         fallback = Path(default)
         if self._is_writable_directory(fallback):
@@ -157,13 +365,22 @@ class LocalizationDashboard(QWidget):
         )
 
     def add_videos(self, paths):
-        paths = list(paths)
-        retryable = [path for path in paths if any(
-            job and job.source_video == path and job.status in {FAILED, CANCELLED}
-            and job.worker is None and job.thread is None for job in self.jobs
+        # QFileDialog normally returns unique paths, but drag/drop and callers
+        # can submit duplicates.  Canonical paths prevent a second job from
+        # allocating a "-2" output while the first one owns the checkpoint.
+        paths = list(dict.fromkeys(os.path.normcase(str(Path(path).resolve())) for path in paths))
+        existing_by_source = {
+            os.path.normcase(str(Path(job.source_video).resolve())): job
+            for job in self.jobs if job
+        }
+        retryable = [path for path in paths if (
+            (job := existing_by_source.get(path)) is not None
+            and job.status in {FAILED, CANCELLED}
+            and job.worker is None and job.thread is None
         )]
         available = self.jobs.count(None)
-        accepted = retryable + [path for path in paths if path not in retryable][:available]
+        accepted = retryable + [path for path in paths
+                                if path not in retryable and path not in existing_by_source][:available]
         if len(paths) > available: QMessageBox.warning(self, "Hàng đợi video", f"Chỉ có thể có tối đa {MAX_LOCALIZATION_JOBS} video. Đã thêm {len(accepted)} video.")
         if not accepted: return []
         root = self.output_edit.text().strip()
@@ -174,7 +391,8 @@ class LocalizationDashboard(QWidget):
             return []
         self.save_api_key(); self.settings.set_value(Settings.Key.LOCALIZATION_OUTPUT_DIRECTORY, root); added = []
         for path in accepted:
-            retry = next((job for job in self.jobs if job and job.source_video == path
+            retry = next((job for job in self.jobs if job and os.path.normcase(
+                str(Path(job.source_video).resolve())) == path
                           and job.status in {FAILED, CANCELLED}
                           and job.worker is None and job.thread is None), None)
             if retry:
@@ -187,9 +405,11 @@ class LocalizationDashboard(QWidget):
                 path, str(self._job_output_directory(root_path, Path(path))),
                 blur_bilibili_watermark=self.blur_bilibili_watermark_checkbox.isChecked(),
                 overlay_ben_review_logo=self.overlay_ben_review_logo_checkbox.isChecked(),
+                portrait_subtitle_overlay=self.portrait_subtitle_overlay_checkbox.isChecked(),
             )
             self.jobs[self.jobs.index(None)] = job; self.refresh_job(job); added.append(job)
         self.start_next_job(); return added
+
     def _job_output_directory(self, root, source):
         used = {Path(job.output_directory) for job in self.jobs if job}
         pattern = re.compile(rf"{re.escape(source.stem)}(?:-(\d+))?")
@@ -202,10 +422,22 @@ class LocalizationDashboard(QWidget):
         except OSError:
             incomplete = []
         if incomplete:
-            return max(
-                incomplete,
-                key=lambda directory: int(pattern.fullmatch(directory.name).group(1) or 1),
-            )
+            def resume_priority(directory):
+                # A newly created "-2" folder must never win over an earlier
+                # folder with durable part-level checkpoints just by suffix.
+                work = directory / f"{source.stem}_localization_work"
+                progress = 0
+                for part in work.glob("part_[0-9][0-9][0-9][0-9]"):
+                    if ((part / "localization-part-complete.json").is_file()
+                            or (part / "localization-asr-checkpoint.json").is_file()
+                            or (part / "source_localization_work"
+                                / "timing-recovery-checkpoint.json").is_file()
+                            or (part / "source_localization_work"
+                                / "translation-checkpoint.json").is_file()):
+                        progress += 1
+                generation = int(pattern.fullmatch(directory.name).group(1) or 1)
+                return (progress, generation)
+            return max(incomplete, key=resume_priority)
         candidate, suffix = root / source.stem, 2
         while candidate in used or candidate.exists(): candidate = root / f"{source.stem}-{suffix}"; suffix += 1
         return candidate
@@ -216,7 +448,8 @@ class LocalizationDashboard(QWidget):
             self._start_job(job)
 
     def _start_job(self, job):
-        if not self.api_key_edit.text().strip(): job.status, job.detail = FAILED, "Cần Gemini API key để bắt đầu."; self.refresh_job(job); self.start_next_job(); return
+        if error := self._translation_configuration_error():
+            job.status, job.detail = FAILED, error; self.refresh_job(job); self.start_next_job(); return
         try:
             Path(job.output_directory).mkdir(parents=True, exist_ok=True)
         except OSError:
@@ -225,7 +458,7 @@ class LocalizationDashboard(QWidget):
             self._show_output_directory_error(job.output_directory)
             return
         job.status, job.detail, job.progress = PROCESSING, "Đang khởi tạo...", 0; self.active_jobs.append(job); self.refresh_job(job)
-        worker = self.worker_factory(source_video=job.source_video, output_directory=job.output_directory, source_language=None, translation_provider_name="gemini", translation_base_url=None, translation_api_key=self.api_key_edit.text().strip(), translation_model="gemini-3.5-flash-lite", tts_voice=self.voice_combo.currentData(), subtitle_mode="burn", cover_original_subtitles=True, blur_bilibili_watermark=job.blur_bilibili_watermark, overlay_ben_review_logo=job.overlay_ben_review_logo, use_background_separation=False)
+        worker = self.worker_factory(source_video=job.source_video, output_directory=job.output_directory, source_language=None, translation_provider_name="gemini", translation_base_url=None, translation_api_key=self.api_key_edit.text().strip(), translation_model=self._gemini_model, tts_voice=self.voice_combo.currentData(), subtitle_mode="burn", cover_original_subtitles=True, blur_bilibili_watermark=job.blur_bilibili_watermark, overlay_ben_review_logo=job.overlay_ben_review_logo, portrait_subtitle_overlay=job.portrait_subtitle_overlay, use_background_separation=False)
         # This thread has no widget parent.  When a window closes while a job
         # is cancelling, the registry keeps the QObject graph alive until the
         # worker emits ``finished`` and the QThread has actually stopped.
@@ -269,8 +502,8 @@ class LocalizationDashboard(QWidget):
         if (self._shutting_down or not job or job.status not in {FAILED, CANCELLED}
                 or job.worker is not None or job.thread is not None):
             return
-        if not self.api_key_edit.text().strip():
-            QMessageBox.warning(self, "Gemini API key", "Vui lòng nhập Gemini API key trước khi thử lại.")
+        if error := self._translation_configuration_error():
+            QMessageBox.warning(self, "Gemini API key", error)
             return
         output_path = Path(job.output_directory)
         if not output_path.is_dir() or not self._is_writable_directory(output_path):
@@ -295,6 +528,7 @@ class LocalizationDashboard(QWidget):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(target if target.exists() else Path(job.output_directory))))
     def shutdown(self):
         self._shutting_down = True
+        self.cancel_subtitle_refresh()
         for job in tuple(self.active_jobs):
             if job.worker: job.worker.request_cancel()
     def refresh_job(self, job): self.refresh_row(self.jobs.index(job))

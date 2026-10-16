@@ -64,3 +64,7 @@ wheelhouse/
 
 # Checkpoints may include video content and translated personal information
 *checkpoint*.json
+
+# Optional local VieNeu installation and downloaded model snapshots
+.vieneu-venv/
+models/

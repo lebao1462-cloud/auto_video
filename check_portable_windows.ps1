@@ -1,5 +1,6 @@
 # Chay tu thu muc goc cua repository Auto Video.
 # Kiem tra thiet lap, KHONG in API key hoac gia tri bi mat.
+param([switch]$RequireVieNeu)
 $ErrorActionPreference = "Continue"
 $repo = Split-Path -Parent $MyInvocation.MyCommand.Path
 $python = Join-Path $repo ".venv\Scripts\python.exe"
@@ -40,31 +41,43 @@ foreach ($tool in @("ffmpeg.exe", "ffprobe.exe")) {
 
 Write-Host ""
 Write-Host "--- VieNeu isolated runtime (needed for Ngoc Huyen voice) ---"
+if (-not $env:BUZZ_VIENEU_PYTHON) {
+    $candidate = Join-Path $repo ".vieneu-venv\Scripts\python.exe"
+    if (Test-Path $candidate) { $env:BUZZ_VIENEU_PYTHON = $candidate }
+}
+if (-not $env:BUZZ_VIENEU_MODEL_DIR) {
+    $candidate = Join-Path $repo "models\VieNeu-TTS-v3-Turbo\onnx_update"
+    if (Test-Path $candidate) { $env:BUZZ_VIENEU_MODEL_DIR = $candidate }
+}
+if (-not $env:BUZZ_VIENEU_HF_HOME) {
+    $candidate = Join-Path $repo "models\HuggingFace"
+    if (Test-Path $candidate) { $env:BUZZ_VIENEU_HF_HOME = $candidate }
+}
 $viePy = $env:BUZZ_VIENEU_PYTHON
 $vieModel = $env:BUZZ_VIENEU_MODEL_DIR
 $vieHome = $env:BUZZ_VIENEU_HF_HOME
 
 if ([string]::IsNullOrWhiteSpace($viePy) -or -not (Test-Path -LiteralPath $viePy -PathType Leaf)) {
     Write-Host "[MISSING] BUZZ_VIENEU_PYTHON points to an existing Python executable"
-    $missing.Add("VieNeu Python executable")
+    if ($RequireVieNeu) { $missing.Add("VieNeu Python executable") }
 } else {
     & $viePy -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('vieneu') is not None else 1)" 2>$null
     if ($LASTEXITCODE -eq 0) {
         Write-Host "[OK] VieNeu Python and module"
     } else {
         Write-Host "[MISSING] VieNeu Python does not contain module 'vieneu'"
-        $missing.Add("VieNeu module")
+        if ($RequireVieNeu) { $missing.Add("VieNeu module") }
     }
 }
 if ([string]::IsNullOrWhiteSpace($vieModel) -or -not (Test-Path -LiteralPath $vieModel -PathType Container)) {
     Write-Host "[MISSING] BUZZ_VIENEU_MODEL_DIR"
-    $missing.Add("VieNeu ONNX model")
+    if ($RequireVieNeu) { $missing.Add("VieNeu ONNX model") }
 } else {
     Write-Host "[OK] VieNeu ONNX model directory"
 }
 if ([string]::IsNullOrWhiteSpace($vieHome) -or -not (Test-Path -LiteralPath $vieHome -PathType Container)) {
     Write-Host "[MISSING] BUZZ_VIENEU_HF_HOME"
-    $missing.Add("VieNeu HuggingFace cache")
+    if ($RequireVieNeu) { $missing.Add("VieNeu HuggingFace cache") }
 } else {
     Write-Host "[OK] VieNeu HuggingFace cache directory"
 }
@@ -77,6 +90,6 @@ if ($missing.Count -gt 0) {
     exit 2
 }
 
-Write-Host "[OK] Basic runtime and VieNeu environment are present."
+Write-Host "[OK] Mandatory GUI runtime present. VieNeu is optional unless -RequireVieNeu."
 Write-Host "This is NOT an end-to-end media quality or clean-Windows installation test."
 exit 0

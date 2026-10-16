@@ -1,4 +1,5 @@
 import os
+import re
 import threading
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from PyQt6.QtWidgets import (
 )
 
 from buzz.localization.final_render import FinalRenderOptions
+from buzz.localization.subtitles import SubtitleOptions
 from buzz.localization.timing import TimingPolicy
 from buzz.localization.preflight import (
     run_localization_preflight,
@@ -40,10 +42,57 @@ from buzz.localization.workflow import (
     LocalizationWorkflowOptions,
     localize_video,
 )
+from buzz.widgets.voice_preview import VoicePreviewControl
 from buzz.localization.voices import TTS_VOICE_CHOICES, parse_tts_voice
 from buzz.settings.settings import Settings
 from buzz.store.keyring_store import Key, get_password, set_password
 from buzz.transcriber.transcriber import Task, TranscriptionOptions
+
+
+_OPENAI_COMPATIBLE_PROVIDER_DEFAULTS = {
+    "grok": {
+        "base_url": "https://api.x.ai/v1",
+        "model": "grok-4.7",
+        "key": Key.GROK_API_KEY,
+        "environment_key": "XAI_API_KEY",
+        "status": "xAI Grok via its OpenAI-compatible API. Network access and billing may apply.",
+    },
+    "cloudflare": {
+        "base_url": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
+        "model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "key": Key.CLOUDFLARE_API_TOKEN,
+        "environment_key": "CLOUDFLARE_API_TOKEN",
+        "status": "Cloudflare Workers AI. Replace {account_id} in the base URL with your Cloudflare account ID.",
+    },
+    "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "google/gemini-2.5-flash",
+        "key": Key.OPENROUTER_API_KEY,
+        "environment_key": "OPENROUTER_API_KEY",
+        "status": "OpenRouter's OpenAI-compatible API. Choose any supported model ID.",
+    },
+    "mistral": {
+        "base_url": "https://api.mistral.ai/v1",
+        "model": "mistral-small-latest",
+        "key": Key.MISTRAL_API_KEY,
+        "environment_key": "MISTRAL_API_KEY",
+        "status": "Mistral's OpenAI-compatible Chat Completions API.",
+    },
+    "groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "model": "openai/gpt-oss-20b",
+        "key": Key.GROQ_API_KEY,
+        "environment_key": "GROQ_API_KEY",
+        "status": "Groq's OpenAI-compatible API. Free-tier rate limits may apply.",
+    },
+    "openai-compatible": {
+        "base_url": "",
+        "model": "",
+        "key": Key.OPENAI_API_KEY,
+        "environment_key": "BUZZ_TRANSLATION_API_KEY",
+        "status": "Custom OpenAI-compatible endpoint (for example a private Grok gateway).",
+    },
+}
 
 
 class LocalizationWorker(QObject):
@@ -68,6 +117,7 @@ class LocalizationWorker(QObject):
         cover_original_subtitles: bool,
         blur_bilibili_watermark: bool,
         overlay_ben_review_logo: bool = True,
+        portrait_subtitle_overlay: bool = False,
         use_background_separation: bool = False,
     ):
         super().__init__()
@@ -83,6 +133,7 @@ class LocalizationWorker(QObject):
         self.cover_original_subtitles = cover_original_subtitles
         self.blur_bilibili_watermark = blur_bilibili_watermark
         self.overlay_ben_review_logo = overlay_ben_review_logo
+        self.portrait_subtitle_overlay = portrait_subtitle_overlay
         self.use_background_separation = use_background_separation
         self.cancel_event = threading.Event()
 
@@ -95,21 +146,17 @@ class LocalizationWorker(QObject):
     def run(self):
         tts_provider = None
         try:
-            if self.translation_provider_name == "argos":
-                translation_provider = ArgosTranslationProvider()
-            elif self.translation_provider_name == "nllb":
-                translation_provider = NLLBTranslationProvider()
-            elif self.translation_provider_name == "gemini":
-                translation_provider = GeminiTranslationProvider(
-                    api_key=self.translation_api_key,
-                    model=self.translation_model,
-                )
-            else:
-                translation_provider = OpenAICompatibleTranslationProvider(
-                    api_key=self.translation_api_key,
-                    model=self.translation_model,
-                    base_url=self.translation_base_url,
-                )
+            if self.translation_provider_name != "gemini":
+                raise ValueError("Only Gemini translation is supported for new localization jobs.")
+            gemini_models = tuple(
+                part.strip() for part in re.split(r"[,\n\r]+", self.translation_model)
+                if part.strip()
+            )
+            translation_provider = GeminiTranslationProvider(
+                api_key=self.translation_api_key,
+                model=gemini_models[0],
+                rate_limit_fallback_models=gemini_models[1:],
+            )
             tts_provider_name, tts_voice = parse_tts_voice(self.tts_voice)
             tts_provider = (VieNeuTTSProvider(default_voice=tts_voice)
                             if tts_provider_name == "vieneu" else EdgeTTSProvider(
@@ -128,11 +175,16 @@ class LocalizationWorker(QObject):
                     use_background_separation=self.use_background_separation,
                     tts_voice=tts_voice,
                     timing_policy=TimingPolicy(),
+                    subtitle_options=SubtitleOptions(
+                        max_line_length=None if self.portrait_subtitle_overlay else 42,
+                        max_lines=1 if self.portrait_subtitle_overlay else 2,
+                    ),
                     render_options=FinalRenderOptions(
                         subtitle_mode=self.subtitle_mode,
                         cover_original_subtitles=self.cover_original_subtitles,
                         blur_bilibili_watermark=self.blur_bilibili_watermark,
                         overlay_ben_review_logo=self.overlay_ben_review_logo,
+                        portrait_subtitle_overlay=self.portrait_subtitle_overlay,
                     ),
                 ),
                 progress_callback=self._on_progress,
@@ -155,7 +207,7 @@ class LocalizationDialog(QDialog):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("Dịch & lồng tiếng video")
-        self.resize(640, 360)
+        self.resize(640, 520)
         self.worker_thread: QThread | None = None
         self.worker: LocalizationWorker | None = None
 
@@ -181,17 +233,27 @@ class LocalizationDialog(QDialog):
             "Gemini API - Online / Optional", "gemini"
         )
         self.translation_provider_combo.addItem(
+            "Grok / xAI - Online", "grok"
+        )
+        self.translation_provider_combo.addItem(
+            "Cloudflare Workers AI - Online", "cloudflare"
+        )
+        self.translation_provider_combo.addItem(
+            "OpenRouter - Online", "openrouter"
+        )
+        self.translation_provider_combo.addItem(
+            "Mistral API - Online", "mistral"
+        )
+        self.translation_provider_combo.addItem(
+            "Groq - Online / Free tier", "groq"
+        )
+        self.translation_provider_combo.addItem(
             "OpenAI-compatible - Advanced", "openai-compatible"
         )
-        # Simple product UI: Gemini is the fixed translation provider.
-        self.translation_provider_combo.setCurrentIndex(
-            self.translation_provider_combo.findData("gemini")
-        )
+        self.translation_provider_combo.clear()
+        self.translation_provider_combo.addItem("Gemini API", "gemini")
         self.translation_provider_status = QLabel()
 
-        self.base_url_edit = QLineEdit(
-            os.getenv("BUZZ_TRANSLATION_API_BASE_URL", "")
-        )
         self._translation_api_keys = {
             "gemini": (
                 os.getenv("GEMINI_API_KEY")
@@ -199,11 +261,10 @@ class LocalizationDialog(QDialog):
                 or get_password(Key.GEMINI_API_KEY)
                 or ""
             ),
-            "openai-compatible": (
-                os.getenv("BUZZ_TRANSLATION_API_KEY")
-                or get_password(Key.OPENAI_API_KEY)
-                or ""
-            ),
+        }
+        self._translation_base_urls = {}
+        self._translation_models = {
+            "gemini": os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
         }
         self._active_translation_provider = (
             self.translation_provider_combo.currentData()
@@ -217,9 +278,18 @@ class LocalizationDialog(QDialog):
         self.api_key_edit.editingFinished.connect(
             self._save_current_api_key
         )
-        self.translation_model_edit = QLineEdit("gemini-3.5-flash-lite")
+        self.base_url_edit = QLineEdit(
+            self._translation_base_urls.get(self._active_translation_provider, "")
+        )
+        self.translation_model_edit = QLineEdit(
+            self._translation_models.get(self._active_translation_provider, "")
+        )
         self.translation_model_edit.editingFinished.connect(
             self._normalize_translation_model
+        )
+        self.translation_model_edit.setToolTip(
+            "Một model hoặc danh sách ưu tiên, ngăn cách bằng dấu phẩy. "
+            "Khi hết quota, app sẽ thử model tiếp theo."
         )
 
         self.language_combo = QComboBox()
@@ -229,6 +299,13 @@ class LocalizationDialog(QDialog):
         self.voice_combo = QComboBox()
         for label, value in TTS_VOICE_CHOICES:
             self.voice_combo.addItem(label, value)
+
+        self.voice_preview_control = VoicePreviewControl(self.voice_combo, self)
+        voice_row = QWidget(self)
+        voice_row_layout = QHBoxLayout(voice_row)
+        voice_row_layout.setContentsMargins(0, 0, 0, 0)
+        voice_row_layout.addWidget(self.voice_combo, 3)
+        voice_row_layout.addWidget(self.voice_preview_control, 2)
 
         self.subtitle_mode_combo = QComboBox()
         self.subtitle_mode_combo.addItem("Soft subtitle", "soft")
@@ -261,6 +338,15 @@ class LocalizationDialog(QDialog):
             "Adds the approved Ben review logo at the upper-right of the output video."
         )
 
+        self.portrait_subtitle_overlay_checkbox = QCheckBox(
+            "Phim dọc: phụ đề Việt 1 dòng đè lên chữ Trung (làm mờ 3 vùng)"
+        )
+        self.portrait_subtitle_overlay_checkbox.setChecked(False)
+        self.portrait_subtitle_overlay_checkbox.setToolTip(
+            "Dành cho video 9:16: làm mờ watermark trên trái, cảnh báo dưới, "
+            "và phụ đề Trung ở độ cao 68-71%, rồi ghi phụ đề Việt tại đó."
+        )
+
         self.background_checkbox = QCheckBox(
             "Separate original vocals and preserve background/music (Demucs)"
         )
@@ -277,18 +363,21 @@ class LocalizationDialog(QDialog):
 
         form = QFormLayout()
         form.addRow("Video:", source_row)
+        form.addRow("Translation provider:", self.translation_provider_combo)
+        self.translation_provider_status.setWordWrap(True)
+        form.addRow("", self.translation_provider_status)
         self.base_url_label = QLabel("Translation API base URL:")
-        self.api_key_label = QLabel("Gemini API key:")
-        self.translation_model_label = QLabel("Translation model:")
-        self.api_key_edit.setPlaceholderText("Nhập Gemini API key")
+        form.addRow(self.base_url_label, self.base_url_edit)
+        self.api_key_label = QLabel("Translation API key:")
+        self.translation_model_label = QLabel("Translation model(s):")
         form.addRow(self.api_key_label, self.api_key_edit)
-        form.addRow("Giọng Việt:", self.voice_combo)
+        form.addRow(self.translation_model_label, self.translation_model_edit)
+        form.addRow("Giọng Việt:", voice_row)
         form.addRow("", self.blur_bilibili_watermark_checkbox)
         form.addRow("", self.overlay_ben_review_logo_checkbox)
+        form.addRow("", self.portrait_subtitle_overlay_checkbox)
 
-        pipeline_label = QLabel(
-            "Tự động: Paraformer-zh → Gemini → Edge / VieNeu TTS → phụ đề Việt"
-        )
+        pipeline_label = QLabel("Tự động: Paraformer-zh → dịch thuật → Edge / VieNeu TTS → phụ đề Việt")
         pipeline_label.setWordWrap(True)
         form.addRow("", pipeline_label)
 
@@ -313,6 +402,11 @@ class LocalizationDialog(QDialog):
         )
         self._on_translation_provider_changed()
         self._on_subtitle_mode_changed()
+        # The legacy dialog retains source/start controls, but Gemini is fixed.
+        self.translation_provider_combo.hide()
+        self.translation_provider_status.hide()
+        self.translation_model_label.hide()
+        self.translation_model_edit.hide()
 
     @staticmethod
     def _path_row(edit: QLineEdit, callback) -> QWidget:
@@ -357,8 +451,11 @@ class LocalizationDialog(QDialog):
 
     def _normalize_translation_model(self):
         if self.translation_provider_combo.currentData() == "gemini":
-            normalized = normalize_gemini_model_name(
-                self.translation_model_edit.text()
+            normalized = ", ".join(
+                value for value in (
+                    normalize_gemini_model_name(item)
+                    for item in re.split(r"[,\n\r]+", self.translation_model_edit.text())
+                ) if value
             )
             if normalized:
                 self.translation_model_edit.setText(normalized)
@@ -366,14 +463,10 @@ class LocalizationDialog(QDialog):
     def _save_current_api_key(self):
         provider = self.translation_provider_combo.currentData()
         api_key = self.api_key_edit.text().strip()
-        if provider not in {"gemini", "openai-compatible"} or not api_key:
+        if provider not in {"gemini", *_OPENAI_COMPATIBLE_PROVIDER_DEFAULTS} or not api_key:
             return
         self._translation_api_keys[provider] = api_key
-        key = (
-            Key.GEMINI_API_KEY
-            if provider == "gemini"
-            else Key.OPENAI_API_KEY
-        )
+        key = Key.GEMINI_API_KEY if provider == "gemini" else _OPENAI_COMPATIBLE_PROVIDER_DEFAULTS[provider]["key"]
         try:
             set_password(key, api_key)
         except Exception:
@@ -384,23 +477,27 @@ class LocalizationDialog(QDialog):
         provider = self.translation_provider_combo.currentData()
         previous = getattr(self, "_active_translation_provider", None)
         if hasattr(self, "api_key_edit") and previous != provider:
-            if previous in {"gemini", "openai-compatible"}:
+            if previous in {"gemini", *_OPENAI_COMPATIBLE_PROVIDER_DEFAULTS}:
                 self._translation_api_keys[previous] = (
                     self.api_key_edit.text().strip()
                 )
+                self._translation_base_urls[previous] = self.base_url_edit.text().strip()
+                self._translation_models[previous] = self.translation_model_edit.text().strip()
             self.api_key_edit.setText(
                 self._translation_api_keys.get(provider, "")
             )
+            self.base_url_edit.setText(self._translation_base_urls.get(provider, ""))
+            self.translation_model_edit.setText(self._translation_models.get(provider, ""))
             self._active_translation_provider = provider
 
         is_offline = provider in {"argos", "nllb"}
         is_argos = provider == "argos"
         is_nllb = provider == "nllb"
         is_gemini = provider == "gemini"
-        is_openai = provider == "openai-compatible"
+        is_openai_compatible = provider in _OPENAI_COMPATIBLE_PROVIDER_DEFAULTS
 
-        self.base_url_label.setVisible(is_openai)
-        self.base_url_edit.setVisible(is_openai)
+        self.base_url_label.setVisible(is_openai_compatible)
+        self.base_url_edit.setVisible(is_openai_compatible)
         self.api_key_label.setVisible(not is_offline)
         self.api_key_edit.setVisible(not is_offline)
         self.translation_model_label.setVisible(not is_offline)
@@ -424,8 +521,14 @@ class LocalizationDialog(QDialog):
                 )
         else:
             self.translation_provider_status.setText(
-                "Advanced OpenAI-compatible endpoint."
+                _OPENAI_COMPATIBLE_PROVIDER_DEFAULTS[provider]["status"]
             )
+        self.api_key_label.setText(
+            "Gemini API key:" if is_gemini else "Translation API key:"
+        )
+        self.api_key_edit.setPlaceholderText(
+            "Nhập Gemini API key" if is_gemini else "Nhập API key / token"
+        )
 
         self.settings.set_value(
             Settings.Key.LOCALIZATION_TRANSLATION_PROVIDER,
@@ -443,11 +546,16 @@ class LocalizationDialog(QDialog):
                 return "Gemini API key is required."
             if not self.translation_model_edit.text().strip():
                 return "Gemini model is required."
-        elif provider == "openai-compatible":
+        elif provider in _OPENAI_COMPATIBLE_PROVIDER_DEFAULTS:
             if not self.api_key_edit.text().strip():
                 return "Translation API key is required."
             if not self.translation_model_edit.text().strip():
                 return "Translation model is required."
+            base_url = self.base_url_edit.text().strip()
+            if not base_url:
+                return "Translation API base URL is required."
+            if provider == "cloudflare" and "{account_id}" in base_url:
+                return "Replace {account_id} in the Cloudflare API base URL."
         return None
 
     def start_localization(self):
@@ -513,6 +621,7 @@ class LocalizationDialog(QDialog):
             ),
             blur_bilibili_watermark=self.blur_bilibili_watermark_checkbox.isChecked(),
             overlay_ben_review_logo=self.overlay_ben_review_logo_checkbox.isChecked(),
+            portrait_subtitle_overlay=(self.portrait_subtitle_overlay_checkbox.isChecked() and self.subtitle_mode_combo.currentData() == "burn"),
             use_background_separation=self.background_checkbox.isChecked(),
         )
         self.worker.moveToThread(self.worker_thread)
