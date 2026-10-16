@@ -16,12 +16,13 @@ Mở **PowerShell** tại thư mục bạn muốn đặt Auto Video:
 ```powershell
 git clone https://github.com/lebao1462-cloud/auto_video.git
 cd auto_video
+git switch setup/windows-portable-20261016
 .\setup_windows.bat
 .\check_portable_windows.ps1
 .\start_auto_video.bat
 ```
 
-Đối với nhánh chuẩn bị di chuyển máy này, dùng `git switch setup/windows-portable-20261016` sau `cd auto_video` nếu muốn thử các công cụ mới; nhánh `master` có thể chưa có chúng. Nếu chính sách Windows chặn PowerShell script, thay bằng:
+Nhánh `setup/windows-portable-20261016` hiện mới bao gồm phần chuẩn bị cài đặt; nhánh `master` chưa đồng bộ bản mã nguồn mới nhất từ máy gốc. Nếu chính sách Windows chặn PowerShell script, thay bằng:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\check_portable_windows.ps1
