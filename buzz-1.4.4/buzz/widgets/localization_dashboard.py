@@ -22,6 +22,8 @@ from buzz.localization.final_render import (
 from buzz.widgets.localization_dialog import LocalizationWorker
 from buzz.widgets.voice_preview import VoicePreviewControl
 from buzz.localization.voices import TTS_VOICE_CHOICES
+from buzz.localization.logo_mask import LogoMaskConfig
+from buzz.widgets.logo_mask_editor import LogoMaskEditorDialog
 
 MAX_LOCALIZATION_JOBS = 5
 MEDIA_FILTER = "Media Files (*.mp4 *.mkv *.mov *.avi *.webm *.m4v);;All Files (*)"
@@ -39,6 +41,7 @@ class LocalizationJob:
     blur_bilibili_watermark: bool = True
     overlay_ben_review_logo: bool = True
     portrait_subtitle_overlay: bool = False
+    logo_mask_config: LogoMaskConfig = LogoMaskConfig()
 
 
 _LIVE_LOCALIZATION_JOBS: list[LocalizationJob] = []
@@ -154,6 +157,16 @@ class LocalizationDashboard(QWidget):
         voice_row_layout.addWidget(self.voice_preview_control, 2)
         self.blur_bilibili_watermark_checkbox = QCheckBox("Làm mờ logo Bilibili (góc phải trên)")
         self.blur_bilibili_watermark_checkbox.setChecked(True)
+        self.logo_mask_config = LogoMaskConfig()
+        self.logo_mask_target_combo = QComboBox()
+        self.logo_mask_target_combo.addItem("Mặc định cho video mới", None)
+        self.logo_mask_button = QPushButton("Tùy chỉnh vùng che logo...")
+        self.logo_mask_button.clicked.connect(self.edit_logo_masks)
+        logo_mask_row = QWidget(self)
+        logo_mask_layout = QHBoxLayout(logo_mask_row)
+        logo_mask_layout.setContentsMargins(0, 0, 0, 0)
+        logo_mask_layout.addWidget(self.logo_mask_target_combo, 1)
+        logo_mask_layout.addWidget(self.logo_mask_button)
         self.blur_bilibili_watermark_checkbox.setToolTip("Làm mờ và phủ tối nhẹ vùng logo ở góc phải trên.")
         self.overlay_ben_review_logo_checkbox = QCheckBox("Chèn logo Ben review")
         self.overlay_ben_review_logo_checkbox.setChecked(True)
@@ -206,6 +219,7 @@ class LocalizationDashboard(QWidget):
         form.addRow("Loại video:", orientation_row)
         form.addRow("Thư mục đầu ra:", output_row)
         form.addRow("", self.blur_bilibili_watermark_checkbox)
+        form.addRow("", logo_mask_row)
         form.addRow("", self.overlay_ben_review_logo_checkbox)
         refresh_source_row = QWidget(); refresh_source_layout = QHBoxLayout(refresh_source_row); refresh_source_layout.setContentsMargins(0, 0, 0, 0); refresh_source_layout.addWidget(self.subtitle_refresh_source_edit); refresh_source_layout.addWidget(self.subtitle_refresh_source_button)
         refresh_srt_row = QWidget(); refresh_srt_layout = QHBoxLayout(refresh_srt_row); refresh_srt_layout.setContentsMargins(0, 0, 0, 0); refresh_srt_layout.addWidget(self.subtitle_refresh_srt_edit); refresh_srt_layout.addWidget(self.subtitle_refresh_srt_button)
@@ -215,7 +229,7 @@ class LocalizationDashboard(QWidget):
         for widget in (
             self.translation_provider_combo, self.translation_status_label,
             self.translation_base_url_edit, self.translation_model_edit,
-            output_row, self.blur_bilibili_watermark_checkbox,
+            output_row, self.blur_bilibili_watermark_checkbox, logo_mask_row,
             self.overlay_ben_review_logo_checkbox, refresh_source_row,
             refresh_srt_row,
         ):
@@ -252,6 +266,63 @@ class LocalizationDashboard(QWidget):
         layout.addWidget(self.advanced_options_button); layout.addWidget(self.advanced_options)
         for row in self.rows: layout.addWidget(row)
         layout.addStretch()
+
+    def edit_logo_masks(self):
+        job = self.logo_mask_target_combo.currentData()
+        # Only a waiting job is editable.  PROCESSING jobs already own a
+        # worker snapshot and must never be mutated through this UI.
+        if job is not None and job.status != WAITING:
+            self._refresh_logo_mask_targets()
+            return
+        config = job.logo_mask_config if job is not None else self.logo_mask_config
+        source = job.source_video if job is not None else None
+        dialog = LogoMaskEditorDialog(config, self, source_video=source)
+        if dialog.exec():
+            if job is None:
+                self.logo_mask_config = dialog.config
+            elif job.status == WAITING:
+                job.logo_mask_config = dialog.config
+                self.refresh_job(job)
+
+    def _refresh_logo_mask_targets(self):
+        selected = self.logo_mask_target_combo.currentData()
+        self.logo_mask_target_combo.blockSignals(True)
+        self.logo_mask_target_combo.clear()
+        self.logo_mask_target_combo.addItem("Mặc định cho video mới", None)
+        for index, job in enumerate(self.jobs):
+            if job is not None and job.status == WAITING:
+                self.logo_mask_target_combo.addItem(
+                    f"Video đang chờ {index + 1}: {Path(job.source_video).name}", job
+                )
+        for index in range(self.logo_mask_target_combo.count()):
+            if self.logo_mask_target_combo.itemData(index) is selected:
+                self.logo_mask_target_combo.setCurrentIndex(index)
+                break
+        self.logo_mask_target_combo.blockSignals(False)
+
+    @staticmethod
+    def _mask_snapshot_path(job: LocalizationJob) -> Path:
+        return Path(job.output_directory) / "logo-mask-config.json"
+
+    def _write_logo_mask_snapshot(self, job: LocalizationJob) -> None:
+        """Persist the exact per-job snapshot without touching ASR/TTS state."""
+        # Do not create a new file for a legacy job.  Apart from avoiding
+        # needless state in old output folders, some resume paths deliberately
+        # use an empty directory as their checkpoint sentinel.
+        if job.logo_mask_config.mode != "custom":
+            return
+        path = self._mask_snapshot_path(job)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(job.logo_mask_config.to_json() + "\n", encoding="utf-8")
+
+    def _read_logo_mask_snapshot(self, output_directory: Path) -> LogoMaskConfig:
+        path = output_directory / "logo-mask-config.json"
+        if not path.is_file():
+            return self.logo_mask_config
+        try:
+            return LogoMaskConfig.from_json(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return LogoMaskConfig()
 
     def browse_subtitle_refresh_source(self):
         source, _ = QFileDialog.getOpenFileName(self, "Select dubbed MP4", "", "MP4 Files (*.mp4)")
@@ -401,13 +472,16 @@ class LocalizationDashboard(QWidget):
                 continue
             if self.jobs.count(None) == 0:
                 continue
+            job_output = self._job_output_directory(root_path, Path(path))
             job = LocalizationJob(
-                path, str(self._job_output_directory(root_path, Path(path))),
+                path, str(job_output),
                 blur_bilibili_watermark=self.blur_bilibili_watermark_checkbox.isChecked(),
+                logo_mask_config=self._read_logo_mask_snapshot(job_output),
                 overlay_ben_review_logo=self.overlay_ben_review_logo_checkbox.isChecked(),
                 portrait_subtitle_overlay=self.portrait_subtitle_overlay_checkbox.isChecked(),
             )
             self.jobs[self.jobs.index(None)] = job; self.refresh_job(job); added.append(job)
+        self._refresh_logo_mask_targets()
         self.start_next_job(); return added
 
     def _job_output_directory(self, root, source):
@@ -457,8 +531,9 @@ class LocalizationDashboard(QWidget):
             self.refresh_job(job)
             self._show_output_directory_error(job.output_directory)
             return
-        job.status, job.detail, job.progress = PROCESSING, "Đang khởi tạo...", 0; self.active_jobs.append(job); self.refresh_job(job)
-        worker = self.worker_factory(source_video=job.source_video, output_directory=job.output_directory, source_language=None, translation_provider_name="gemini", translation_base_url=None, translation_api_key=self.api_key_edit.text().strip(), translation_model=self._gemini_model, tts_voice=self.voice_combo.currentData(), subtitle_mode="burn", cover_original_subtitles=True, blur_bilibili_watermark=job.blur_bilibili_watermark, overlay_ben_review_logo=job.overlay_ben_review_logo, portrait_subtitle_overlay=job.portrait_subtitle_overlay, use_background_separation=False)
+        job.status, job.detail, job.progress = PROCESSING, "Đang khởi tạo...", 0; self.active_jobs.append(job); self.refresh_job(job); self._refresh_logo_mask_targets()
+        self._write_logo_mask_snapshot(job)
+        worker = self.worker_factory(source_video=job.source_video, output_directory=job.output_directory, source_language=None, translation_provider_name="gemini", translation_base_url=None, translation_api_key=self.api_key_edit.text().strip(), translation_model=self._gemini_model, tts_voice=self.voice_combo.currentData(), subtitle_mode="burn", cover_original_subtitles=True, blur_bilibili_watermark=job.blur_bilibili_watermark, logo_mask_config=job.logo_mask_config, overlay_ben_review_logo=job.overlay_ben_review_logo, portrait_subtitle_overlay=job.portrait_subtitle_overlay, use_background_separation=False)
         # This thread has no widget parent.  When a window closes while a job
         # is cancelling, the registry keeps the QObject graph alive until the
         # worker emits ``finished`` and the QThread has actually stopped.

@@ -8,6 +8,7 @@ from typing import Callable
 
 from buzz.localization.audio_mix import AudioMixingCancelled, _run_ffmpeg
 from buzz.localization.subtitles import SubtitleGenerationError, split_portrait_cue
+from buzz.localization.logo_mask import LogoMaskConfig
 
 
 class FinalRenderError(RuntimeError):
@@ -36,8 +37,11 @@ class FinalRenderOptions:
     bilibili_watermark_height_ratio: float = 0.15
     bilibili_watermark_blur_radius: int = 24
     bilibili_watermark_dark_opacity: float = 0.18
+    logo_mask_config: LogoMaskConfig = LogoMaskConfig()
 
     def __post_init__(self):
+        if not isinstance(self.logo_mask_config, LogoMaskConfig):
+            raise TypeError("logo_mask_config must be a LogoMaskConfig")
         if self.subtitle_mode not in {"soft", "burn", "none"}:
             raise ValueError("subtitle_mode must be 'soft', 'burn', or 'none'")
         if self.portrait_subtitle_overlay and self.subtitle_mode != "burn":
@@ -134,6 +138,10 @@ def build_bilibili_watermark_filter_graph(
     """Return an FFmpeg graph that blurs and lightly darkens the Bilibili region."""
     if not isinstance(options, FinalRenderOptions):
         raise TypeError("options must be FinalRenderOptions")
+    if options.logo_mask_config.mode == "custom":
+        return build_custom_logo_mask_filter_graph(
+            options.logo_mask_config, input_label=input_label, output_label=output_label
+        )
     x = options.bilibili_watermark_x_ratio
     y = options.bilibili_watermark_y_ratio
     width = options.bilibili_watermark_width_ratio
@@ -151,6 +159,47 @@ def build_bilibili_watermark_filter_graph(
         f"color=black@{options.bilibili_watermark_dark_opacity:.2f}:t=fill"
         f"[{output_label}]"
     )
+
+
+def build_custom_logo_mask_filter_graph(
+    config: LogoMaskConfig, *, input_label: str = "0:v", output_label: str = "vout",
+) -> str:
+    """Build deterministic split/crop/blur/overlay stages for custom regions.
+
+    Coordinates remain FFmpeg expressions relative to the actual decoded frame,
+    so the same graph works for landscape, portrait, rotation-normalized input,
+    and preview clips.  The model has already rejected unsafe/non-finite input.
+    """
+    if not isinstance(config, LogoMaskConfig) or config.mode != "custom":
+        raise ValueError("custom logo mask graph requires a custom LogoMaskConfig")
+    current = input_label
+    regions = config.enabled_regions
+    if not regions:
+        return f"[{input_label}]null[{output_label}]"
+    stages: list[str] = []
+    for index, region in enumerate(regions):
+        base, src, blur, over = (f"mask_{index}_base", f"mask_{index}_src",
+                                 f"mask_{index}_blur", f"mask_{index}_over")
+        # max(2,...) avoids FFmpeg's invalid zero/one-pixel crops at tiny sizes.
+        stages.extend([
+            f"[{current}]split=2[{base}][{src}]",
+            # Crop dimensions and origin are clamped together.  This keeps a
+            # two-pixel crop valid even for a tiny region against an edge.
+            f"[{src}]crop=w=max(2\\,iw*{region.w:.6f}):h=max(2\\,ih*{region.h:.6f}):"
+            f"x=min(iw*{region.x:.6f}\\,iw-2):y=min(ih*{region.y:.6f}\\,ih-2),"
+            # boxblur requires a radius *strictly* below half the smaller
+            # cropped dimension.  A 2x2 crop therefore deliberately gets a
+            # zero radius, which is valid and keeps edge masks renderable.
+            # This is evaluated after crop, where w/h are crop pixels.
+            f"boxblur=luma_radius=max(0\\,min({region.blur_radius}\\,(min(w\\,h)-2)/2)):"
+            # On yuv420 inputs chroma is half-resolution, so it needs its
+            # own stricter bound instead of boxblur's invalid derived radius.
+            f"chroma_radius=max(0\\,min({region.blur_radius}\\,(min(w\\,h)-2)/4)):luma_power=2[{blur}]",
+            f"[{base}][{blur}]overlay=x=min(W*{region.x:.6f}\\,W-2):y=min(H*{region.y:.6f}\\,H-2)[{over}]",
+        ])
+        current = over
+    stages.append(f"[{current}]null[{output_label}]")
+    return ";".join(stages)
 
 
 
@@ -284,6 +333,34 @@ def build_portrait_subtitle_filter_graph(
         "w=iw*0.90:h=ih*0.06:color=black@0.16:t=fill,"
         f"subtitles='{escaped_subtitle}':force_style="
         f"'Alignment=5,MarginV=0,FontSize=32,Outline=2,Shadow=0,WrapStyle=2'"
+        f"[{out_label}]"
+    )
+    if overlay_logo:
+        graph += ";" + build_ben_review_logo_filter_graph(
+            input_label=out_label, logo_input_label="2:v"
+        )
+    return graph
+
+
+def build_portrait_dialogue_filter_graph(
+    escaped_subtitle: str, *, input_label: str, overlay_logo: bool = False,
+) -> str:
+    """The unchanged portrait dialogue/subtitle stage, without legacy corners.
+
+    Custom masks run before this graph.  Keep the geometry and ASS style in
+    lockstep with ``build_portrait_subtitle_filter_graph``.
+    """
+    out_label = "portrait_subtitle_burned" if overlay_logo else "vout"
+    graph = (
+        f"[{input_label}]split=2[portrait_dialogue_base][portrait_dialogue_src];"
+        "[portrait_dialogue_src]crop=iw*0.90:ih*0.06:iw*0.05:ih*0.655,"
+        "boxblur=luma_radius=22:luma_power=2[portrait_dialogue_blur];"
+        "[portrait_dialogue_base][portrait_dialogue_blur]"
+        "overlay=x=W*0.05:y=H*0.655[portrait_dialogue_done];"
+        "[portrait_dialogue_done]drawbox=x=iw*0.05:y=ih*0.655:"
+        "w=iw*0.90:h=ih*0.06:color=black@0.16:t=fill,"
+        f"subtitles='{escaped_subtitle}':force_style="
+        "'Alignment=5,MarginV=0,FontSize=32,Outline=2,Shadow=0,WrapStyle=2'"
         f"[{out_label}]"
     )
     if overlay_logo:
@@ -535,6 +612,7 @@ def render_localized_mp4(
 
     subtitle_included = False
     portrait_ass_path: Path | None = None
+    custom_mask_mode = render_options.logo_mask_config.mode == "custom"
 
     if render_options.subtitle_mode == "soft":
         assert subtitle_path is not None
@@ -594,9 +672,23 @@ def render_localized_mp4(
         if render_options.portrait_subtitle_overlay:
             portrait_ass_path = _portrait_one_line_ass(subtitle_path, output_path.parent)
             escaped_subtitle = _escape_subtitle_filter_path(portrait_ass_path)
-            filter_complex = build_portrait_subtitle_filter_graph(
-                escaped_subtitle, overlay_logo=logo_path is not None,
-            )
+            if custom_mask_mode:
+                logo_stage = (
+                    build_bilibili_watermark_filter_graph(
+                        render_options, output_label="custom_logo_ready"
+                    ) if render_options.blur_bilibili_watermark
+                    else "[0:v]null[custom_logo_ready]"
+                )
+                filter_complex = logo_stage + ";" + build_portrait_dialogue_filter_graph(
+                    escaped_subtitle, input_label="custom_logo_ready",
+                    overlay_logo=logo_path is not None,
+                )
+            else:
+                # Legacy graph intentionally remains unchanged, including the
+                # two portrait corner covers and the dialogue band.
+                filter_complex = build_portrait_subtitle_filter_graph(
+                    escaped_subtitle, overlay_logo=logo_path is not None,
+                )
             command.extend(["-filter_complex", filter_complex])
             video_map = "[vout]"
             video_filter = None
