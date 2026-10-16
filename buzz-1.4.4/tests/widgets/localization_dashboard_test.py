@@ -8,6 +8,8 @@ from PyQt6.QtWidgets import QApplication
 
 from buzz.settings.settings import Settings as RealSettings
 from buzz.store.keyring_store import Key
+from buzz.localization.logo_mask import LogoMaskConfig, LogoMaskRegion
+from buzz.widgets.logo_mask_editor import LogoMaskEditorDialog
 from buzz.widgets.localization_dashboard import (
     CANCELLED, COMPLETED, FAILED, PROCESSING, WAITING, LocalizationDashboard, LocalizationJob,
 )
@@ -259,6 +261,64 @@ def test_logo_choice_is_snapshotted_when_a_job_is_added(qtbot, tmp_path):
     assert job.worker.kwargs["overlay_ben_review_logo"] is False
     view.shutdown()
     finish(qtbot, job.worker, job)
+
+
+def test_logo_mask_snapshot_does_not_create_a_legacy_file_but_keeps_custom_snapshot(qtbot, tmp_path):
+    view = dashboard(qtbot, tmp_path)
+    directory = tmp_path / "job"
+    legacy = LocalizationJob("source.mp4", str(directory))
+    view._write_logo_mask_snapshot(legacy)
+    assert not (directory / "logo-mask-config.json").exists()
+    custom = LocalizationJob("source.mp4", str(directory), logo_mask_config=LogoMaskConfig(
+        mode="custom", regions=(LogoMaskRegion("one", "One", True, .1, .1, .2, .2, 8),)
+    ))
+    view._write_logo_mask_snapshot(custom)
+    assert view._read_logo_mask_snapshot(directory) == custom.logo_mask_config
+
+
+def test_logo_mask_mode_and_preview_radio_groups_are_independent(qtbot):
+    dialog = LogoMaskEditorDialog(LogoMaskConfig(mode="custom"))
+    qtbot.add_widget(dialog)
+
+    dialog.filtered_button.setChecked(True)
+    assert dialog.custom_radio.isChecked()
+
+    dialog.legacy_radio.setChecked(True)
+    assert dialog.original_button.isChecked()
+
+
+def test_waiting_jobs_can_keep_independent_logo_masks_without_mutating_active_snapshot(
+        qtbot, tmp_path, monkeypatch):
+    view = dashboard(qtbot, tmp_path)
+    first = LocalizationJob("first.mp4", str(tmp_path / "first"), status=WAITING,
+                            portrait_subtitle_overlay=True)
+    second = LocalizationJob("second.mp4", str(tmp_path / "second"), status=WAITING)
+    active_config = LogoMaskConfig(mode="custom", regions=(
+        LogoMaskRegion("active", "Active", True, .1, .1, .2, .2, 8),
+    ))
+    active = LocalizationJob("active.mp4", str(tmp_path / "active"), status=PROCESSING,
+                             logo_mask_config=active_config, portrait_subtitle_overlay=True)
+    view.jobs[:3] = [first, second, active]
+    view._refresh_logo_mask_targets()
+
+    replacement = LogoMaskConfig(mode="custom", regions=(
+        LogoMaskRegion("second", "Second", True, .5, .5, .2, .2, 12),
+    ))
+    class AcceptedDialog:
+        def __init__(self, config, parent, source_video):
+            assert config == second.logo_mask_config
+            assert source_video == second.source_video
+            self.config = replacement
+        def exec(self):
+            return True
+    monkeypatch.setattr("buzz.widgets.localization_dashboard.LogoMaskEditorDialog", AcceptedDialog)
+    view.logo_mask_target_combo.setCurrentIndex(2)
+    view.edit_logo_masks()
+
+    assert first.logo_mask_config == LogoMaskConfig()
+    assert second.logo_mask_config == replacement
+    assert active.logo_mask_config == active_config
+    assert active.portrait_subtitle_overlay is True
 
 
 def test_paraformer_cache_resets_only_after_final_active_thread(qtbot, tmp_path, monkeypatch):

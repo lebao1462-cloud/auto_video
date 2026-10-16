@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
 )
 
 from buzz.localization.final_render import FinalRenderOptions
+from buzz.localization.logo_mask import LogoMaskConfig
 from buzz.localization.subtitles import SubtitleOptions
 from buzz.localization.timing import TimingPolicy
 from buzz.localization.preflight import (
@@ -116,6 +117,7 @@ class LocalizationWorker(QObject):
         subtitle_mode: str,
         cover_original_subtitles: bool,
         blur_bilibili_watermark: bool,
+        logo_mask_config: LogoMaskConfig = LogoMaskConfig(),
         overlay_ben_review_logo: bool = True,
         portrait_subtitle_overlay: bool = False,
         use_background_separation: bool = False,
@@ -132,6 +134,7 @@ class LocalizationWorker(QObject):
         self.subtitle_mode = subtitle_mode
         self.cover_original_subtitles = cover_original_subtitles
         self.blur_bilibili_watermark = blur_bilibili_watermark
+        self.logo_mask_config = logo_mask_config
         self.overlay_ben_review_logo = overlay_ben_review_logo
         self.portrait_subtitle_overlay = portrait_subtitle_overlay
         self.use_background_separation = use_background_separation
@@ -183,6 +186,7 @@ class LocalizationWorker(QObject):
                         subtitle_mode=self.subtitle_mode,
                         cover_original_subtitles=self.cover_original_subtitles,
                         blur_bilibili_watermark=self.blur_bilibili_watermark,
+                        logo_mask_config=self.logo_mask_config,
                         overlay_ben_review_logo=self.overlay_ben_review_logo,
                         portrait_subtitle_overlay=self.portrait_subtitle_overlay,
                     ),
